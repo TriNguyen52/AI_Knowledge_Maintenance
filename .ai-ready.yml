@@ -1,0 +1,25 @@
+version: 1
+
+thresholds:
+  overall_score: 85
+
+fail_on:
+  - CRITICAL
+
+weights:
+  retrieval: 0.25
+  context: 0.15
+  consistency: 0.20
+  trust: 0.20
+  connectivity: 0.10
+  workflow: 0.10
+
+rules:
+  topic_purity:
+    enabled: true
+  context_independence:
+    enabled: true
+  heading_quality:
+    enabled: true
+  link_integrity:
+    enabled: true

@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+test_snapshots.db
+
+# AI-Ready runtime
+.ai-ready/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Scripts
+analyze_scan.py
+debug_nav.py
+debug_nav2.py
+quick_check.py
+run_fastapi_scan.py
+scan_khe_validation.py
+scan_phase2.py
+scan_summary.py
+fastapi_scan.json
