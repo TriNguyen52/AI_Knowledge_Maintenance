@@ -228,3 +228,39 @@ rules:
         assert config.weights["retrieval"] == 0.30
         assert "topic_purity" in config.enabled_rule_ids
         assert "context_independence" not in config.enabled_rule_ids
+
+
+def test_config_collectors_key():
+    """Config should accept 'collectors' key alongside 'rules'."""
+    from ai_ready.config import Config
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        f.write("""
+version: 1
+collectors:
+  topic_purity:
+    enabled: true
+  heading_quality:
+    enabled: false
+""")
+        f.flush()
+
+        config = Config.from_file(f.name)
+        assert "topic_purity" in config.enabled_collector_ids
+        assert "heading_quality" not in config.enabled_collector_ids
+        # enabled_rule_ids and enabled_collector_ids should be the same
+        assert config.enabled_rule_ids == config.enabled_collector_ids
+
+
+def test_config_collectors_takes_precedence():
+    """If both 'rules' and 'collectors' are present, collectors takes precedence."""
+    from ai_ready.config import Config
+
+    data = {
+        "rules": {"topic_purity": {"enabled": True}},
+        "collectors": {"heading_quality": {"enabled": True}},
+    }
+    config = Config.from_dict(data)
+    # collectors should take precedence
+    assert "heading_quality" in config.enabled_rule_ids
+    assert "topic_purity" not in config.enabled_rule_ids

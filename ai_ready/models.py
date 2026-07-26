@@ -141,6 +141,18 @@ class DocumentRelation:
     relation_type: str  # "parent_child", "cross_reference", "navigation"
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def to_relationship(self) -> "Relationship":
+        """Convert this DocumentRelation to a Relationship.
+
+        Maps source_path -> source_uri, target_path -> target_uri.
+        """
+        return Relationship(
+            source_uri=self.source_path,
+            target_uri=self.target_path,
+            relation_type=self.relation_type,
+            metadata=dict(self.metadata),
+        )
+
 
 @dataclass
 class KnowledgeBase:
@@ -188,6 +200,19 @@ class KnowledgeBase:
             if r.target_path == path and r.source_path != path:
                 return True
         return False
+
+    def to_artifact_bundle(self) -> "ArtifactBundle":
+        """Convert this KnowledgeBase to an ArtifactBundle.
+
+        Documents are converted to KnowledgeArtifacts via ``to_artifact()``
+        and DocumentRelations to Relationships via ``to_relationship()``.
+        """
+        return ArtifactBundle(
+            artifacts=[d.to_artifact() for d in self.documents],
+            relationships=[r.to_relationship() for r in self.relations],
+            source=self.source,
+            metadata=dict(self.metadata),
+        )
 
 
 class FindingStatus(str, Enum):
@@ -483,6 +508,36 @@ class Snapshot:
             "metrics": self.metrics,
             "metadata": self.metadata,
         }
+
+    def to_assessment(self) -> "KnowledgeAssessment":
+        """Convert this Snapshot to a KnowledgeAssessment.
+
+        Maps snapshot_id -> assessment_id, findings -> signals.
+        All other fields map 1:1.
+        """
+        return KnowledgeAssessment(
+            assessment_id=self.snapshot_id,
+            score=self.score,
+            dimensions=dict(self.dimensions),
+            signals=list(self.findings),
+            metrics=dict(self.metrics),
+            metadata=dict(self.metadata),
+        )
+
+    @classmethod
+    def from_assessment(cls, assessment: "KnowledgeAssessment") -> "Snapshot":
+        """Create a Snapshot from a KnowledgeAssessment.
+
+        Maps assessment_id -> snapshot_id, signals -> findings.
+        """
+        return cls(
+            snapshot_id=assessment.assessment_id,
+            score=assessment.score,
+            dimensions=dict(assessment.dimensions),
+            findings=list(assessment.signals),
+            metrics=dict(assessment.metrics),
+            metadata=dict(assessment.metadata),
+        )
 
     def _dominant_dimensions(self) -> list[dict[str, Any]]:
         weights = self._effective_weights()
@@ -986,6 +1041,24 @@ class SignalLifecycle:
             "age_assessments": len(self.assessment_ids),
         }
 
+    def to_finding_lifecycle(self) -> "FindingLifecycle":
+        """Convert this SignalLifecycle to a FindingLifecycle.
+
+        Maps signal-centric fields to finding-centric fields for backward
+        compatibility with SnapshotStore consumers.
+        """
+        return FindingLifecycle(
+            finding_id=self.signal_id,
+            rule_id=self.collector_id,
+            document_path=self.artifact_uri,
+            first_seen=self.first_seen,
+            last_seen=self.last_seen,
+            status=FindingStatus(self.status.value),
+            severity_history=self.severity_history,
+            snapshot_ids=list(self.assessment_ids),
+            resolved_snapshot=self.resolved_assessment,
+        )
+
 
 @dataclass
 class CollectorResult:
@@ -1046,6 +1119,35 @@ class KnowledgeAssessment:
             "metadata": self.metadata,
         }
 
+    def to_snapshot(self) -> "Snapshot":
+        """Convert this KnowledgeAssessment to a Snapshot.
+
+        Maps assessment_id -> snapshot_id, signals -> findings.
+        """
+        return Snapshot(
+            snapshot_id=self.assessment_id,
+            score=self.score,
+            dimensions=dict(self.dimensions),
+            findings=list(self.signals),
+            metrics=dict(self.metrics),
+            metadata=dict(self.metadata),
+        )
+
+    @classmethod
+    def from_snapshot(cls, snapshot: "Snapshot") -> "KnowledgeAssessment":
+        """Create a KnowledgeAssessment from a Snapshot.
+
+        Maps snapshot_id -> assessment_id, findings -> signals.
+        """
+        return cls(
+            assessment_id=snapshot.snapshot_id,
+            score=snapshot.score,
+            dimensions=dict(snapshot.dimensions),
+            signals=list(snapshot.findings),
+            metrics=dict(snapshot.metrics),
+            metadata=dict(snapshot.metadata),
+        )
+
 
 @dataclass
 class AssessmentDiff:
@@ -1091,6 +1193,31 @@ class AssessmentDiff:
             "explanation": self.explanation,
         }
 
+    def to_regression_report(self) -> "RegressionReport":
+        """Convert this AssessmentDiff to a RegressionReport.
+
+        Maps assessment-centric fields back to snapshot-centric fields
+        for backward compatibility with SnapshotStore consumers.
+        """
+        return RegressionReport(
+            prev_snapshot_id=self.prev_assessment_id,
+            curr_snapshot_id=self.curr_assessment_id,
+            prev_score=self.prev_score,
+            curr_score=self.curr_score,
+            score_delta=self.score_delta,
+            new_findings=list(self.new_signals),
+            resolved_findings=list(self.resolved_signals),
+            persistent_findings=list(self.persistent_signals),
+            recurring_findings=list(self.recurring_signals),
+            severity_changes=self.severity_changes,
+            dimension_deltas=self.dimension_deltas,
+            new_high_count=self.new_high_count,
+            score_change_explanation=self.score_change_explanation,
+            contributor_changes=self.contributor_changes,
+            recommendation=self.recommendation,
+            explanation=self.explanation,
+        )
+
 
 @dataclass
 class EvolutionView:
@@ -1115,3 +1242,37 @@ class EvolutionView:
             "trajectory": self.trajectory,
             "summary": self.summary,
         }
+
+    def to_trend_report(self) -> "TrendReport":
+        """Convert this EvolutionView to a TrendReport.
+
+        Maps assessment-centric fields to snapshot-centric fields for
+        backward compatibility with SnapshotStore consumers.
+        """
+        # Convert score_trend entries from assessment_id to snapshot_id
+        score_trend = [
+            {**entry, "snapshot_id": entry.get("assessment_id", "")}
+            for entry in self.score_trend
+        ]
+        # Convert signal_trend to finding_trend with snapshot_id keys
+        finding_trend = [
+            {
+                "snapshot_id": entry.get("assessment_id", ""),
+                "total_findings": entry.get("total_signals", 0),
+                "high_findings": entry.get("high_signals", 0),
+            }
+            for entry in self.signal_trend
+        ]
+        # Convert assessments list to snapshots list
+        snapshots = [
+            {"snapshot_id": a.get("assessment_id", ""), "score": a.get("score", 0)}
+            for a in self.assessments
+        ]
+        return TrendReport(
+            snapshots=snapshots,
+            score_trend=score_trend,
+            finding_trend=finding_trend,
+            dimension_trends=self.dimension_trends,
+            trajectory=self.trajectory,
+            summary=self.summary,
+        )

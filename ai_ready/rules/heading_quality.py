@@ -147,3 +147,7 @@ class HeadingQualityRule(Rule):
         elif issue_type == "too_short":
             return f"Heading '{heading}' is too short. Use a more descriptive heading (2+ words recommended)."
         return f"Improve heading '{heading}' for better AI retrieval."
+
+
+# Collector alias (Phase 11 naming migration)
+HeadingQualityCollector = HeadingQualityRule

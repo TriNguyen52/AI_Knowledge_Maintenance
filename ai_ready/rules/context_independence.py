@@ -154,3 +154,7 @@ class ContextIndependenceRule(Rule):
             findings=findings,
             recommendation=f"{total_dangling} dangling references across {len(findings)} documents" if findings else "All paragraphs are self-contained",
         )
+
+
+# Collector alias (Phase 11 naming migration)
+ContextIndependenceCollector = ContextIndependenceRule

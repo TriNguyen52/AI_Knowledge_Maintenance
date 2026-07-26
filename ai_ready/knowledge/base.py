@@ -8,7 +8,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator
 
-from ai_ready.models import Document, DocumentRelation
+from ai_ready.models import (
+    ArtifactBundle,
+    Document,
+    DocumentRelation,
+    KnowledgeArtifact,
+    Relationship,
+)
 
 
 class KnowledgeCapability(str, Enum):
@@ -19,6 +25,7 @@ class KnowledgeCapability(str, Enum):
     NAVIGATION = "navigation"
     METADATA = "metadata"
     EMBEDDINGS = "embeddings"
+    ARTIFACTS = "artifacts"
 
 
 @dataclass
@@ -30,6 +37,19 @@ class KnowledgeSource:
     metadata: dict[str, Any] = field(default_factory=dict)
     capabilities: frozenset[KnowledgeCapability] = frozenset()
     source: str = ""
+
+    def to_artifact_bundle(self) -> ArtifactBundle:
+        """Convert this document-centric source to an artifact-centric bundle.
+
+        Documents are converted to KnowledgeArtifacts via ``to_artifact()``
+        and DocumentRelations to Relationships via ``to_relationship()``.
+        """
+        return ArtifactBundle(
+            artifacts=[d.to_artifact() for d in self.documents],
+            relationships=[r.to_relationship() for r in self.relations],
+            source=self.source,
+            metadata=dict(self.metadata),
+        )
 
 
 class KnowledgeSDK(ABC):
@@ -64,6 +84,25 @@ class KnowledgeSDK(ABC):
         """Yield normalized relationships when the source can provide them."""
         return iter(())
 
+    def iter_artifacts(self) -> Iterator[KnowledgeArtifact]:
+        """Yield normalized knowledge artifacts.
+
+        Default implementation delegates to ``iter_documents()`` and
+        converts each document via ``Document.to_artifact()``. SDKs that
+        natively produce non-document artifacts should override this.
+        """
+        for doc in self.iter_documents():
+            yield doc.to_artifact()
+
+    def iter_relationships(self) -> Iterator[Relationship]:
+        """Yield normalized relationships between artifacts.
+
+        Default implementation delegates to ``iter_relations()`` and
+        converts each DocumentRelation via ``to_relationship()``.
+        """
+        for rel in self.iter_relations():
+            yield rel.to_relationship()
+
     def source_metadata(self) -> dict[str, Any]:
         """Return source-level metadata to carry into the knowledge base."""
         return {}
@@ -76,4 +115,17 @@ class KnowledgeSDK(ABC):
             metadata=self.source_metadata(),
             capabilities=frozenset(self.capabilities),
             source=str(self._source) if self._source is not None else "",
+        )
+
+    def load_artifacts(self) -> ArtifactBundle:
+        """Materialize the source as an ArtifactBundle.
+
+        Default implementation calls ``iter_artifacts()`` and
+        ``iter_relationships()``. SDKs may override for custom behavior.
+        """
+        return ArtifactBundle(
+            artifacts=list(self.iter_artifacts()),
+            relationships=list(self.iter_relationships()),
+            source=str(self._source) if self._source is not None else "",
+            metadata=self.source_metadata(),
         )

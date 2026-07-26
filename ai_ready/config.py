@@ -39,6 +39,11 @@ class Config:
                 result.append(rule_id)
         return result
 
+    @property
+    def enabled_collector_ids(self) -> list[str]:
+        """Return list of collector IDs that are enabled (alias for enabled_rule_ids)."""
+        return self.enabled_rule_ids
+
     @classmethod
     def from_file(cls, path: str | Path) -> "Config":
         """Load config from a YAML file."""
@@ -53,12 +58,21 @@ class Config:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
-        """Create config from a parsed dict."""
+        """Create config from a parsed dict.
+
+        Accepts both 'rules' (legacy) and 'collectors' (new) keys.
+        If both are present, collectors takes precedence.
+        """
+        enabled_rules = data.get("rules", {})
+        collectors = data.get("collectors", {})
+        # collectors takes precedence if non-empty
+        if collectors:
+            enabled_rules = collectors
         return cls(
             weights=data.get("weights", dict(DEFAULT_WEIGHTS)),
             thresholds=data.get("thresholds", {"overall_score": 0}),
             fail_on=data.get("fail_on", ["CRITICAL"]),
-            enabled_rules=data.get("rules", {}),
+            enabled_rules=enabled_rules,
         )
 
     @classmethod

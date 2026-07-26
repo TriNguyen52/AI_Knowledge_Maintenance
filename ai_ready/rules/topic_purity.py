@@ -197,3 +197,7 @@ class TopicPurityRule(Rule):
         if not union:
             return 0.0
         return len(a & b) / len(union)
+
+
+# Collector alias (Phase 11 naming migration)
+TopicPurityCollector = TopicPurityRule

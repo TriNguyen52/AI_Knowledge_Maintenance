@@ -136,5 +136,14 @@ def _import_rules() -> None:
             continue
         importlib.import_module(f"{__name__}.{module_info.name}")
 
+_import_rules()
+
+# Re-export collector aliases for convenient access.
+# These are set by each rule module at import time.
+from ai_ready.rules.topic_purity import TopicPurityCollector  # noqa: E402, F401
+from ai_ready.rules.heading_quality import HeadingQualityCollector  # noqa: E402, F401
+from ai_ready.rules.context_independence import ContextIndependenceCollector  # noqa: E402, F401
+from ai_ready.rules.link_integrity import LinkIntegrityCollector  # noqa: E402, F401
+
 
 _import_rules()

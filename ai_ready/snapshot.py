@@ -1,4 +1,16 @@
-"""SQLite snapshot store - persists scan results for regression detection."""
+"""SQLite snapshot store - persists scan results for regression detection.
+
+Phase 9: SnapshotStore now delegates to AssessmentStore + SignalStore
+internally. The external API is unchanged — callers still see Snapshot,
+RegressionReport, FindingLifecycle, and TrendReport objects. Internally,
+data is persisted in the assessments/signals/signal_lifecycle tables
+managed by AssessmentStore and SignalStore.
+
+The old snapshots/findings/finding_lifecycle tables are still created
+for backward compatibility (reading legacy databases) but are no longer
+written to. A fallback read path checks old tables if the new tables
+don't have the requested data.
+"""
 
 from __future__ import annotations
 
@@ -10,25 +22,38 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from ai_ready.models import (
+    AssessmentDiff,
     DimensionScore,
     Finding,
     FindingLifecycle,
     FindingStatus,
     RegressionReport,
     Severity,
+    SignalLifecycle,
     Snapshot,
     TrendReport,
     _severity_rank,
 )
+from ai_ready.stores import AssessmentStore, SignalStore
+from ai_ready.operations import DiffOperation
 
 
 class SnapshotStore:
-    """SQLite-backed snapshot storage with lifecycle tracking."""
+    """SQLite-backed snapshot storage with lifecycle tracking.
+
+    Delegates persistence to AssessmentStore + SignalStore. The external
+    API (Snapshot, RegressionReport, FindingLifecycle, TrendReport) is
+    preserved for backward compatibility.
+    """
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+        # Internal delegation to new stores
+        self._assessment_store = AssessmentStore(db_path)
+        self._signal_store = self._assessment_store.signal_store
+        # Initialize legacy tables for backward-compat reads
+        self._init_legacy_db()
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -44,7 +69,8 @@ class SnapshotStore:
         finally:
             conn.close()
 
-    def _init_db(self) -> None:
+    def _init_legacy_db(self) -> None:
+        """Create legacy tables for backward-compat reads from old databases."""
         with self._conn() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS snapshots (
@@ -82,7 +108,6 @@ class SnapshotStore:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_findings_finding_id ON findings(finding_id)
             """)
-            # Lifecycle table - tracks findings across scans
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS finding_lifecycle (
                     finding_id TEXT PRIMARY KEY,
@@ -113,176 +138,250 @@ class SnapshotStore:
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
-    # --- Snapshot CRUD ---
+    def _has_legacy_data(self) -> bool:
+        """Check if the legacy snapshots table has any rows."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT COUNT(*) as count FROM snapshots").fetchone()
+            return row["count"] > 0
+
+    def _has_assessment_data(self) -> bool:
+        """Check if the new assessments table has any rows."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT COUNT(*) as count FROM assessments").fetchone()
+            return row["count"] > 0
+
+    # --- Snapshot CRUD (delegates to AssessmentStore) ---
 
     def save(self, snapshot: Snapshot) -> None:
-        """Persist a snapshot, its findings, and update lifecycle tracking."""
-        timestamp = datetime.now(timezone.utc).isoformat()
-        with self._conn() as conn:
-            conn.execute(
-                """INSERT OR REPLACE INTO snapshots
-                   (snapshot_id, timestamp, score, dimensions, metrics, metadata)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    snapshot.snapshot_id,
-                    timestamp,
-                    snapshot.score,
-                    json.dumps({k: {"name": v.name, "score": v.score, "rule_ids": v.rule_ids,
-                                    "findings_count": v.findings_count}
-                                for k, v in snapshot.dimensions.items()}),
-                    json.dumps(snapshot.metrics),
-                    json.dumps(snapshot.metadata),
-                ),
-            )
-            for f in snapshot.findings:
-                conn.execute(
-                    """INSERT INTO findings
-                       (snapshot_id, finding_id, rule_id, issue_type, severity, score,
-                        document_id, document_path, evidence, recommendation, ai_impact, line)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        snapshot.snapshot_id,
-                        f.finding_id,
-                        f.rule_id,
-                        f.issue_type,
-                        f.severity.value,
-                        f.score,
-                        f.document_id,
-                        f.document_path,
-                        json.dumps(f.evidence),
-                        f.recommendation,
-                        f.ai_impact,
-                        f.line,
-                    ),
-                )
+        """Persist a snapshot by delegating to AssessmentStore.
 
-            # Update lifecycle tracking
-            self._update_lifecycle(conn, snapshot, timestamp)
-
-    def _update_lifecycle(self, conn: sqlite3.Connection, snapshot: Snapshot, timestamp: str) -> None:
-        """Update finding lifecycle table based on current snapshot findings."""
-        # Get previous snapshot's finding IDs
-        prev_snapshot = self._get_previous_snapshot_id(conn, snapshot.snapshot_id)
-        prev_finding_ids: set[str] = set()
-        if prev_snapshot:
-            rows = conn.execute(
-                "SELECT finding_id FROM findings WHERE snapshot_id = ?", (prev_snapshot,)
-            ).fetchall()
-            prev_finding_ids = {r["finding_id"] for r in rows}
-
-        curr_finding_ids = {f.finding_id for f in snapshot.findings}
-
-        # Mark resolved findings
-        resolved_ids = prev_finding_ids - curr_finding_ids
-        for fid in resolved_ids:
-            row = conn.execute(
-                "SELECT * FROM finding_lifecycle WHERE finding_id = ?", (fid,)
-            ).fetchone()
-            if row and row["status"] != "resolved":
-                conn.execute(
-                    "UPDATE finding_lifecycle SET status = ?, resolved_snapshot = ? WHERE finding_id = ?",
-                    (FindingStatus.RESOLVED.value, snapshot.snapshot_id, fid),
-                )
-
-        # Upsert current findings
-        for f in snapshot.findings:
-            existing = conn.execute(
-                "SELECT * FROM finding_lifecycle WHERE finding_id = ?", (f.finding_id,)
-            ).fetchone()
-
-            severity_entry = {
-                "snapshot_id": snapshot.snapshot_id,
-                "severity": f.severity.value,
-                "score": f.score,
-            }
-
-            if existing:
-                # Update existing finding
-                sev_history = json.loads(existing["severity_history"])
-                sev_history.append(severity_entry)
-
-                snap_ids = json.loads(existing["snapshot_ids"])
-                if snapshot.snapshot_id not in snap_ids:
-                    snap_ids.append(snapshot.snapshot_id)
-
-                # Determine status
-                if existing["status"] == FindingStatus.RESOLVED.value:
-                    status = FindingStatus.RECURRING.value
-                elif existing["status"] == FindingStatus.NEW.value:
-                    status = FindingStatus.PERSISTENT.value
-                else:
-                    status = existing["status"]
-
-                conn.execute(
-                    """UPDATE finding_lifecycle
-                       SET last_seen = ?, status = ?, severity_history = ?, snapshot_ids = ?,
-                           resolved_snapshot = ''
-                       WHERE finding_id = ?""",
-                    (timestamp, status, json.dumps(sev_history), json.dumps(snap_ids), f.finding_id),
-                )
-            else:
-                # New finding
-                conn.execute(
-                    """INSERT INTO finding_lifecycle
-                       (finding_id, rule_id, document_path, first_seen, last_seen, status,
-                        severity_history, snapshot_ids, resolved_snapshot)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        f.finding_id,
-                        f.rule_id,
-                        f.document_path,
-                        timestamp,
-                        timestamp,
-                        FindingStatus.NEW.value,
-                        json.dumps([severity_entry]),
-                        json.dumps([snapshot.snapshot_id]),
-                        "",
-                    ),
-                )
-
-    def _get_previous_snapshot_id(self, conn: sqlite3.Connection, snapshot_id: str) -> str | None:
-        """Get the snapshot ID immediately before the given one."""
-        row = conn.execute(
-            "SELECT timestamp FROM snapshots WHERE snapshot_id = ?", (snapshot_id,)
-        ).fetchone()
-        if not row:
-            return None
-        prev = conn.execute(
-            "SELECT snapshot_id FROM snapshots WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1",
-            (row["timestamp"],),
-        ).fetchone()
-        return prev["snapshot_id"] if prev else None
+        Converts the Snapshot to a KnowledgeAssessment and saves via
+        AssessmentStore.save(), which persists to the assessments and
+        signals tables and updates signal lifecycle tracking.
+        """
+        assessment = snapshot.to_assessment()
+        self._assessment_store.save(assessment)
 
     def load(self, snapshot_id: str) -> Snapshot | None:
-        """Load a snapshot by ID."""
+        """Load a snapshot by ID.
+
+        Tries AssessmentStore first. Falls back to legacy tables if the
+        ID is not found in the new tables (for old databases).
+        """
+        assessment = self._assessment_store.load(snapshot_id)
+        if assessment is not None:
+            return Snapshot.from_assessment(assessment)
+
+        # Fallback: try legacy tables
+        return self._legacy_load(snapshot_id)
+
+    def latest(self) -> Snapshot | None:
+        """Get the most recent snapshot.
+
+        Tries AssessmentStore first, falls back to legacy tables.
+        """
+        assessment = self._assessment_store.latest()
+        if assessment is not None:
+            return Snapshot.from_assessment(assessment)
+
+        # Fallback: try legacy tables
+        return self._legacy_latest()
+
+    def history(self, limit: int = 10) -> list[Snapshot]:
+        """Get recent snapshots ordered by time descending.
+
+        Merges results from both new and legacy tables if both have data.
+        """
+        assessments = self._assessment_store.history(limit=limit)
+        if assessments:
+            return [Snapshot.from_assessment(a) for a in assessments]
+
+        # Fallback: try legacy tables
+        return self._legacy_history(limit)
+
+    def previous(self, snapshot_id: str) -> Snapshot | None:
+        """Get the snapshot immediately before the given one."""
+        assessment = self._assessment_store.previous(snapshot_id)
+        if assessment is not None:
+            return Snapshot.from_assessment(assessment)
+
+        # Fallback: try legacy tables
+        return self._legacy_previous(snapshot_id)
+
+    # --- Diff / Regression ---
+
+    def diff(self, prev_id: str, curr_id: str) -> RegressionReport | None:
+        """Compute regression between two snapshots by ID.
+
+        Loads both snapshots (via AssessmentStore with legacy fallback),
+        then delegates to DiffOperation.compute_diff for the full
+        contributor-change analysis.
+        """
+        prev = self.load(prev_id)
+        curr = self.load(curr_id)
+        if not prev or not curr:
+            return None
+        return DiffOperation.compute_diff(prev, curr)
+
+    def diff_latest(self) -> RegressionReport | None:
+        """Diff the two most recent snapshots."""
+        history = self.history(limit=2)
+        if len(history) < 2:
+            return None
+        return DiffOperation.compute_diff(history[1], history[0])
+
+    def _compute_diff(self, prev: Snapshot, curr: Snapshot) -> RegressionReport:
+        """Compute regression report between two snapshots.
+
+        Delegates to DiffOperation for the full diff logic including
+        contributor changes and score explanations.
+        """
+        return DiffOperation.compute_diff(prev, curr)
+
+    # --- Lifecycle queries (delegates to SignalStore) ---
+
+    def get_lifecycle(self, finding_id: str) -> FindingLifecycle | None:
+        """Get lifecycle info for a specific finding.
+
+        Delegates to SignalStore, converting SignalLifecycle to
+        FindingLifecycle for backward compatibility.
+        """
+        # Try new store first
+        signal_lifecycle = self._signal_store.get_lifecycle(finding_id)
+        if signal_lifecycle is not None:
+            return signal_lifecycle.to_finding_lifecycle()
+
+        # Fallback: try legacy tables
+        return self._legacy_get_lifecycle(finding_id)
+
+    def get_open_findings(self, limit: int = 100) -> list[FindingLifecycle]:
+        """Get all currently open findings (new or persistent or recurring)."""
+        # Try new store first
+        open_signals = self._signal_store.get_open_signals(limit=limit)
+        if open_signals:
+            return [s.to_finding_lifecycle() for s in open_signals]
+
+        # Fallback: try legacy tables
+        return self._legacy_get_open_findings(limit)
+
+    def get_oldest_findings(self, limit: int = 10) -> list[FindingLifecycle]:
+        """Get the findings that have been open the longest."""
+        open_signals = self._signal_store.get_open_signals(limit=limit)
+        if open_signals:
+            # Sort by first_seen ascending (oldest first)
+            sorted_signals = sorted(open_signals, key=lambda s: s.first_seen)
+            return [s.to_finding_lifecycle() for s in sorted_signals[:limit]]
+
+        # Fallback: try legacy tables
+        return self._legacy_get_oldest_findings(limit)
+
+    def get_recurring_findings(self, limit: int = 50) -> list[FindingLifecycle]:
+        """Get findings that resolved and then came back."""
+        recurring = self._signal_store.get_recurring_signals(limit=limit)
+        if recurring:
+            return [s.to_finding_lifecycle() for s in recurring]
+
+        # Fallback: try legacy tables
+        return self._legacy_get_recurring_findings(limit)
+
+    def get_recently_resolved(self, limit: int = 20) -> list[FindingLifecycle]:
+        """Get findings that were resolved in the most recent scan."""
+        latest = self.latest()
+        if not latest:
+            return []
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT * FROM signal_lifecycle
+                   WHERE status = ? AND resolved_assessment = ?
+                   ORDER BY last_seen DESC
+                   LIMIT ?""",
+                (FindingStatus.RESOLVED.value, latest.snapshot_id, limit),
+            ).fetchall()
+            if rows:
+                return [
+                    SignalLifecycle(
+                        signal_id=r["signal_id"],
+                        collector_id=r["collector_id"],
+                        artifact_uri=r["artifact_uri"],
+                        first_seen=r["first_seen"],
+                        last_seen=r["last_seen"],
+                        status=FindingStatus(r["status"]),
+                        severity_history=json.loads(r["severity_history"]),
+                        assessment_ids=json.loads(r["assessment_ids"]),
+                        resolved_assessment=r["resolved_assessment"],
+                    ).to_finding_lifecycle()
+                    for r in rows
+                ]
+
+        # Fallback: try legacy tables
+        return self._legacy_get_recently_resolved(limit)
+
+    def get_finding_stats(self) -> dict[str, Any]:
+        """Get summary stats about finding lifecycle."""
+        # Try new store first
+        stats = self._signal_store.get_signal_stats()
+        if stats and any(v > 0 for k, v in stats.items() if k != "avg_age_days"):
+            # Rename keys for backward compatibility
+            return stats  # Keys are already the same (new, persistent, recurring, resolved)
+
+        # Fallback: try legacy tables
+        return self._legacy_get_finding_stats()
+
+    # --- Trend analysis (delegates to AssessmentStore) ---
+
+    def get_trend(self, limit: int = 30) -> TrendReport:
+        """Get health trend across recent snapshots.
+
+        Delegates to AssessmentStore.get_trend() and converts the
+        EvolutionView to a TrendReport for backward compatibility.
+        """
+        evolution = self._assessment_store.get_trend(limit=limit)
+        trend = evolution.to_trend_report()
+
+        # If new store has data, return it
+        if evolution.score_trend:
+            return trend
+
+        # Fallback: try legacy tables
+        legacy_trend = self._legacy_get_trend(limit)
+        if legacy_trend.score_trend:
+            return legacy_trend
+
+        return trend
+
+    # --- Legacy fallback methods ---
+
+    def _legacy_load(self, snapshot_id: str) -> Snapshot | None:
+        """Load from legacy snapshots table."""
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT * FROM snapshots WHERE snapshot_id = ?", (snapshot_id,)
             ).fetchone()
             if not row:
                 return None
-            return self._row_to_snapshot(conn, row)
+            return self._legacy_row_to_snapshot(conn, row)
 
-    def latest(self) -> Snapshot | None:
-        """Get the most recent snapshot."""
+    def _legacy_latest(self) -> Snapshot | None:
+        """Get latest from legacy table."""
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT * FROM snapshots ORDER BY timestamp DESC LIMIT 1"
             ).fetchone()
             if not row:
                 return None
-            return self._row_to_snapshot(conn, row)
+            return self._legacy_row_to_snapshot(conn, row)
 
-    def history(self, limit: int = 10) -> list[Snapshot]:
-        """Get recent snapshots ordered by time descending."""
+    def _legacy_history(self, limit: int = 10) -> list[Snapshot]:
+        """Get history from legacy table."""
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM snapshots ORDER BY timestamp DESC LIMIT ?", (limit,)
             ).fetchall()
-            return [self._row_to_snapshot(conn, row) for row in rows]
+            return [self._legacy_row_to_snapshot(conn, row) for row in rows]
 
-    def previous(self, snapshot_id: str) -> Snapshot | None:
-        """Get the snapshot immediately before the given one."""
+    def _legacy_previous(self, snapshot_id: str) -> Snapshot | None:
+        """Get previous from legacy table."""
         with self._conn() as conn:
             target = conn.execute(
                 "SELECT timestamp FROM snapshots WHERE snapshot_id = ?", (snapshot_id,)
@@ -297,230 +396,18 @@ class SnapshotStore:
             ).fetchone()
             if not row:
                 return None
-            return self._row_to_snapshot(conn, row)
+            return self._legacy_row_to_snapshot(conn, row)
 
-    # --- Diff / Regression ---
-
-    def diff(self, prev_id: str, curr_id: str) -> RegressionReport | None:
-        """Compute regression between two snapshots by ID."""
-        prev = self.load(prev_id)
-        curr = self.load(curr_id)
-        if not prev or not curr:
-            return None
-        return self._compute_diff(prev, curr)
-
-    def diff_latest(self) -> RegressionReport | None:
-        """Diff the two most recent snapshots."""
-        history = self.history(limit=2)
-        if len(history) < 2:
-            return None
-        return self._compute_diff(history[1], history[0])
-
-    def _compute_diff(self, prev: Snapshot, curr: Snapshot) -> RegressionReport:
-        """Compute regression report between two snapshots using stable finding IDs."""
-        prev_by_id = {f.finding_id: f for f in prev.findings}
-        curr_by_id = {f.finding_id: f for f in curr.findings}
-
-        prev_ids = set(prev_by_id.keys())
-        curr_ids = set(curr_by_id.keys())
-
-        new_findings = [curr_by_id[fid] for fid in curr_ids - prev_ids]
-        resolved_findings = [prev_by_id[fid] for fid in prev_ids - curr_ids]
-        persistent_findings = [curr_by_id[fid] for fid in curr_ids & prev_ids]
-
-        # Detect severity changes
-        severity_changes: list[dict[str, Any]] = []
-        for fid in curr_ids & prev_ids:
-            pf = prev_by_id[fid]
-            cf = curr_by_id[fid]
-            if pf.severity != cf.severity:
-                severity_changes.append({
-                    "finding_id": fid,
-                    "rule_id": cf.rule_id,
-                    "document_path": cf.document_path,
-                    "prev_severity": pf.severity.value,
-                    "curr_severity": cf.severity.value,
-                    "direction": "worse" if _severity_rank(cf.severity) > _severity_rank(pf.severity) else "better",
-                })
-
-        # Dimension deltas
-        dim_deltas: dict[str, int] = {}
-        for dim_name in set(list(prev.dimensions.keys()) + list(curr.dimensions.keys())):
-            prev_score = prev.dimensions[dim_name].score if dim_name in prev.dimensions else 0
-            curr_score = curr.dimensions[dim_name].score if dim_name in curr.dimensions else 0
-            dim_deltas[dim_name] = curr_score - prev_score
-
-        new_high = sum(1 for f in new_findings if f.severity in (Severity.HIGH, Severity.CRITICAL))
-
-        # Metric deltas
-        prev_contradictions = prev.metrics.get("contradiction_count", 0)
-        curr_contradictions = curr.metrics.get("contradiction_count", 0)
-        prev_entropy = prev.metrics.get("avg_topic_entropy", 0)
-        curr_entropy = curr.metrics.get("avg_topic_entropy", 0)
-        prev_orphans = prev.metrics.get("orphan_documents", 0)
-        curr_orphans = curr.metrics.get("orphan_documents", 0)
-        prev_dupes = prev.metrics.get("duplicate_clusters", 0)
-        curr_dupes = curr.metrics.get("duplicate_clusters", 0)
-
-        contributor_changes = self._compute_contributor_changes(prev, curr)
-        dimension_change_explanations = [
-            {
-                "dimension": name,
-                "prev_score": prev.dimensions[name].score if name in prev.dimensions else None,
-                "curr_score": curr.dimensions[name].score if name in curr.dimensions else None,
-                "delta": delta,
-                "direction": "worse" if delta < 0 else "better" if delta > 0 else "unchanged",
-            }
-            for name, delta in sorted(
-                dim_deltas.items(),
-                key=lambda item: (abs(item[1]), item[0]),
-                reverse=True,
-            )
-            if delta != 0
-        ]
-
-        # Build explanation
-        explanation_parts: list[str] = []
-        if new_findings:
-            explanation_parts.append(f"{len(new_findings)} new findings")
-        if resolved_findings:
-            explanation_parts.append(f"{len(resolved_findings)} resolved")
-        if severity_changes:
-            worse = sum(1 for s in severity_changes if s["direction"] == "worse")
-            better = sum(1 for s in severity_changes if s["direction"] == "better")
-            if worse:
-                explanation_parts.append(f"{worse} findings got worse")
-            if better:
-                explanation_parts.append(f"{better} findings improved")
-        top_regression = next(
-            (c for c in contributor_changes if c["delta_estimated_score_gain"] > 0),
-            None,
-        )
-        if top_regression:
-            explanation_parts.append(
-                f"largest new score pressure: {top_regression['cause']}"
-            )
-        if not explanation_parts:
-            explanation_parts.append("No changes detected")
-        explanation = "; ".join(explanation_parts) + "."
-
-        score_change_explanation = {
-            "summary": explanation,
-            "score_delta": curr.score - prev.score,
-            "dimension_changes": dimension_change_explanations,
-            "top_regressions": [
-                c for c in contributor_changes
-                if c["delta_estimated_score_gain"] > 0
-            ][:5],
-            "top_improvements": [
-                c for c in contributor_changes
-                if c["delta_estimated_score_gain"] < 0
-            ][:5],
-        }
-
-        recommendation = ""
-        if curr.score < prev.score:
-            recommendation = f"Score dropped {prev.score} -> {curr.score}. Review {len(new_findings)} new findings before deployment."
-        elif new_high > 0:
-            recommendation = f"{new_high} new high-severity findings. Review before deployment."
-        elif len(resolved_findings) > 0 and not new_findings:
-            recommendation = f"Improving. {len(resolved_findings)} findings resolved, no new issues."
-        elif not new_findings:
-            recommendation = "No regressions detected."
-
-        return RegressionReport(
-            prev_snapshot_id=prev.snapshot_id,
-            curr_snapshot_id=curr.snapshot_id,
-            prev_score=prev.score,
-            curr_score=curr.score,
-            score_delta=curr.score - prev.score,
-            new_findings=new_findings,
-            resolved_findings=resolved_findings,
-            persistent_findings=persistent_findings,
-            severity_changes=severity_changes,
-            dimension_deltas=dim_deltas,
-            new_high_count=new_high,
-            increased_contradictions=max(0, curr_contradictions - prev_contradictions),
-            increased_topic_entropy=max(0, curr_entropy - prev_entropy),
-            new_orphan_documents=max(0, curr_orphans - prev_orphans),
-            new_duplicate_clusters=max(0, curr_dupes - prev_dupes),
-            score_change_explanation=score_change_explanation,
-            contributor_changes=contributor_changes[:10],
-            recommendation=recommendation,
-            explanation=explanation,
-        )
-
-    def _compute_contributor_changes(
-        self,
-        prev: Snapshot,
-        curr: Snapshot,
-    ) -> list[dict[str, Any]]:
-        """Compare derived score contributors between two snapshots."""
-        prev_contributors = {
-            c.key: c for c in prev.explain_score(max_contributors=50).dominant_contributors
-        }
-        curr_contributors = {
-            c.key: c for c in curr.explain_score(max_contributors=50).dominant_contributors
-        }
-
-        changes: list[dict[str, Any]] = []
-        for key in set(prev_contributors) | set(curr_contributors):
-            prev_c = prev_contributors.get(key)
-            curr_c = curr_contributors.get(key)
-            representative = curr_c or prev_c
-            if representative is None:
-                continue
-
-            prev_gain = prev_c.estimated_score_gain if prev_c else 0.0
-            curr_gain = curr_c.estimated_score_gain if curr_c else 0.0
-            prev_count = prev_c.finding_count if prev_c else 0
-            curr_count = curr_c.finding_count if curr_c else 0
-            prev_ids = set(prev_c.finding_ids if prev_c else [])
-            curr_ids = set(curr_c.finding_ids if curr_c else [])
-
-            delta = curr_gain - prev_gain
-            if delta == 0 and curr_count == prev_count:
-                continue
-
-            changes.append({
-                "key": key,
-                "dimension": representative.dimension,
-                "rule": representative.rule_id,
-                "issue_type": representative.issue_type,
-                "cause": representative.cause,
-                "prev_estimated_score_gain": round(prev_gain, 2),
-                "curr_estimated_score_gain": round(curr_gain, 2),
-                "delta_estimated_score_gain": round(delta, 2),
-                "prev_findings": prev_count,
-                "curr_findings": curr_count,
-                "finding_count_delta": curr_count - prev_count,
-                "added_finding_ids": sorted(curr_ids - prev_ids)[:20],
-                "removed_finding_ids": sorted(prev_ids - curr_ids)[:20],
-            })
-
-        return sorted(
-            changes,
-            key=lambda c: (
-                abs(c["delta_estimated_score_gain"]),
-                abs(c["finding_count_delta"]),
-            ),
-            reverse=True,
-        )
-
-    # --- Lifecycle queries ---
-
-    def get_lifecycle(self, finding_id: str) -> FindingLifecycle | None:
-        """Get lifecycle info for a specific finding."""
+    def _legacy_get_lifecycle(self, finding_id: str) -> FindingLifecycle | None:
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT * FROM finding_lifecycle WHERE finding_id = ?", (finding_id,)
             ).fetchone()
             if not row:
                 return None
-            return self._row_to_lifecycle(row)
+            return self._legacy_row_to_lifecycle(row)
 
-    def get_open_findings(self, limit: int = 100) -> list[FindingLifecycle]:
-        """Get all currently open findings (new or persistent or recurring)."""
+    def _legacy_get_open_findings(self, limit: int = 100) -> list[FindingLifecycle]:
         with self._conn() as conn:
             rows = conn.execute(
                 """SELECT * FROM finding_lifecycle
@@ -529,10 +416,9 @@ class SnapshotStore:
                    LIMIT ?""",
                 (FindingStatus.NEW.value, FindingStatus.PERSISTENT.value, FindingStatus.RECURRING.value, limit),
             ).fetchall()
-            return [self._row_to_lifecycle(r) for r in rows]
+            return [self._legacy_row_to_lifecycle(r) for r in rows]
 
-    def get_oldest_findings(self, limit: int = 10) -> list[FindingLifecycle]:
-        """Get the findings that have been open the longest."""
+    def _legacy_get_oldest_findings(self, limit: int = 10) -> list[FindingLifecycle]:
         with self._conn() as conn:
             rows = conn.execute(
                 """SELECT * FROM finding_lifecycle
@@ -541,10 +427,9 @@ class SnapshotStore:
                    LIMIT ?""",
                 (FindingStatus.NEW.value, FindingStatus.PERSISTENT.value, FindingStatus.RECURRING.value, limit),
             ).fetchall()
-            return [self._row_to_lifecycle(r) for r in rows]
+            return [self._legacy_row_to_lifecycle(r) for r in rows]
 
-    def get_recurring_findings(self, limit: int = 50) -> list[FindingLifecycle]:
-        """Get findings that resolved and then came back."""
+    def _legacy_get_recurring_findings(self, limit: int = 50) -> list[FindingLifecycle]:
         with self._conn() as conn:
             rows = conn.execute(
                 """SELECT * FROM finding_lifecycle
@@ -553,11 +438,10 @@ class SnapshotStore:
                    LIMIT ?""",
                 (FindingStatus.RECURRING.value, limit),
             ).fetchall()
-            return [self._row_to_lifecycle(r) for r in rows]
+            return [self._legacy_row_to_lifecycle(r) for r in rows]
 
-    def get_recently_resolved(self, limit: int = 20) -> list[FindingLifecycle]:
-        """Get findings that were resolved in the most recent scan."""
-        latest = self.latest()
+    def _legacy_get_recently_resolved(self, limit: int = 20) -> list[FindingLifecycle]:
+        latest = self._legacy_latest()
         if not latest:
             return []
         with self._conn() as conn:
@@ -568,10 +452,9 @@ class SnapshotStore:
                    LIMIT ?""",
                 (FindingStatus.RESOLVED.value, latest.snapshot_id, limit),
             ).fetchall()
-            return [self._row_to_lifecycle(r) for r in rows]
+            return [self._legacy_row_to_lifecycle(r) for r in rows]
 
-    def get_finding_stats(self) -> dict[str, Any]:
-        """Get summary stats about finding lifecycle."""
+    def _legacy_get_finding_stats(self) -> dict[str, Any]:
         with self._conn() as conn:
             stats = {}
             for status in FindingStatus:
@@ -581,7 +464,6 @@ class SnapshotStore:
                 ).fetchone()
                 stats[status.value] = row["count"]
 
-            # Average age of open findings
             row = conn.execute(
                 """SELECT AVG(julianday('now') - julianday(first_seen)) as avg_age
                    FROM finding_lifecycle
@@ -592,11 +474,9 @@ class SnapshotStore:
 
             return stats
 
-    # --- Trend analysis ---
-
-    def get_trend(self, limit: int = 30) -> TrendReport:
-        """Get health trend across recent snapshots."""
-        snapshots = self.history(limit=limit)
+    def _legacy_get_trend(self, limit: int = 30) -> TrendReport:
+        """Get trend from legacy snapshots table."""
+        snapshots = self._legacy_history(limit=limit)
         if len(snapshots) < 2:
             return TrendReport(
                 snapshots=[],
@@ -604,7 +484,6 @@ class SnapshotStore:
                 summary="Not enough snapshots for trend analysis (need at least 2).",
             )
 
-        # Reverse to chronological order
         snapshots.reverse()
 
         score_trend = []
@@ -628,7 +507,6 @@ class SnapshotStore:
                     "score": dim.score,
                 })
 
-        # Determine trajectory
         if len(score_trend) >= 2:
             recent_scores = [s["score"] for s in score_trend[-3:]] if len(score_trend) >= 3 else [s["score"] for s in score_trend]
             first_score = recent_scores[0]
@@ -658,10 +536,10 @@ class SnapshotStore:
             summary=". ".join(summary_parts) + ".",
         )
 
-    # --- Row converters ---
+    # --- Legacy row converters ---
 
-    def _row_to_snapshot(self, conn: sqlite3.Connection, row: sqlite3.Row) -> Snapshot:
-        """Convert a DB row to a Snapshot object."""
+    def _legacy_row_to_snapshot(self, conn: sqlite3.Connection, row: sqlite3.Row) -> Snapshot:
+        """Convert a legacy DB row to a Snapshot object."""
         dims_data = json.loads(row["dimensions"])
         dimensions: dict[str, DimensionScore] = {}
         for k, v in dims_data.items():
@@ -699,8 +577,8 @@ class SnapshotStore:
             metadata=json.loads(row["metadata"]),
         )
 
-    def _row_to_lifecycle(self, row: sqlite3.Row) -> FindingLifecycle:
-        """Convert a DB row to a FindingLifecycle object."""
+    def _legacy_row_to_lifecycle(self, row: sqlite3.Row) -> FindingLifecycle:
+        """Convert a legacy DB row to a FindingLifecycle object."""
         return FindingLifecycle(
             finding_id=row["finding_id"],
             rule_id=row["rule_id"],

@@ -214,3 +214,7 @@ class LinkIntegrityRule(Rule):
                     return candidate
 
         return None
+
+
+# Collector alias (Phase 11 naming migration)
+LinkIntegrityCollector = LinkIntegrityRule

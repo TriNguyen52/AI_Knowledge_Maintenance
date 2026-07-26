@@ -161,7 +161,7 @@ def scan(
     # Run pipeline
     pipeline = ScanPipeline(
         weights=config.weights,
-        enabled_rules=config.enabled_rule_ids,
+        enabled_rules=config.enabled_collector_ids,
         thresholds=config.thresholds,
         fail_on=config.fail_on,
     )
@@ -250,7 +250,7 @@ def history(
     console.print("=" * 60)
     for snap in snapshots:
         console.print(f"  {snap.snapshot_id}  Score: {snap.score}/100  "
-                       f"Findings: {len(snap.findings)}  "
+                       f"Signals: {len(snap.findings)}  "
                        f"Source: {snap.metadata.get('source', 'N/A')}")
     console.print("=" * 60)
 
@@ -291,13 +291,14 @@ def status(
     console.print(f"  Documents:   {latest.metadata.get('document_count', '?')}")
     console.print(f"  Findings:    {len(latest.findings)}")
     console.print(f"  Source:      {latest.metadata.get('source', 'N/A')}")
+    console.print(f"  Collectors:  {', '.join(sorted(latest.dimensions.keys()))}")
     if latest.metadata.get("git_commit"):
         console.print(f"  Git:         {latest.metadata['git_commit']}")
 
     # Dimensions
     console.print(f"\n  Dimensions:")
     for dim_name, dim in sorted(latest.dimensions.items()):
-        console.print(f"    {dim_name:20s} {dim.score:>3}/100  ({dim.findings_count} findings)")
+        console.print(f"    {dim_name:20s} {dim.score:>3}/100  ({dim.findings_count} signals)")
 
     # Recent changes
     diff_report = store.diff_latest()
@@ -325,7 +326,7 @@ def status(
     # Oldest unresolved findings
     oldest = store.get_oldest_findings(limit=5)
     if oldest:
-        console.print(f"\n  Oldest Unresolved Findings:")
+        console.print(f"\n  Oldest Unresolved Signals:")
         for f in oldest:
             console.print(f"    {f.rule_id:25s} {f.document_path}  (since {f.first_seen[:10]})")
 
@@ -367,7 +368,7 @@ def trend(
         bar = _score_bar(entry["score"])
         console.print(f"    {entry['snapshot_id']}  {bar} {entry['score']}/100")
 
-    console.print(f"\n  Finding Trend:")
+    console.print(f"\n  Signal Trend:")
     for entry in report.finding_trend:
         console.print(f"    {entry['snapshot_id']}  Total: {entry['total_findings']:>4}  High: {entry['high_findings']:>4}")
 
@@ -388,12 +389,13 @@ def trend(
 @app.command()
 def findings(
     status_filter: str = typer.Option(None, "--status", help="Filter by status (new, persistent, recurring, resolved)"),
-    rule: str = typer.Option(None, "--rule", help="Filter by rule ID"),
+    rule: str = typer.Option(None, "--rule", help="Filter by rule/collector ID"),
+    collector: str = typer.Option(None, "--collector", help="Filter by collector ID (alias for --rule)"),
     limit: int = typer.Option(50, "--limit", help="Max findings to show"),
     db: str = typer.Option(None, "--db", help="Snapshot database path"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ) -> None:
-    """List findings with lifecycle information."""
+    """List findings (signals) with lifecycle information."""
     store = _get_store(db)
 
     if status_filter:
@@ -413,9 +415,10 @@ def findings(
     else:
         all_findings = store.get_open_findings(limit=limit)
 
-    # Filter by rule
-    if rule:
-        all_findings = [f for f in all_findings if f.rule_id == rule]
+    # Filter by rule/collector (--collector is an alias for --rule)
+    filter_id = collector or rule
+    if filter_id:
+        all_findings = [f for f in all_findings if f.rule_id == filter_id]
 
     if json_output:
         import json
@@ -431,7 +434,7 @@ def findings(
     console.print("=" * 80)
 
     table = Table(show_header=True, header_style="bold")
-    table.add_column("Rule", style="cyan", width=20)
+    table.add_column("Collector", style="cyan", width=20)
     table.add_column("Document", style="white", width=40)
     table.add_column("Status", style="yellow", width=12)
     table.add_column("Age (scans)", justify="right", width=10)
@@ -477,7 +480,7 @@ def monitor(
                 git_commit = _detect_git_commit(source)
                 pipeline = ScanPipeline(
                     weights=config.weights,
-                    enabled_rules=config.enabled_rule_ids,
+                    enabled_rules=config.enabled_collector_ids,
                     thresholds=config.thresholds,
                     fail_on=config.fail_on,
                 )
@@ -486,7 +489,7 @@ def monitor(
                 store = _get_store(db)
                 store.save(snapshot)
 
-                console.print(f"  Score: {snapshot.score}/100  Findings: {len(snapshot.findings)}  Relations: {len(relations)}")
+                console.print(f"  Score: {snapshot.score}/100  Signals: {len(snapshot.findings)}  Relations: {len(relations)}")
 
                 # Check for regression
                 report = store.diff_latest()
