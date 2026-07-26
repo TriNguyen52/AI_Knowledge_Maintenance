@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # Force UTF-8 output on Windows to avoid cp1252 encoding errors
 if sys.stdout.encoding != "utf-8":
@@ -17,7 +17,6 @@ from rich.console import Console
 from rich.table import Table
 
 from ai_ready.config import Config
-from ai_ready.connectors.markdown import MarkdownConnector
 from ai_ready.output import (
     format_json,
     format_regression_json,
@@ -25,6 +24,7 @@ from ai_ready.output import (
     format_sarif,
     format_terminal,
 )
+from ai_ready.knowledge.loader import load_knowledge_base
 from ai_ready.pipeline import ScanPipeline
 from ai_ready.snapshot import SnapshotStore
 
@@ -74,11 +74,56 @@ def _detect_git_commit(source: str | Path) -> str:
 
 def _load_kb(source: Path, config: Config) -> tuple[list, list]:
     """Load documents and relations from source."""
-    connector = MarkdownConnector()
-    connector.connect(source)
-    documents = list(connector.iter_documents())
-    relations = list(connector.iter_relations())
-    return documents, relations
+    knowledge_source = load_knowledge_base(source)
+    return knowledge_source.documents, knowledge_source.relations
+
+
+def _run_incremental_scan(
+    pipeline: ScanPipeline,
+    source: Path,
+    documents: list,
+    relations: list,
+    git_commit: str,
+    db: str | None,
+) -> Any:
+    """Run an incremental scan, falling back to full scan if needed.
+
+    Loads the previous snapshot, detects changes via git diff, and
+    delegates to pipeline.run_incremental(). Falls back to a full scan
+    if no previous snapshot exists or changes can't be determined.
+    """
+    from ai_ready.incremental import detect_changes_via_git, detect_changes
+
+    store = _get_store(db)
+    prev_snapshot = store.latest()
+
+    if prev_snapshot is None:
+        console.print("[dim]No previous snapshot found — running full scan.[/dim]")
+        return pipeline.run(documents, source=str(source), git_commit=git_commit, relations=relations)
+
+    # Try git-based change detection first
+    change_events = detect_changes_via_git(source, prev_snapshot, documents)
+
+    if change_events is None:
+        # Git not available — fall back to snapshot comparison
+        change_events = detect_changes(source, prev_snapshot, documents)
+
+    if not change_events:
+        console.print("[dim]No changes detected — reusing previous snapshot.[/dim]")
+        # Still save a new snapshot with updated metadata
+        return pipeline.run(documents, source=str(source), git_commit=git_commit, relations=relations)
+
+    changed_count = len({e.document_path for e in change_events})
+    console.print(f"[dim]Incremental scan: {changed_count} document(s) changed.[/dim]")
+
+    return pipeline.run_incremental(
+        prev_snapshot=prev_snapshot,
+        change_events=change_events,
+        documents=documents,
+        relations=relations,
+        source=str(source),
+        git_commit=git_commit,
+    )
 
 
 @app.command()
@@ -89,6 +134,7 @@ def scan(
     db: str = typer.Option(None, "--db", help="Snapshot database path"),
     config_path: str = typer.Option(None, "--config", help="Config file path"),
     save: bool = typer.Option(True, "--save/--no-save", help="Save snapshot to store"),
+    incremental: bool = typer.Option(False, "--incremental", help="Run incremental scan (only re-evaluate changed documents)"),
 ) -> None:
     """Scan a knowledge base and produce an AI readiness report."""
     source = Path(path).resolve()
@@ -119,7 +165,13 @@ def scan(
         thresholds=config.thresholds,
         fail_on=config.fail_on,
     )
-    snapshot = pipeline.run(documents, source=str(source), git_commit=git_commit, relations=relations)
+
+    if incremental:
+        snapshot = _run_incremental_scan(
+            pipeline, source, documents, relations, git_commit, db
+        )
+    else:
+        snapshot = pipeline.run(documents, source=str(source), git_commit=git_commit, relations=relations)
 
     # Save snapshot
     if save:

@@ -1,10 +1,12 @@
 """Tests for the canonical document model."""
 
 from ai_ready.models import (
+    AssessedSignal,
     CodeBlock,
     Document,
     Finding,
     Heading,
+    KnowledgeSignal,
     Link,
     Paragraph,
     RuleResult,
@@ -84,6 +86,58 @@ def test_rule_result_to_dict():
     assert d["rule"] == "test"
     assert d["score"] == 80
     assert d["findings"] == []
+
+
+def test_finding_to_signal_roundtrip():
+    """Finding.to_signal() extracts bare fact; from_signal() rebuilds with placeholders."""
+    f = Finding(
+        rule_id="test_rule",
+        severity=Severity.HIGH,
+        score=50,
+        document_id="doc1",
+        document_path="path/to/doc.md",
+        evidence={"key": "value"},
+        recommendation="Fix it",
+        ai_impact="Bad impact",
+    )
+    sig = f.to_signal()
+    assert sig.collector_id == "test_rule"
+    assert sig.signal_type == f.issue_type
+    assert sig.artifact_uri == "path/to/doc.md"
+    assert sig.evidence == {"key": "value"}
+    assert sig.signal_id == f.finding_id
+    assert sig.artifact_id == f.document_id
+    assert sig.line == f.line
+
+    # Round-trip: from_signal rebuilds a Finding with placeholder interpretation
+    rebuilt = Finding.from_signal(sig)
+    assert rebuilt.rule_id == f.rule_id
+    assert rebuilt.document_path == f.document_path
+    assert rebuilt.document_id == f.document_id
+    assert rebuilt.evidence == f.evidence
+    assert rebuilt.issue_type == f.issue_type
+    assert rebuilt.finding_id == f.finding_id
+    # Interpretation fields are placeholders
+    assert rebuilt.severity == Severity.LOW
+    assert rebuilt.score == 100
+    assert rebuilt.recommendation == ""
+    assert rebuilt.ai_impact == ""
+
+
+def test_assessed_signal_is_finding():
+    """AssessedSignal is a type alias for Finding, not a new class."""
+    assert AssessedSignal is Finding
+    f = AssessedSignal(
+        rule_id="r",
+        severity=Severity.LOW,
+        score=100,
+        document_id="d",
+        document_path="p",
+        evidence={},
+        recommendation="",
+    )
+    assert isinstance(f, Finding)
+    assert f.to_assessed_signal() is f
 
 
 def test_snapshot_to_dict():

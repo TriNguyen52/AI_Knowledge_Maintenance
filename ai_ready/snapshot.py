@@ -18,20 +18,8 @@ from ai_ready.models import (
     Severity,
     Snapshot,
     TrendReport,
+    _severity_rank,
 )
-
-_SEVERITY_ORDER = {
-    Severity.CRITICAL: 4,
-    Severity.HIGH: 3,
-    Severity.MEDIUM: 2,
-    Severity.LOW: 1,
-    Severity.INFO: 0,
-}
-
-
-def _severity_rank(s: Severity) -> int:
-    """Return numeric rank for severity comparison (higher = worse)."""
-    return _SEVERITY_ORDER.get(s, 0)
 
 
 class SnapshotStore:
@@ -74,16 +62,20 @@ class SnapshotStore:
                     snapshot_id TEXT NOT NULL,
                     finding_id TEXT NOT NULL,
                     rule_id TEXT NOT NULL,
+                    issue_type TEXT NOT NULL DEFAULT '',
                     severity TEXT NOT NULL,
                     score INTEGER NOT NULL,
                     document_id TEXT NOT NULL,
                     document_path TEXT NOT NULL,
                     evidence TEXT NOT NULL,
                     recommendation TEXT NOT NULL,
+                    ai_impact TEXT NOT NULL DEFAULT '',
                     line INTEGER DEFAULT 0,
                     FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id)
                 )
             """)
+            self._ensure_column(conn, "findings", "issue_type", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "findings", "ai_impact", "TEXT NOT NULL DEFAULT ''")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_findings_snapshot ON findings(snapshot_id)
             """)
@@ -107,6 +99,19 @@ class SnapshotStore:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_lifecycle_status ON finding_lifecycle(status)
             """)
+
+    def _ensure_column(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        """Add a column to an existing table if the local DB predates it."""
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        existing = {row["name"] for row in rows}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     # --- Snapshot CRUD ---
 
@@ -132,19 +137,21 @@ class SnapshotStore:
             for f in snapshot.findings:
                 conn.execute(
                     """INSERT INTO findings
-                       (snapshot_id, finding_id, rule_id, severity, score, document_id, document_path,
-                        evidence, recommendation, line)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (snapshot_id, finding_id, rule_id, issue_type, severity, score,
+                        document_id, document_path, evidence, recommendation, ai_impact, line)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         snapshot.snapshot_id,
                         f.finding_id,
                         f.rule_id,
+                        f.issue_type,
                         f.severity.value,
                         f.score,
                         f.document_id,
                         f.document_path,
                         json.dumps(f.evidence),
                         f.recommendation,
+                        f.ai_impact,
                         f.line,
                     ),
                 )
@@ -355,6 +362,23 @@ class SnapshotStore:
         prev_dupes = prev.metrics.get("duplicate_clusters", 0)
         curr_dupes = curr.metrics.get("duplicate_clusters", 0)
 
+        contributor_changes = self._compute_contributor_changes(prev, curr)
+        dimension_change_explanations = [
+            {
+                "dimension": name,
+                "prev_score": prev.dimensions[name].score if name in prev.dimensions else None,
+                "curr_score": curr.dimensions[name].score if name in curr.dimensions else None,
+                "delta": delta,
+                "direction": "worse" if delta < 0 else "better" if delta > 0 else "unchanged",
+            }
+            for name, delta in sorted(
+                dim_deltas.items(),
+                key=lambda item: (abs(item[1]), item[0]),
+                reverse=True,
+            )
+            if delta != 0
+        ]
+
         # Build explanation
         explanation_parts: list[str] = []
         if new_findings:
@@ -368,9 +392,31 @@ class SnapshotStore:
                 explanation_parts.append(f"{worse} findings got worse")
             if better:
                 explanation_parts.append(f"{better} findings improved")
+        top_regression = next(
+            (c for c in contributor_changes if c["delta_estimated_score_gain"] > 0),
+            None,
+        )
+        if top_regression:
+            explanation_parts.append(
+                f"largest new score pressure: {top_regression['cause']}"
+            )
         if not explanation_parts:
             explanation_parts.append("No changes detected")
         explanation = "; ".join(explanation_parts) + "."
+
+        score_change_explanation = {
+            "summary": explanation,
+            "score_delta": curr.score - prev.score,
+            "dimension_changes": dimension_change_explanations,
+            "top_regressions": [
+                c for c in contributor_changes
+                if c["delta_estimated_score_gain"] > 0
+            ][:5],
+            "top_improvements": [
+                c for c in contributor_changes
+                if c["delta_estimated_score_gain"] < 0
+            ][:5],
+        }
 
         recommendation = ""
         if curr.score < prev.score:
@@ -398,8 +444,67 @@ class SnapshotStore:
             increased_topic_entropy=max(0, curr_entropy - prev_entropy),
             new_orphan_documents=max(0, curr_orphans - prev_orphans),
             new_duplicate_clusters=max(0, curr_dupes - prev_dupes),
+            score_change_explanation=score_change_explanation,
+            contributor_changes=contributor_changes[:10],
             recommendation=recommendation,
             explanation=explanation,
+        )
+
+    def _compute_contributor_changes(
+        self,
+        prev: Snapshot,
+        curr: Snapshot,
+    ) -> list[dict[str, Any]]:
+        """Compare derived score contributors between two snapshots."""
+        prev_contributors = {
+            c.key: c for c in prev.explain_score(max_contributors=50).dominant_contributors
+        }
+        curr_contributors = {
+            c.key: c for c in curr.explain_score(max_contributors=50).dominant_contributors
+        }
+
+        changes: list[dict[str, Any]] = []
+        for key in set(prev_contributors) | set(curr_contributors):
+            prev_c = prev_contributors.get(key)
+            curr_c = curr_contributors.get(key)
+            representative = curr_c or prev_c
+            if representative is None:
+                continue
+
+            prev_gain = prev_c.estimated_score_gain if prev_c else 0.0
+            curr_gain = curr_c.estimated_score_gain if curr_c else 0.0
+            prev_count = prev_c.finding_count if prev_c else 0
+            curr_count = curr_c.finding_count if curr_c else 0
+            prev_ids = set(prev_c.finding_ids if prev_c else [])
+            curr_ids = set(curr_c.finding_ids if curr_c else [])
+
+            delta = curr_gain - prev_gain
+            if delta == 0 and curr_count == prev_count:
+                continue
+
+            changes.append({
+                "key": key,
+                "dimension": representative.dimension,
+                "rule": representative.rule_id,
+                "issue_type": representative.issue_type,
+                "cause": representative.cause,
+                "prev_estimated_score_gain": round(prev_gain, 2),
+                "curr_estimated_score_gain": round(curr_gain, 2),
+                "delta_estimated_score_gain": round(delta, 2),
+                "prev_findings": prev_count,
+                "curr_findings": curr_count,
+                "finding_count_delta": curr_count - prev_count,
+                "added_finding_ids": sorted(curr_ids - prev_ids)[:20],
+                "removed_finding_ids": sorted(prev_ids - curr_ids)[:20],
+            })
+
+        return sorted(
+            changes,
+            key=lambda c: (
+                abs(c["delta_estimated_score_gain"]),
+                abs(c["finding_count_delta"]),
+            ),
+            reverse=True,
         )
 
     # --- Lifecycle queries ---
@@ -570,15 +675,18 @@ class SnapshotStore:
             "SELECT * FROM findings WHERE snapshot_id = ?", (row["snapshot_id"],)
         ).fetchall()
         for fr in frows:
+            keys = set(fr.keys())
             findings.append(Finding(
                 finding_id=fr["finding_id"],
                 rule_id=fr["rule_id"],
+                issue_type=fr["issue_type"] if "issue_type" in keys else "",
                 severity=Severity(fr["severity"]),
                 score=fr["score"],
                 document_id=fr["document_id"],
                 document_path=fr["document_path"],
                 evidence=json.loads(fr["evidence"]),
                 recommendation=fr["recommendation"],
+                ai_impact=fr["ai_impact"] if "ai_impact" in keys else "",
                 line=fr["line"],
             ))
 

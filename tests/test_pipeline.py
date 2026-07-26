@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 from ai_ready.connectors.markdown import MarkdownConnector
+from ai_ready.models import Severity
 from ai_ready.output import format_json, format_sarif, format_terminal
 from ai_ready.pipeline import ScanPipeline
 
@@ -110,6 +111,91 @@ def test_config_loading():
     config = Config.default()
     assert config.weights["retrieval"] == 0.25
     assert "CRITICAL" in config.fail_on
+
+
+def test_pipeline_signal_conversion_roundtrip():
+    """Phase 8: CollectOperation emits KnowledgeSignals, AssessOperation
+    converts them to AssessedSignals (Findings) with policy-enriched interpretation.
+
+    Verifies that the signal conversion roundtrip preserves finding IDs,
+    document paths, and that policy is correctly applied after conversion.
+    """
+    from ai_ready.operations import CollectOperation, AssessOperation
+
+    docs, relations = _load_kb()
+    collect_op = CollectOperation()
+    results, signals, kb = collect_op.run(
+        documents=docs, relations=relations, source=str(FIXTURES)
+    )
+
+    # CollectOperation should produce KnowledgeSignal objects
+    from ai_ready.models import KnowledgeSignal
+    assert len(signals) > 0
+    assert all(isinstance(s, KnowledgeSignal) for s in signals)
+
+    # AssessOperation should convert signals to AssessedSignals (Findings)
+    assess_op = AssessOperation()
+    snapshot = assess_op.run(
+        results=results, signals=signals, documents=docs, kb=kb,
+        source=str(FIXTURES),
+    )
+
+    # Findings should have policy-enriched interpretation (not placeholders)
+    from ai_ready.models import Finding
+    assert len(snapshot.findings) > 0
+    assert all(isinstance(f, Finding) for f in snapshot.findings)
+
+    # At least some findings should have non-default severity or score
+    # (meaning policy was applied, not just placeholder values)
+    has_enriched = any(
+        f.severity != Severity.LOW or f.score != 100 or f.recommendation != ""
+        for f in snapshot.findings
+    )
+    assert has_enriched, "Policy should enrich at least some findings"
+
+    # Finding IDs should match signal IDs (roundtrip preserves IDs)
+    signal_ids = {s.signal_id for s in signals}
+    finding_ids = {f.finding_id for f in snapshot.findings}
+    assert finding_ids == signal_ids
+
+
+def test_pipeline_incremental_still_works():
+    """Phase 8: Incremental execution should still work unchanged.
+    It uses pipeline helper methods directly with Finding objects,
+    bypassing the signal conversion path.
+    """
+    from ai_ready.incremental import ChangeEvent, IncrementalExecutor
+
+    docs, relations = _load_kb()
+    pipeline = ScanPipeline()
+    snapshot = pipeline.run(docs, source=str(FIXTURES), relations=relations)
+
+    # Simulate a modification to one document
+    from ai_ready.models import Document, Section
+    modified_doc = Document(
+        id=docs[0].id,
+        path=docs[0].path,
+        title=docs[0].title,
+        sections=docs[0].sections,
+    )
+
+    change_events = [ChangeEvent(
+        event_type="modified",
+        document_path=docs[0].path,
+        document=modified_doc,
+        links_changed=False,
+    )]
+
+    new_snapshot = pipeline.run_incremental(
+        prev_snapshot=snapshot,
+        change_events=change_events,
+        documents=docs,
+        relations=relations,
+        source=str(FIXTURES),
+    )
+
+    assert new_snapshot.score >= 0
+    assert new_snapshot.score <= 100
 
 
 def test_config_from_file():

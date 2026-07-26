@@ -315,7 +315,7 @@ def test_policy_enriches_findings():
 
     # Apply policy
     pipeline = ScanPipeline()
-    pipeline._apply_policy(result.findings)
+    pipeline.apply_policy(result.findings)
 
     # After policy: severity from policy registry
     assert result.findings[0].severity == Severity.CRITICAL

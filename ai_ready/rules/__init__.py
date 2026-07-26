@@ -1,4 +1,14 @@
-"""Rule engine base class and registry."""
+"""Signal collector base class and registry.
+
+The SignalCollector is the generalized form of the original Rule. Rules
+already follow the collect -> measure -> evaluate -> report pipeline and
+emit bare findings (signals without interpretation). SignalCollector
+formalizes this pattern with signal-centric naming.
+
+Rule inherits from SignalCollector so all existing rule classes work
+unchanged. The registry provides both old (register_rule/get_rule/all_rules)
+and new (register_collector/get_collector/all_collectors) names.
+"""
 
 from __future__ import annotations
 
@@ -8,12 +18,15 @@ from typing import Any
 from ai_ready.models import Document, Finding, KnowledgeBase, RuleResult, Severity
 
 
-class Rule(ABC):
-    """Base rule contract - every rule implements collect/measure/evaluate/report.
+class SignalCollector(ABC):
+    """Base collector contract — every collector implements collect/measure/evaluate/report.
 
-    Rules receive a KnowledgeBase (documents + relations) instead of a raw
-    list of documents. This allows rules to access document relationships
+    Collectors receive a KnowledgeBase (documents + relations) instead of a raw
+    list of documents. This allows collectors to access document relationships
     (navigation hierarchy, cross-references) for richer analysis.
+
+    The pipeline produces signals (bare facts) that are later interpreted by
+    the assessment layer via InterpretationPolicy.
     """
 
     id: str = "base"
@@ -32,12 +45,12 @@ class Rule(ABC):
 
     @abstractmethod
     def evaluate(self, metrics: dict[str, Any]) -> list[Finding]:
-        """Evaluate metrics and produce findings."""
+        """Evaluate metrics and produce signals (findings during migration)."""
         ...
 
     @abstractmethod
     def report(self) -> RuleResult:
-        """Produce the final rule result."""
+        """Produce the final collector result."""
         ...
 
     def run(self, kb: KnowledgeBase) -> RuleResult:
@@ -53,29 +66,53 @@ class Rule(ABC):
         """Convenience accessor for the documents in the knowledge base."""
         return self._kb.documents if hasattr(self, "_kb") else []
 
-
-# Registry of all available rules
-_RULE_REGISTRY: dict[str, type[Rule]] = {}
-
-
-def register_rule(rule_class: type[Rule]) -> type[Rule]:
-    """Decorator to register a rule class."""
-    _RULE_REGISTRY[rule_class.id] = rule_class
-    return rule_class
+    @property
+    def artifacts(self) -> list[Document]:
+        """Convenience accessor for artifacts (alias for documents during migration)."""
+        return self.documents
 
 
-def get_rule(rule_id: str) -> type[Rule] | None:
-    """Look up a rule class by ID."""
-    return _RULE_REGISTRY.get(rule_id)
+class Rule(SignalCollector):
+    """Base rule contract — inherits from SignalCollector.
+
+    Deprecated: use SignalCollector directly for new collectors.
+    All existing rule classes inherit from Rule and work unchanged.
+    """
+
+    pass
 
 
-def all_rules() -> dict[str, type[Rule]]:
-    """Return all registered rules."""
-    return dict(_RULE_REGISTRY)
+# Registry of all available collectors (shared with rule registry)
+_COLLECTOR_REGISTRY: dict[str, type[SignalCollector]] = {}
+
+# Alias for backward compatibility
+_RULE_REGISTRY = _COLLECTOR_REGISTRY
 
 
-# Dimension -> rule mapping
-DIMENSION_RULES: dict[str, list[str]] = {
+def register_collector(collector_class: type[SignalCollector]) -> type[SignalCollector]:
+    """Decorator to register a collector class."""
+    _COLLECTOR_REGISTRY[collector_class.id] = collector_class
+    return collector_class
+
+
+def get_collector(collector_id: str) -> type[SignalCollector] | None:
+    """Look up a collector class by ID."""
+    return _COLLECTOR_REGISTRY.get(collector_id)
+
+
+def all_collectors() -> dict[str, type[SignalCollector]]:
+    """Return all registered collectors."""
+    return dict(_COLLECTOR_REGISTRY)
+
+
+# Backward-compatible aliases
+register_rule = register_collector
+get_rule = get_collector
+all_rules = all_collectors
+
+
+# Dimension -> collector mapping
+DIMENSION_COLLECTORS: dict[str, list[str]] = {
     "retrieval": ["topic_purity", "heading_quality"],
     "context": ["context_independence"],
     "consistency": ["terminology_consistency", "contradiction_detection"],
@@ -83,6 +120,9 @@ DIMENSION_RULES: dict[str, list[str]] = {
     "connectivity": ["knowledge_connectivity", "link_integrity"],
     "workflow": ["workflow_completeness"],
 }
+
+# Backward-compatible alias
+DIMENSION_RULES = DIMENSION_COLLECTORS
 
 
 # Auto-import all rule modules to trigger @register_rule decorators

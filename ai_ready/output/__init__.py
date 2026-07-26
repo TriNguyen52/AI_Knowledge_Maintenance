@@ -29,6 +29,25 @@ def format_terminal(snapshot: Snapshot) -> str:
         lines.append(f"    {name:20s} {dim.score:>3}/100  ({dim.findings_count} findings)")
     lines.append("")
 
+    explanation = snapshot.explain_score()
+    if snapshot.findings:
+        lines.append("  Why this score:")
+        lines.append(f"    {explanation.summary}")
+        for contributor in explanation.dominant_contributors[:5]:
+            gain = contributor.estimated_score_gain
+            lines.append(
+                f"    - {contributor.cause} [{contributor.dimension}/{contributor.rule_id}] "
+                f"{contributor.finding_count} finding(s), "
+                f"{contributor.document_count} doc(s), up to +{gain:.1f} score"
+            )
+            if contributor.sample_findings:
+                sample = contributor.sample_findings[0]
+                lines.append(
+                    f"      Example: {sample['document_path']} "
+                    f"({sample['finding_id']})"
+                )
+        lines.append("")
+
     if snapshot.findings:
         lines.append(f"  Findings ({len(snapshot.findings)}):")
         lines.append("")
@@ -132,6 +151,25 @@ def format_regression_terminal(report: RegressionReport) -> str:
             indicator = "[+]" if delta > 0 else "[!]" if delta < 0 else "   "
             lines.append(f"    {indicator} {name:20s} {delta:+d}")
         lines.append("")
+
+    if report.score_change_explanation:
+        regressions = report.score_change_explanation.get("top_regressions", [])
+        improvements = report.score_change_explanation.get("top_improvements", [])
+        if regressions or improvements:
+            lines.append("  Why the score changed:")
+            for change in regressions[:3]:
+                lines.append(
+                    f"    [!] {change['cause']} "
+                    f"({change['prev_findings']} -> {change['curr_findings']} findings, "
+                    f"{change['delta_estimated_score_gain']:+.1f} score pressure)"
+                )
+            for change in improvements[:3]:
+                lines.append(
+                    f"    [+] {change['cause']} "
+                    f"({change['prev_findings']} -> {change['curr_findings']} findings, "
+                    f"{change['delta_estimated_score_gain']:+.1f} score pressure)"
+                )
+            lines.append("")
 
     if report.new_findings:
         lines.append(f"  New Issues ({len(report.new_findings)}):")

@@ -1,41 +1,24 @@
-"""Connector base class and registry."""
+"""Backward-compatible connector base class."""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from pathlib import Path
 from typing import Iterator
 
+from ai_ready.knowledge.base import KnowledgeSDK
 from ai_ready.models import Document, DocumentRelation
 
 
-class Connector(ABC):
-    """Base connector - reads from a source and yields normalized Documents.
+class Connector(KnowledgeSDK, ABC):
+    """Backward-compatible alias for the Knowledge SDK base.
 
-    Connectors can optionally provide document relationships (navigation
-    hierarchy, cross-references) via iter_relations().
+    New source integrations should subclass KnowledgeSDK directly. Existing
+    connector imports keep working through this compatibility layer.
     """
 
     name: str = "base"
 
-    @abstractmethod
-    def connect(self, source: str | Path) -> None:
-        """Open connection to the source."""
-        ...
-
-    @abstractmethod
-    def iter_documents(self) -> Iterator[Document]:
-        """Yield normalized Document objects."""
-        ...
-
-    def iter_relations(self) -> Iterator[DocumentRelation]:
-        """Yield document relationships (navigation, cross-references).
-
-        Default implementation returns no relations. Override in
-        subclasses that can extract navigation structure.
-        """
-        return iter(())
-
     def document_count(self) -> int:
-        """Count documents (default: iterate)."""
+        """Count documents by iterating the normalized stream."""
         return sum(1 for _ in self.iter_documents())

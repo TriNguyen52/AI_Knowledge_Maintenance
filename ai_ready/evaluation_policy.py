@@ -1,9 +1,14 @@
-"""Evaluation Policy registry - centralized interpretation of structural findings.
+"""Interpretation policy registry - centralized interpretation of signals.
 
-Rules detect structural facts (e.g., "this heading is generic"). The policy
-registry maps those facts to AI-readiness impacts: severity, score penalty,
-ai_impact description, and recommendation template. This separates measurement
-(what the rule detects) from interpretation (what it means for AI readiness).
+Collectors detect structural facts (e.g., "this heading is generic"). The
+policy registry maps those facts to AI-readiness impacts: severity, score
+penalty, ai_impact description, and recommendation template. This separates
+measurement (what the collector detects) from interpretation (what it means
+for AI readiness).
+
+InterpretationPolicy is the generalized form of EvaluationPolicy.
+EvaluationPolicy inherits from InterpretationPolicy for backward compatibility.
+InterpretationEntry is the generalized form of PolicyEntry.
 """
 
 from __future__ import annotations
@@ -15,8 +20,13 @@ from ai_ready.models import Severity
 
 
 @dataclass
-class PolicyEntry:
-    """What a structural finding means for AI readiness."""
+class InterpretationEntry:
+    """What a signal means for AI readiness.
+
+    Generalized form of PolicyEntry. Maps a (collector_id, signal_type) pair
+    to severity, score penalty, AI impact description, and recommendation
+    template.
+    """
 
     severity: Severity
     score_penalty: int
@@ -24,34 +34,54 @@ class PolicyEntry:
     recommendation_template: str
 
 
-class EvaluationPolicy:
-    """Deterministic lookup registry mapping (rule_id, issue_type) to AI readiness impacts.
+# Backward-compatible alias
+PolicyEntry = InterpretationEntry
+
+
+class InterpretationPolicy:
+    """Deterministic lookup registry mapping (collector_id, signal_type) to AI readiness impacts.
 
     Usage:
-        policy = EvaluationPolicy()
+        policy = InterpretationPolicy()
         entry = policy.lookup("heading_quality", "placeholder")
         if entry:
-            finding.severity = entry.severity
-            finding.score = 100 - entry.score_penalty
+            signal.severity = entry.severity
+            signal.score = 100 - entry.score_penalty
+
+    During migration, lookup also accepts (rule_id, issue_type) as aliases
+    for (collector_id, signal_type).
     """
 
     def __init__(self) -> None:
-        self._registry: dict[tuple[str, str], PolicyEntry] = {}
+        self._registry: dict[tuple[str, str], InterpretationEntry] = {}
         self._load_default_policy()
 
-    def lookup(self, rule_id: str, issue_type: str) -> PolicyEntry | None:
-        """Look up the policy for a structural finding."""
-        return self._registry.get((rule_id, issue_type))
+    def lookup(self, collector_id: str, signal_type: str) -> InterpretationEntry | None:
+        """Look up the policy for a signal.
 
-    def register(self, rule_id: str, issue_type: str, entry: PolicyEntry) -> None:
-        """Register a policy entry (for testing/overrides)."""
-        self._registry[(rule_id, issue_type)] = entry
+        Args:
+            collector_id: The collector that produced the signal (alias: rule_id).
+            signal_type: The type of signal (alias: issue_type).
+        """
+        return self._registry.get((collector_id, signal_type))
+
+    def register(
+        self, collector_id: str, signal_type: str, entry: InterpretationEntry
+    ) -> None:
+        """Register a policy entry (for testing/overrides).
+
+        Args:
+            collector_id: The collector ID (alias: rule_id).
+            signal_type: The signal type (alias: issue_type).
+            entry: The interpretation entry.
+        """
+        self._registry[(collector_id, signal_type)] = entry
 
     def _load_default_policy(self) -> None:
-        """Load the built-in policy for all current rules and issue types."""
+        """Load the built-in policy for all current collectors and signal types."""
 
         # --- topic_purity ---
-        self._registry[("topic_purity", "mixed_topics")] = PolicyEntry(
+        self._registry[("topic_purity", "mixed_topics")] = InterpretationEntry(
             severity=Severity.HIGH,
             score_penalty=15,
             ai_impact=(
@@ -66,7 +96,7 @@ class EvaluationPolicy:
         )
 
         # --- heading_quality ---
-        self._registry[("heading_quality", "generic")] = PolicyEntry(
+        self._registry[("heading_quality", "generic")] = InterpretationEntry(
             severity=Severity.MEDIUM,
             score_penalty=10,
             ai_impact=(
@@ -79,7 +109,7 @@ class EvaluationPolicy:
                 "descriptive heading."
             ),
         )
-        self._registry[("heading_quality", "placeholder")] = PolicyEntry(
+        self._registry[("heading_quality", "placeholder")] = InterpretationEntry(
             severity=Severity.CRITICAL,
             score_penalty=20,
             ai_impact=(
@@ -90,7 +120,7 @@ class EvaluationPolicy:
                 "Replace placeholder heading '{heading}' with actual content heading."
             ),
         )
-        self._registry[("heading_quality", "numbered_only")] = PolicyEntry(
+        self._registry[("heading_quality", "numbered_only")] = InterpretationEntry(
             severity=Severity.CRITICAL,
             score_penalty=20,
             ai_impact=(
@@ -102,7 +132,7 @@ class EvaluationPolicy:
                 "heading that includes the action or topic."
             ),
         )
-        self._registry[("heading_quality", "too_short")] = PolicyEntry(
+        self._registry[("heading_quality", "too_short")] = InterpretationEntry(
             severity=Severity.MEDIUM,
             score_penalty=10,
             ai_impact=(
@@ -116,7 +146,7 @@ class EvaluationPolicy:
         )
 
         # --- context_independence ---
-        self._registry[("context_independence", "dangling_reference")] = PolicyEntry(
+        self._registry[("context_independence", "dangling_reference")] = InterpretationEntry(
             severity=Severity.MEDIUM,
             score_penalty=10,
             ai_impact=(
@@ -131,7 +161,7 @@ class EvaluationPolicy:
                 "'previous section', etc."
             ),
         )
-        self._registry[("context_independence", "undefined_entity")] = PolicyEntry(
+        self._registry[("context_independence", "undefined_entity")] = InterpretationEntry(
             severity=Severity.MEDIUM,
             score_penalty=10,
             ai_impact=(
@@ -145,7 +175,7 @@ class EvaluationPolicy:
         )
 
         # --- link_integrity ---
-        self._registry[("link_integrity", "broken_link")] = PolicyEntry(
+        self._registry[("link_integrity", "broken_link")] = InterpretationEntry(
             severity=Severity.MEDIUM,
             score_penalty=10,
             ai_impact=(
@@ -155,7 +185,7 @@ class EvaluationPolicy:
             ),
             recommendation_template="Fix {broken_link_count} broken link(s) in this document.",
         )
-        self._registry[("link_integrity", "orphan")] = PolicyEntry(
+        self._registry[("link_integrity", "orphan")] = InterpretationEntry(
             severity=Severity.LOW,
             score_penalty=5,
             ai_impact=(
@@ -172,11 +202,24 @@ class EvaluationPolicy:
     def validate(self) -> list[str]:
         """Validate that all entries are well-formed. Return list of errors (empty if valid)."""
         errors: list[str] = []
-        for (rule_id, issue_type), entry in self._registry.items():
-            if not rule_id or not issue_type:
-                errors.append("Empty rule_id or issue_type in registry entry")
+        for (collector_id, signal_type), entry in self._registry.items():
+            if not collector_id or not signal_type:
+                errors.append("Empty collector_id or signal_type in registry entry")
             if not entry.ai_impact or not entry.recommendation_template:
                 errors.append(
-                    f"({rule_id}, {issue_type}) missing ai_impact or recommendation_template"
+                    f"({collector_id}, {signal_type}) missing ai_impact or recommendation_template"
                 )
         return errors
+
+
+class EvaluationPolicy(InterpretationPolicy):
+    """Interpretation policy — inherits from InterpretationPolicy.
+
+    Deprecated: use InterpretationPolicy directly for new code.
+    Provides backward-compatible method signatures.
+
+    The lookup method accepts (rule_id, issue_type) as aliases for
+    (collector_id, signal_type).
+    """
+
+    pass
