@@ -6,7 +6,7 @@ import hashlib
 import re
 from pathlib import Path
 
-from ai_ready.models import CodeBlock, Document, Heading, Link, Paragraph, Section
+from ai_ready.models import CodeBlock, DocumentContent, Heading, KnowledgeArtifact, Link, Paragraph, Section
 
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 RST_HEADING_RE = re.compile(r"^([^\n]+)\n([=\-~`'\"^_*+#])\2+\s*$", re.MULTILINE)
@@ -17,11 +17,11 @@ CODE_FENCE_RE = re.compile(r"```(\w*)\n(.*?)```", re.DOTALL)
 class MarkdownDocumentParser:
     """Parse markdown-ish documents into normalized AI-Ready document models."""
 
-    def parse(self, filepath: Path, source_root: Path | None = None) -> Document:
+    def parse(self, filepath: Path, source_root: Path | None = None) -> KnowledgeArtifact:
         text = filepath.read_text(encoding="utf-8", errors="replace")
         relative_path = self._relative_path(filepath, source_root)
 
-        doc_id = hashlib.sha256(relative_path.encode()).hexdigest()[:16]
+        artifact_id = hashlib.sha256(relative_path.encode()).hexdigest()[:16]
         metadata = self._extract_frontmatter(text)
         body = self._strip_frontmatter(text)
 
@@ -33,15 +33,19 @@ class MarkdownDocumentParser:
 
         title = self._extract_title(filepath, metadata, headings)
 
-        return Document(
-            id=doc_id,
-            path=relative_path,
-            title=title,
+        content = DocumentContent(
             headings=headings,
             sections=sections,
             paragraphs=paragraphs,
             links=links,
             code_blocks=code_blocks,
+        )
+
+        return KnowledgeArtifact(
+            id=artifact_id,
+            uri=relative_path,
+            title=title,
+            content=content,
             metadata=metadata,
         )
 

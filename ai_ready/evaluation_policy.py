@@ -5,10 +5,6 @@ policy registry maps those facts to AI-readiness impacts: severity, score
 penalty, ai_impact description, and recommendation template. This separates
 measurement (what the collector detects) from interpretation (what it means
 for AI readiness).
-
-InterpretationPolicy is the generalized form of EvaluationPolicy.
-EvaluationPolicy inherits from InterpretationPolicy for backward compatibility.
-InterpretationEntry is the generalized form of PolicyEntry.
 """
 
 from __future__ import annotations
@@ -23,19 +19,14 @@ from ai_ready.models import Severity
 class InterpretationEntry:
     """What a signal means for AI readiness.
 
-    Generalized form of PolicyEntry. Maps a (collector_id, signal_type) pair
-    to severity, score penalty, AI impact description, and recommendation
-    template.
+    Maps a (collector_id, signal_type) pair to severity, score penalty,
+    AI impact description, and recommendation template.
     """
 
     severity: Severity
     score_penalty: int
     ai_impact: str
     recommendation_template: str
-
-
-# Backward-compatible alias
-PolicyEntry = InterpretationEntry
 
 
 class InterpretationPolicy:
@@ -48,8 +39,6 @@ class InterpretationPolicy:
             signal.severity = entry.severity
             signal.score = 100 - entry.score_penalty
 
-    During migration, lookup also accepts (rule_id, issue_type) as aliases
-    for (collector_id, signal_type).
     """
 
     def __init__(self) -> None:
@@ -60,8 +49,8 @@ class InterpretationPolicy:
         """Look up the policy for a signal.
 
         Args:
-            collector_id: The collector that produced the signal (alias: rule_id).
-            signal_type: The type of signal (alias: issue_type).
+            collector_id: The collector that produced the signal.
+            signal_type: The type of signal.
         """
         return self._registry.get((collector_id, signal_type))
 
@@ -71,8 +60,8 @@ class InterpretationPolicy:
         """Register a policy entry (for testing/overrides).
 
         Args:
-            collector_id: The collector ID (alias: rule_id).
-            signal_type: The signal type (alias: issue_type).
+            collector_id: The collector ID.
+            signal_type: The signal type.
             entry: The interpretation entry.
         """
         self._registry[(collector_id, signal_type)] = entry
@@ -210,16 +199,3 @@ class InterpretationPolicy:
                     f"({collector_id}, {signal_type}) missing ai_impact or recommendation_template"
                 )
         return errors
-
-
-class EvaluationPolicy(InterpretationPolicy):
-    """Interpretation policy — inherits from InterpretationPolicy.
-
-    Deprecated: use InterpretationPolicy directly for new code.
-    Provides backward-compatible method signatures.
-
-    The lookup method accepts (rule_id, issue_type) as aliases for
-    (collector_id, signal_type).
-    """
-
-    pass

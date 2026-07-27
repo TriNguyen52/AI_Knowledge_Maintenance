@@ -1,4 +1,4 @@
-"""Backward-compatible connector base class."""
+"""Source integrations for the Knowledge SDK."""
 
 from __future__ import annotations
 
@@ -7,18 +7,18 @@ from pathlib import Path
 from typing import Iterator
 
 from ai_ready.knowledge.base import KnowledgeSDK
-from ai_ready.models import Document, DocumentRelation
+from ai_ready.models import KnowledgeArtifact
 
 
 class Connector(KnowledgeSDK, ABC):
-    """Backward-compatible alias for the Knowledge SDK base.
+    """Base class for source-specific knowledge connectors.
 
-    New source integrations should subclass KnowledgeSDK directly. Existing
-    connector imports keep working through this compatibility layer.
+    Subclasses implement iter_artifacts() to produce KnowledgeArtifact
+    objects from a specific source (filesystem, API, database, etc.).
     """
 
     name: str = "base"
 
-    def document_count(self) -> int:
-        """Count documents by iterating the normalized stream."""
-        return sum(1 for _ in self.iter_documents())
+    def artifact_count(self) -> int:
+        """Count artifacts by iterating the normalized stream."""
+        return sum(1 for _ in self.iter_artifacts())

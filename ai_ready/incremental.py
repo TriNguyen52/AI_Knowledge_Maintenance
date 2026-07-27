@@ -1,15 +1,15 @@
-"""Incremental execution model — update snapshots in response to document changes.
+"""Incremental execution model — update assessments in response to artifact changes.
 
-Instead of re-running all rules across the entire corpus, the incremental executor:
-1. Classifies document changes (added, modified, deleted, link-changed)
-2. Determines which rules need to re-run on which documents
-3. Invalidates only affected findings from the previous snapshot
-4. Re-runs affected rules on affected documents
-5. Merges new findings with reused findings
+Instead of re-running all collectors across the entire corpus, the incremental executor:
+1. Classifies artifact changes (added, modified, deleted, link-changed)
+2. Determines which collectors need to re-run on which artifacts
+3. Invalidates only affected signals from the previous assessment
+4. Re-runs affected collectors on affected artifacts
+5. Merges new signals with reused signals
 6. Recomputes affected dimensions and overall score
 
-The result is a snapshot identical to what a full scan would produce,
-but computed in O(affected + neighborhood) instead of O(total documents).
+The result is an assessment identical to what a full scan would produce,
+but computed in O(affected + neighborhood) instead of O(total artifacts).
 
 If correctness cannot be guaranteed, the executor falls back to a full scan.
 """
@@ -21,15 +21,15 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ai_ready.models import (
-    Document,
-    DocumentRelation,
-    Finding,
-    KnowledgeBase,
-    RuleResult,
+    ArtifactBundle,
+    CollectorResult,
+    KnowledgeArtifact,
+    KnowledgeAssessment,
+    KnowledgeSignal,
+    Relationship,
     Severity,
-    Snapshot,
 )
-from ai_ready.rules import Rule, all_rules
+from ai_ready.rules import SignalCollector, all_collectors
 
 
 # ---------------------------------------------------------------------------
@@ -38,104 +38,103 @@ from ai_ready.rules import Rule, all_rules
 
 @dataclass
 class ChangeEvent:
-    """A single document change detected between scans.
+    """A single artifact change detected between assessments.
 
     Attributes:
         event_type: "added", "modified", or "deleted"
-        document_path: Relative path of the changed document
-        document: New Document object (None for deletions)
-        links_changed: For "modified" events, whether the document's links
+        artifact_uri: Relative URI of the changed artifact
+        artifact: New KnowledgeArtifact object (None for deletions)
+        links_changed: For "modified" events, whether the artifact's links
                        differ from the previous version. If True, link_integrity
-                       must re-evaluate. If False, link_integrity findings for
-                       this document are unchanged.
+                       must re-evaluate. If False, link_integrity signals for
+                       this artifact are unchanged.
     """
 
     event_type: str
-    document_path: str
-    document: Document | None = None
+    artifact_uri: str
+    artifact: KnowledgeArtifact | None = None
     links_changed: bool = False
 
 
 # ---------------------------------------------------------------------------
-# Rule dependencies
+# Collector dependencies
 # ---------------------------------------------------------------------------
 
 @dataclass
-class RuleDependency:
-    """Declares what a rule depends on, driving incremental execution.
+class CollectorDependency:
+    """Declares what a collector depends on, driving incremental execution.
 
     Attributes:
-        rule_id: The rule's identifier
-        scope: "per_document" if the rule only reads one document at a time,
-               "cross_document" if it needs the full KB
-        needs_full_kb_on_link_change: If True, any link change triggers a full
-                                      re-evaluation of this rule
+        collector_id: The collector's identifier
+        scope: "per_artifact" if the collector only reads one artifact at a time,
+               "cross_artifact" if it needs the full bundle
+        needs_full_bundle_on_link_change: If True, any link change triggers a full
+                                          re-evaluation of this collector
     """
-
-    rule_id: str
-    scope: str  # "per_document" | "cross_document"
-    needs_full_kb_on_link_change: bool = False
+    collector_id: str
+    scope: str  # "per_artifact" | "cross_artifact"
+    needs_full_bundle_on_link_change: bool = False
 
     def is_affected_by(self, event: ChangeEvent) -> bool:
-        """Whether this rule's findings may change due to this event."""
+        """Whether this collector's signals may change due to this event."""
         if event.event_type == "deleted":
             return True
         if event.event_type == "added":
             return True
         if event.event_type == "modified":
-            if self.scope == "per_document":
+            if self.scope == "per_artifact":
                 return True
-            if self.scope == "cross_document":
+            if self.scope == "cross_artifact":
                 return event.links_changed
         return False
 
-    def get_affected_docs(
-        self, event: ChangeEvent, all_doc_paths: set[str]
+    def get_affected_uris(
+        self, event: ChangeEvent, all_uris: set[str]
     ) -> set[str]:
-        """Which document paths need re-evaluation for this rule + event.
+        """Which artifact URIs need re-evaluation for this collector + event.
 
-        For per-document rules: only the changed document itself.
-        For cross-document rules on link changes: all documents (full KB).
-        For cross-document rules on content-only changes: empty set (skip).
+        For per-artifact collectors: only the changed artifact itself.
+        For cross-artifact collectors on link changes: all artifacts (full bundle).
+        For cross-artifact collectors on content-only changes: empty set (skip).
         """
         if event.event_type == "deleted":
-            if self.scope == "cross_document":
-                return all_doc_paths
-            return set()  # deleted doc is gone, no findings to recompute
+            if self.scope == "cross_artifact":
+                return all_uris
+            return set()  # deleted artifact is gone, no signals to recompute
 
         if event.event_type == "added":
-            if self.scope == "cross_document":
-                return all_doc_paths
-            return {event.document_path}
+            if self.scope == "cross_artifact":
+                return all_uris
+            return {event.artifact_uri}
 
         if event.event_type == "modified":
-            if self.scope == "per_document":
-                return {event.document_path}
-            if self.scope == "cross_document" and event.links_changed:
-                return all_doc_paths
-            return set()  # content-only change, cross-document rule not affected
+            if self.scope == "per_artifact":
+                return {event.artifact_uri}
+            if self.scope == "cross_artifact" and event.links_changed:
+                return all_uris
+            return set()  # content-only change, cross-artifact collector not affected
 
         return set()
 
 
-# Registry of rule dependencies
-_RULE_DEPENDENCIES: dict[str, RuleDependency] = {
-    "topic_purity": RuleDependency(
-        rule_id="topic_purity",
-        scope="per_document",
+# Registry of collector dependencies
+_COLLECTOR_DEPENDENCIES: dict[str, CollectorDependency] = {
+    "topic_purity": CollectorDependency(
+        collector_id="topic_purity",
+        scope="per_artifact",
     ),
-    "heading_quality": RuleDependency(
-        rule_id="heading_quality",
-        scope="per_document",
+    "heading_quality": CollectorDependency(
+        collector_id="heading_quality",
+        scope="per_artifact",
     ),
-    "context_independence": RuleDependency(
-        rule_id="context_independence",
-        scope="per_document",
+    "context_independence": CollectorDependency(
+        collector_id="context_independence",
+        scope="per_artifact",
     ),
-    "link_integrity": RuleDependency(
-        rule_id="link_integrity",
-        scope="cross_document",
-        needs_full_kb_on_link_change=True,
+    "link_integrity": CollectorDependency(
+        collector_id="link_integrity",
+        scope="cross_artifact",
+        needs_full_bundle_on_link_change=True,
     ),
 }
 
@@ -145,9 +144,9 @@ _RULE_DEPENDENCIES: dict[str, RuleDependency] = {
 # ---------------------------------------------------------------------------
 
 class IncrementalExecutor:
-    """Orchestrates incremental snapshot updates.
+    """Orchestrates incremental assessment updates.
 
-    Uses a ScanPipeline instance to reuse policy application, dimension
+    Uses an AssessmentPipeline instance to reuse policy application, dimension
     aggregation, and score computation — no logic is duplicated.
     """
 
@@ -155,7 +154,7 @@ class IncrementalExecutor:
         """Create an executor that reuses the given pipeline's helper methods.
 
         Args:
-            pipeline: A ScanPipeline instance with apply_policy,
+            pipeline: An AssessmentPipeline instance with apply_policy,
                       aggregate_dimensions, compute_overall_score, and
                       weights attributes.
         """
@@ -165,140 +164,140 @@ class IncrementalExecutor:
 
     def run(
         self,
-        prev_snapshot: Snapshot,
+        prev_assessment: KnowledgeAssessment,
         change_events: list[ChangeEvent],
-        all_documents: list[Document],
-        relations: list[DocumentRelation],
+        all_artifacts: list[KnowledgeArtifact],
+        relationships: list[Relationship],
         source: str = "",
         git_commit: str = "",
-    ) -> Snapshot:
-        """Produce an updated snapshot from changes.
+    ) -> KnowledgeAssessment:
+        """Produce an updated assessment from changes.
 
         Args:
-            prev_snapshot: The previous complete snapshot.
-            change_events: List of document changes since the previous scan.
-            all_documents: ALL current documents (including unchanged).
-                          The executor uses these to build KBs for rule execution.
-            relations: ALL current document relations.
+            prev_assessment: The previous complete assessment.
+            change_events: List of artifact changes since the previous scan.
+            all_artifacts: ALL current artifacts (including unchanged).
+                          The executor uses these to build bundles for collector execution.
+            relationships: ALL current artifact relationships.
             source: Source path string for metadata.
             git_commit: Git commit hash for metadata.
 
         Returns:
-            A new Snapshot that is identical to what a full scan would produce.
+            A KnowledgeAssessment that is identical to what a full scan would produce.
         """
         # --- Fallback conditions ---
-        if not prev_snapshot or not change_events:
-            return self._full_scan_fallback(all_documents, relations, source, git_commit)
+        if not prev_assessment or not change_events:
+            return self._full_scan_fallback(all_artifacts, relationships, source, git_commit)
 
-        all_doc_paths = {doc.path for doc in all_documents}
-        changed_paths = {e.document_path for e in change_events}
+        all_uris = {a.uri for a in all_artifacts}
+        changed_uris = {e.artifact_uri for e in change_events}
 
-        # If >50% of docs changed, incremental gain is minimal — do full scan
-        if len(changed_paths) > len(all_doc_paths) * 0.5:
-            return self._full_scan_fallback(all_documents, relations, source, git_commit)
+        # If >50% of artifacts changed, incremental gain is minimal — do full scan
+        if len(changed_uris) > len(all_uris) * 0.5:
+            return self._full_scan_fallback(all_artifacts, relationships, source, git_commit)
 
         # --- Classify changes ---
-        added_paths: set[str] = set()
-        modified_paths: set[str] = set()
-        deleted_paths: set[str] = set()
-        link_changed_paths: set[str] = set()
+        added_uris: set[str] = set()
+        modified_uris: set[str] = set()
+        deleted_uris: set[str] = set()
+        link_changed_uris: set[str] = set()
 
         for event in change_events:
             if event.event_type == "added":
-                added_paths.add(event.document_path)
+                added_uris.add(event.artifact_uri)
             elif event.event_type == "modified":
-                modified_paths.add(event.document_path)
+                modified_uris.add(event.artifact_uri)
                 if event.links_changed:
-                    link_changed_paths.add(event.document_path)
+                    link_changed_uris.add(event.artifact_uri)
             elif event.event_type == "deleted":
-                deleted_paths.add(event.document_path)
+                deleted_uris.add(event.artifact_uri)
 
-        per_doc_rules = ["topic_purity", "heading_quality", "context_independence"]
-        per_doc_affected = added_paths | modified_paths
+        per_doc_collectors = ["topic_purity", "heading_quality", "context_independence"]
+        per_doc_affected = added_uris | modified_uris
 
         link_integrity_affected: set[str] = set()
-        link_integrity_needs_full = bool(link_changed_paths or added_paths or deleted_paths)
+        link_integrity_needs_full = bool(link_changed_uris or added_uris or deleted_uris)
         if link_integrity_needs_full:
-            link_integrity_affected = all_doc_paths
+            link_integrity_affected = all_uris
 
-        # --- Invalidate findings from previous snapshot ---
-        # Build set of (rule_id, document_path) pairs to invalidate
+        # --- Invalidate signals from previous assessment ---
+        # Build set of (collector_id, artifact_uri) pairs to invalidate
         invalidated: set[tuple[str, str]] = set()
 
-        for rule_id in per_doc_rules:
-            for path in per_doc_affected:
-                invalidated.add((rule_id, path))
+        for collector_id in per_doc_collectors:
+            for uri in per_doc_affected:
+                invalidated.add((collector_id, uri))
 
         if link_integrity_needs_full:
-            # Invalidate all link_integrity findings
-            for f in prev_snapshot.findings:
-                if f.rule_id == "link_integrity":
-                    invalidated.add((f.rule_id, f.document_path))
+            # Invalidate all link_integrity signals
+            for s in prev_assessment.signals:
+                if s.collector_id == "link_integrity":
+                    invalidated.add((s.collector_id, s.artifact_uri))
 
-        # Also invalidate findings for deleted docs (any rule)
-        for path in deleted_paths:
-            for rule_id in per_doc_rules + ["link_integrity"]:
-                invalidated.add((rule_id, path))
+        # Also invalidate signals for deleted artifacts (any collector)
+        for uri in deleted_uris:
+            for collector_id in per_doc_collectors + ["link_integrity"]:
+                invalidated.add((collector_id, uri))
 
-        # --- Keep findings that are not invalidated ---
-        kept_findings: list[Finding] = [
-            f for f in prev_snapshot.findings
-            if (f.rule_id, f.document_path) not in invalidated
+        # --- Keep signals that are not invalidated ---
+        kept_signals: list[KnowledgeSignal] = [
+            s for s in prev_assessment.signals
+            if (s.collector_id, s.artifact_uri) not in invalidated
         ]
 
-        # --- Re-run affected rules ---
-        new_findings: list[Finding] = []
-        results: list[RuleResult] = []
+        # --- Re-run affected collectors ---
+        new_signals: list[KnowledgeSignal] = []
+        results: list[CollectorResult] = []
 
-        # Build document lookup for mini-KB construction
-        doc_by_path: dict[str, Document] = {doc.path: doc for doc in all_documents}
+        # Build artifact lookup for mini-bundle construction
+        artifact_by_uri: dict[str, KnowledgeArtifact] = {a.uri: a for a in all_artifacts}
 
-        # Run per-document rules on affected docs only
+        # Run per-artifact collectors on affected artifacts only
         if per_doc_affected:
-            affected_docs = [
-                doc_by_path[p] for p in per_doc_affected
-                if p in doc_by_path
+            affected_artifacts = [
+                artifact_by_uri[uri] for uri in per_doc_affected
+                if uri in artifact_by_uri
             ]
-            if affected_docs:
-                mini_kb = KnowledgeBase(
-                    documents=affected_docs,
-                    relations=relations,  # relations don't affect per-doc rules
+            if affected_artifacts:
+                mini_bundle = ArtifactBundle(
+                    artifacts=affected_artifacts,
+                    relationships=relationships,  # relationships don't affect per-artifact collectors
                     source=source,
                 )
-                registry = all_rules()
-                for rule_id in per_doc_rules:
-                    if rule_id not in registry:
+                registry = all_collectors()
+                for collector_id in per_doc_collectors:
+                    if collector_id not in registry:
                         continue
-                    if self.pipeline.enabled_rules and rule_id not in self.pipeline.enabled_rules:
+                    if self.pipeline.enabled_collectors and collector_id not in self.pipeline.enabled_collectors:
                         continue
-                    rule = registry[rule_id]()
-                    result = rule.run(mini_kb)
+                    collector = registry[collector_id]()
+                    result = collector.run(mini_bundle)
                     results.append(result)
-                    new_findings.extend(result.findings)
+                    new_signals.extend(result.signals)
 
-        # Run link_integrity on full KB if needed
+        # Run link_integrity on full bundle if needed
         if link_integrity_needs_full:
-            registry = all_rules()
-            rule_id = "link_integrity"
-            if rule_id in registry:
-                if not self.pipeline.enabled_rules or rule_id in self.pipeline.enabled_rules:
-                    full_kb = KnowledgeBase(
-                        documents=all_documents,
-                        relations=relations,
+            registry = all_collectors()
+            collector_id = "link_integrity"
+            if collector_id in registry:
+                if not self.pipeline.enabled_collectors or collector_id in self.pipeline.enabled_collectors:
+                    full_bundle = ArtifactBundle(
+                        artifacts=all_artifacts,
+                        relationships=relationships,
                         source=source,
                     )
-                    rule = registry[rule_id]()
-                    result = rule.run(full_kb)
+                    collector = registry[collector_id]()
+                    result = collector.run(full_bundle)
                     results.append(result)
-                    new_findings.extend(result.findings)
+                    new_signals.extend(result.signals)
 
-        if new_findings:
-            self.pipeline.apply_policy(new_findings)
+        if new_signals:
+            self.pipeline.apply_policy(new_signals)
 
-        all_findings = kept_findings + new_findings
+        all_signals = kept_signals + new_signals
 
-        all_results = self._build_all_results(results, all_findings, prev_snapshot)
-        dimensions = self.pipeline.aggregate_dimensions(all_results, all_findings)
+        all_results = self._build_all_results(results, all_signals, prev_assessment)
+        dimensions = self.pipeline.aggregate_dimensions(all_results, all_signals)
 
         # --- Recompute overall score ---
         overall_score = self.pipeline.compute_overall_score(dimensions)
@@ -308,81 +307,81 @@ class IncrementalExecutor:
         for r in results:
             metrics.update(r.metrics)
 
-        # --- Create updated snapshot ---
-        snapshot_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # --- Create updated assessment ---
+        assessment_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         metadata: dict[str, Any] = {
             "source": source,
-            "document_count": len(all_documents),
-            "relation_count": len(relations),
+            "artifact_count": len(all_artifacts),
+            "relationship_count": len(relationships),
             "incremental": True,
-            "changed_documents": len(changed_paths),
+            "changed_artifacts": len(changed_uris),
         }
         if git_commit:
             metadata["git_commit"] = git_commit
 
-        return Snapshot(
-            snapshot_id=snapshot_id,
+        return KnowledgeAssessment(
+            assessment_id=assessment_id,
             score=overall_score,
             dimensions=dimensions,
-            findings=all_findings,
+            signals=all_signals,
             metrics=metrics,
             metadata=metadata,
         )
 
     def _build_all_results(
         self,
-        new_results: list[RuleResult],
-        all_findings: list[Finding],
-        prev_snapshot: Snapshot,
-    ) -> list[RuleResult]:
-        """Build a complete RuleResult list for dimension aggregation.
+        new_results: list[CollectorResult],
+        all_signals: list[KnowledgeSignal],
+        prev_assessment: KnowledgeAssessment,
+    ) -> list[CollectorResult]:
+        """Build a complete CollectorResult list for dimension aggregation.
 
-        For rules that ran incrementally, use their new RuleResult.
-        For rules that didn't run (no affected docs), construct a RuleResult
-        from the kept findings so that aggregate_dimensions can compute
+        For collectors that ran incrementally, use their new CollectorResult.
+        For collectors that didn't run (no affected artifacts), construct a CollectorResult
+        from the kept signals so that aggregate_dimensions can compute
         the correct dimension scores.
 
-        All registered rules must have a RuleResult, even if they have zero
-        findings, because aggregate_dimensions uses RuleResult.rule_id to
-        look up the rule's dimension. Without a RuleResult, the rule's
+        All registered collectors must have a CollectorResult, even if they have zero
+        signals, because aggregate_dimensions uses CollectorResult.collector_id to
+        look up the collector's dimension. Without a CollectorResult, the collector's
         dimension would be missing from the output, changing the overall
         score calculation.
         """
-        ran_rule_ids = {r.rule_id for r in new_results}
-        registry = all_rules()
+        ran_collector_ids = {r.collector_id for r in new_results}
+        registry = all_collectors()
 
         results = list(new_results)
 
-        for rule_id in registry:
-            if rule_id in ran_rule_ids:
+        for collector_id in registry:
+            if collector_id in ran_collector_ids:
                 continue
-            if self.pipeline.enabled_rules and rule_id not in self.pipeline.enabled_rules:
+            if self.pipeline.enabled_collectors and collector_id not in self.pipeline.enabled_collectors:
                 continue
-            # Construct a RuleResult from existing findings
-            rule_findings = [f for f in all_findings if f.rule_id == rule_id]
-            results.append(RuleResult(
-                rule_id=rule_id,
+            # Construct a CollectorResult from existing signals
+            collector_signals = [s for s in all_signals if s.collector_id == collector_id]
+            results.append(CollectorResult(
+                collector_id=collector_id,
                 score=100,  # Placeholder; aggregate_dimensions recomputes
                 severity=Severity.LOW,
                 metrics={},
-                findings=rule_findings,
+                signals=collector_signals,
             ))
 
         return results
 
     def _full_scan_fallback(
         self,
-        documents: list[Document],
-        relations: list[DocumentRelation],
+        artifacts: list[KnowledgeArtifact],
+        relationships: list[Relationship],
         source: str,
         git_commit: str,
-    ) -> Snapshot:
+    ) -> KnowledgeAssessment:
         """Fall back to a full scan via the pipeline."""
         return self.pipeline.run(
-            documents,
+            artifacts,
             source=source,
             git_commit=git_commit,
-            relations=relations,
+            relationships=relationships,
         )
 
 
@@ -392,69 +391,67 @@ class IncrementalExecutor:
 
 def detect_changes(
     source_path: Any,
-    prev_snapshot: Snapshot | None,
-    current_documents: list[Document],
+    prev_assessment: KnowledgeAssessment | None,
+    current_artifacts: list[KnowledgeArtifact],
 ) -> list[ChangeEvent]:
-    """Detect document changes between a previous snapshot and current state.
+    """Detect artifact changes between a previous assessment and current state.
 
-    Uses git diff when available. Falls back to snapshot comparison.
+    Uses git diff when available. Falls back to assessment comparison.
 
     Args:
         source_path: Path to the knowledge base directory.
-        prev_snapshot: The previous snapshot (None if no history).
-        current_documents: All current Document objects.
+        prev_assessment: The previous assessment (None if no history).
+        current_artifacts: All current KnowledgeArtifact objects.
 
     Returns:
         List of ChangeEvent objects. Empty list means no changes detected
         (which will trigger a full scan fallback).
     """
-    if prev_snapshot is None:
+    if prev_assessment is None:
         return []  # No previous state — can't do incremental
 
-    current_by_path: dict[str, Document] = {doc.path: doc for doc in current_documents}
-    current_paths = set(current_by_path.keys())
+    current_by_uri: dict[str, KnowledgeArtifact] = {a.uri: a for a in current_artifacts}
+    current_uris = set(current_by_uri.keys())
 
-    prev_paths: set[str] = set()
-    prev_doc_links: dict[str, list[str]] = {}
+    prev_uris: set[str] = set()
+    for s in prev_assessment.signals:
+        prev_uris.add(s.artifact_uri)
 
-    for f in prev_snapshot.findings:
-        prev_paths.add(f.document_path)
+    prev_artifact_count = prev_assessment.metadata.get("artifact_count", 0)
 
-    prev_doc_count = prev_snapshot.metadata.get("document_count", 0)
-
-    if not prev_paths and prev_doc_count > 0:
-        return []  
+    if not prev_uris and prev_artifact_count > 0:
+        return []
 
     # Detect changes
     events: list[ChangeEvent] = []
 
-    # Added documents
-    for path in current_paths - prev_paths:
+    # Added artifacts
+    for uri in current_uris - prev_uris:
         events.append(ChangeEvent(
             event_type="added",
-            document_path=path,
-            document=current_by_path[path],
-            links_changed=True,  
+            artifact_uri=uri,
+            artifact=current_by_uri[uri],
+            links_changed=True,
         ))
 
-    # Deleted documents
-    for path in prev_paths - current_paths:
+    # Deleted artifacts
+    for uri in prev_uris - current_uris:
         events.append(ChangeEvent(
             event_type="deleted",
-            document_path=path,
-            document=None,
+            artifact_uri=uri,
+            artifact=None,
         ))
 
-    # Modified documents — compare links
-    for path in current_paths & prev_paths:
-        doc = current_by_path[path]
-        current_internal_links = {link.target for link in doc.links if link.is_internal}
+    # Modified artifacts — compare links
+    for uri in current_uris & prev_uris:
+        artifact = current_by_uri[uri]
+        current_internal_links = {link.target for link in artifact.links if link.is_internal}
 
         events.append(ChangeEvent(
             event_type="modified",
-            document_path=path,
-            document=doc,
-            links_changed=True,  
+            artifact_uri=uri,
+            artifact=artifact,
+            links_changed=True,
         ))
 
     return events
@@ -462,8 +459,8 @@ def detect_changes(
 
 def detect_changes_via_git(
     source_path: Any,
-    prev_snapshot: Snapshot | None,
-    current_documents: list[Document],
+    prev_assessment: KnowledgeAssessment | None,
+    current_artifacts: list[KnowledgeArtifact],
 ) -> list[ChangeEvent] | None:
     """Detect changes using git diff.
 
@@ -477,10 +474,10 @@ def detect_changes_via_git(
     if not source.is_dir():
         return None
 
-    if prev_snapshot is None:
+    if prev_assessment is None:
         return None
 
-    prev_commit = prev_snapshot.metadata.get("git_commit", "")
+    prev_commit = prev_assessment.metadata.get("git_commit", "")
     if not prev_commit:
         return None
 
@@ -494,9 +491,9 @@ def detect_changes_via_git(
 
         lines = result.stdout.strip().split("\n")
         if not lines or lines == [""]:
-            return []  
+            return []
 
-        current_by_path = {doc.path: doc for doc in current_documents}
+        current_by_uri = {a.uri: a for a in current_artifacts}
         events: list[ChangeEvent] = []
 
         for line in lines:
@@ -513,52 +510,52 @@ def detect_changes_via_git(
             if not any(file_path.endswith(ext) for ext in [".md", ".markdown", ".mdx", ".txt", ".rst"]):
                 continue
 
-            doc_path = None
-            if file_path in current_by_path:
-                doc_path = file_path
+            artifact_uri = None
+            if file_path in current_by_uri:
+                artifact_uri = file_path
             else:
                 # Try matching as suffix
-                for p in current_by_path:
+                for p in current_by_uri:
                     if p.endswith(file_path) or file_path.endswith(p):
-                        doc_path = p
+                        artifact_uri = p
                         break
 
             if status.startswith("A"):
                 # Added
-                if doc_path:
+                if artifact_uri:
                     events.append(ChangeEvent(
                         event_type="added",
-                        document_path=doc_path,
-                        document=current_by_path[doc_path],
+                        artifact_uri=artifact_uri,
+                        artifact=current_by_uri[artifact_uri],
                         links_changed=True,
                     ))
             elif status.startswith("D"):
                 # Deleted
-                if doc_path:
+                if artifact_uri:
                     events.append(ChangeEvent(
                         event_type="deleted",
-                        document_path=doc_path,
-                        document=None,
+                        artifact_uri=artifact_uri,
+                        artifact=None,
                     ))
             elif status.startswith("R"):
                 # Renamed — treat as delete + add
-                if doc_path:
+                if artifact_uri:
                     events.append(ChangeEvent(
                         event_type="added",
-                        document_path=doc_path,
-                        document=current_by_path[doc_path],
+                        artifact_uri=artifact_uri,
+                        artifact=current_by_uri[artifact_uri],
                         links_changed=True,
                     ))
             else:
                 # Modified (M) or unknown
-                if doc_path:
-                    doc = current_by_path[doc_path]
-                    current_links = {link.target for link in doc.links if link.is_internal}
+                if artifact_uri:
+                    artifact = current_by_uri[artifact_uri]
+                    current_links = {link.target for link in artifact.links if link.is_internal}
 
                     events.append(ChangeEvent(
                         event_type="modified",
-                        document_path=doc_path,
-                        document=doc,
+                        artifact_uri=artifact_uri,
+                        artifact=artifact,
                         links_changed=True,  # Conservative
                     ))
 

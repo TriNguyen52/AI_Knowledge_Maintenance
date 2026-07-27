@@ -6,14 +6,14 @@ from pathlib import Path
 from typing import Iterator
 
 from ai_ready.knowledge.base import KnowledgeCapability, KnowledgeSDK
-from ai_ready.models import Document, DocumentRelation, Heading, Paragraph, Section
+from ai_ready.models import DocumentContent, Heading, KnowledgeArtifact, Paragraph, Relationship, Section
 
 
 class PineconeKnowledgeSDK(KnowledgeSDK):
     """Example SDK for a vector-store-backed knowledge source."""
 
     name = "pinecone"
-    supported_capabilities = frozenset({KnowledgeCapability.DOCUMENTS})
+    supported_capabilities = frozenset({KnowledgeCapability.ARTIFACTS})
 
     @classmethod
     def supports(cls, source: str | Path) -> bool:
@@ -22,10 +22,10 @@ class PineconeKnowledgeSDK(KnowledgeSDK):
     def connect(self, source: str | Path) -> None:
         self._source = Path(str(source))
 
-    def iter_documents(self) -> Iterator[Document]:
+    def iter_artifacts(self) -> Iterator[KnowledgeArtifact]:
         return iter(())
 
-    def iter_relations(self) -> Iterator[DocumentRelation]:
+    def iter_relationships(self) -> Iterator[Relationship]:
         return iter(())
 
 
@@ -34,7 +34,7 @@ class ConfluenceKnowledgeSDK(KnowledgeSDK):
 
     name = "confluence"
     supported_capabilities = frozenset({
-        KnowledgeCapability.DOCUMENTS,
+        KnowledgeCapability.ARTIFACTS,
         KnowledgeCapability.RELATIONS,
         KnowledgeCapability.METADATA,
     })
@@ -46,17 +46,19 @@ class ConfluenceKnowledgeSDK(KnowledgeSDK):
     def connect(self, source: str | Path) -> None:
         self._source = Path(str(source))
 
-    def iter_documents(self) -> Iterator[Document]:
-        example = Document(
+    def iter_artifacts(self) -> Iterator[KnowledgeArtifact]:
+        example = KnowledgeArtifact(
             id="confluence-example",
-            path="spaces/example/page",
+            uri="spaces/example/page",
             title="Example Confluence Page",
-            headings=[Heading(level=1, text="Example Confluence Page", line=1)],
-            sections=[Section(heading=None, text="Example content from Confluence.", line_start=1, line_end=1)],
-            paragraphs=[Paragraph(text="Example content from Confluence.", section_heading="", line=1)],
+            content=DocumentContent(
+                headings=[Heading(level=1, text="Example Confluence Page", line=1)],
+                sections=[Section(heading=None, text="Example content from Confluence.", line_start=1, line_end=1)],
+                paragraphs=[Paragraph(text="Example content from Confluence.", section_heading="", line=1)],
+            ),
             metadata={"source": "confluence"},
         )
         return iter([example])
 
-    def iter_relations(self) -> Iterator[DocumentRelation]:
+    def iter_relationships(self) -> Iterator[Relationship]:
         return iter(())

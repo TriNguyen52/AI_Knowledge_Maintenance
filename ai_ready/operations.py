@@ -1,14 +1,12 @@
-"""Collect and Assess operations — extracted from ScanPipeline.
+"""Collect and Assess operations — extracted from AssessmentPipeline.
 
-CollectOperation runs collectors against a knowledge base and produces
+CollectOperation runs collectors against an artifact bundle and produces
 raw KnowledgeSignals (bare facts without interpretation).
 
-AssessOperation converts signals into AssessedSignals (Findings) by
-applying interpretation policy, then aggregates dimensions and computes
-the overall score to produce a snapshot (assessment during migration).
+AssessOperation applies interpretation policy to signals, then aggregates
+dimensions and computes the overall score to produce a KnowledgeAssessment.
 
-ScanPipeline.run() delegates to CollectOperation then AssessOperation.
-This is a facade extraction — no behavior change.
+AssessmentPipeline.run() delegates to CollectOperation then AssessOperation.
 """
 
 from __future__ import annotations
@@ -18,31 +16,28 @@ from typing import Any
 
 from ai_ready.evaluation_policy import InterpretationPolicy
 from ai_ready.models import (
-    AssessedSignal,
+    ArtifactBundle,
+    AssessmentDiff,
+    CollectorResult,
     DimensionScore,
-    DocumentRelation,
-    Finding,
-    KnowledgeBase,
+    KnowledgeArtifact,
+    KnowledgeAssessment,
     KnowledgeSignal,
-    RegressionReport,
-    RuleResult,
+    Relationship,
     Severity,
-    Snapshot,
     _severity_rank,
 )
 from ai_ready.rules import SignalCollector, all_collectors
 
 
 class CollectOperation:
-    """Runs collectors against a knowledge base and produces raw signals.
+    """Runs collectors against an artifact bundle and produces raw signals.
 
-    Extracted from ScanPipeline.run() — the collection phase.
+    Extracted from AssessmentPipeline.run() — the collection phase.
 
-    Collectors (rules) still emit Finding objects internally for backward
-    compatibility. CollectOperation converts them to KnowledgeSignal
-    (bare facts) as the primary output. The assessment layer converts
-    signals back to AssessedSignal (Finding) and enriches them with
-    interpretation via InterpretationPolicy.
+    Collectors (SignalCollectors) emit KnowledgeSignal objects as the
+    primary output. CollectOperation passes an ArtifactBundle to each
+    collector and collects the resulting CollectorResult objects.
     """
 
     def __init__(self, enabled_collectors: list[str] | None = None) -> None:
@@ -50,20 +45,18 @@ class CollectOperation:
 
     def run(
         self,
-        documents: list,
-        relations: list[DocumentRelation] | None = None,
+        artifacts: list[KnowledgeArtifact],
+        relationships: list[Relationship] | None = None,
         source: str = "",
-    ) -> tuple[list[RuleResult], list[KnowledgeSignal], KnowledgeBase]:
-        """Run all enabled collectors and return results, signals, and the KB.
+    ) -> tuple[list[CollectorResult], list[KnowledgeSignal], ArtifactBundle]:
+        """Run all enabled collectors and return results, signals, and the bundle.
 
         Returns:
-            A tuple of (collector_results, all_signals, knowledge_base).
-            collector_results still contain Finding objects for backward
-            compatibility, but all_signals are the canonical output.
+            A tuple of (collector_results, all_signals, artifact_bundle).
         """
-        kb = KnowledgeBase(
-            documents=documents,
-            relations=relations or [],
+        bundle = ArtifactBundle(
+            artifacts=artifacts,
+            relationships=relationships or [],
             source=source,
         )
 
@@ -73,27 +66,26 @@ class CollectOperation:
         else:
             collector_ids = list(registry.keys())
 
-        results: list[RuleResult] = []
+        results: list[CollectorResult] = []
         all_signals: list[KnowledgeSignal] = []
         for collector_id in collector_ids:
             collector_cls = registry[collector_id]
             collector = collector_cls()
-            result = collector.run(kb)
+            result = collector.run(bundle)
             results.append(result)
-            # Convert findings to signals (strip interpretation)
-            all_signals.extend(f.to_signal() for f in result.findings)
+            all_signals.extend(result.signals)
 
-        return results, all_signals, kb
+        return results, all_signals, bundle
 
 
 class AssessOperation:
     """Applies interpretation policy, aggregates dimensions, computes score.
 
-    Extracted from ScanPipeline.run() — the assessment phase.
+    Extracted from AssessmentPipeline.run() — the assessment phase.
 
-    Converts KnowledgeSignals to AssessedSignals (Findings) by applying
-    InterpretationPolicy, then aggregates dimensions and computes the
-    overall score to produce a Snapshot.
+    Applies InterpretationPolicy to enrich KnowledgeSignals with severity,
+    score, recommendation, and ai_impact, then aggregates dimensions and
+    computes the overall score to produce a KnowledgeAssessment.
     """
 
     def __init__(
@@ -107,34 +99,31 @@ class AssessOperation:
 
     def run(
         self,
-        results: list[RuleResult],
+        results: list[CollectorResult],
         signals: list[KnowledgeSignal],
-        documents: list,
-        kb: KnowledgeBase,
+        artifacts: list[KnowledgeArtifact],
+        bundle: ArtifactBundle,
         source: str = "",
         git_commit: str = "",
-    ) -> Snapshot:
-        """Convert signals to assessed findings, aggregate, and produce a snapshot.
+    ) -> KnowledgeAssessment:
+        """Apply policy to signals, aggregate, and produce an assessment.
 
         Args:
             results: Collector results from CollectOperation.
             signals: Bare KnowledgeSignals from CollectOperation.
-            documents: Original document list (for metadata).
-            kb: KnowledgeBase from CollectOperation.
+            artifacts: Original artifact list (for metadata).
+            bundle: ArtifactBundle from CollectOperation.
             source: Source path string for metadata.
             git_commit: Git commit hash for metadata.
 
         Returns:
-            A Snapshot with assessed findings, dimension scores, and overall score.
+            A KnowledgeAssessment with assessed signals, dimension scores, and overall score.
         """
-        # Convert signals to AssessedSignals (Findings) with placeholder interpretation
-        assessed_signals = self.signals_to_assessed(signals)
-
         # Apply policy to populate severity, score, ai_impact, recommendation
-        self.apply_policy(assessed_signals)
+        self.apply_policy(signals)
 
         # Aggregate into dimensions
-        dimensions = self.aggregate_dimensions(results, assessed_signals)
+        dimensions = self.aggregate_dimensions(results, signals)
 
         # Compute overall score
         overall_score = self.compute_overall_score(dimensions)
@@ -144,89 +133,80 @@ class AssessOperation:
         for r in results:
             metrics.update(r.metrics)
 
-        # Create snapshot
-        snapshot_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Create assessment
+        assessment_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         metadata: dict[str, Any] = {"source": source}
         if git_commit:
             metadata["git_commit"] = git_commit
-        metadata["document_count"] = len(documents)
-        metadata["relation_count"] = len(kb.relations)
+        metadata["artifact_count"] = len(artifacts)
+        metadata["relationship_count"] = len(bundle.relationships)
 
-        return Snapshot(
-            snapshot_id=snapshot_id,
+        return KnowledgeAssessment(
+            assessment_id=assessment_id,
             score=overall_score,
             dimensions=dimensions,
-            findings=assessed_signals,
+            signals=signals,
             metrics=metrics,
             metadata=metadata,
         )
 
-    @staticmethod
-    def signals_to_assessed(signals: list[KnowledgeSignal]) -> list[AssessedSignal]:
-        """Convert bare KnowledgeSignals to AssessedSignals with placeholder interpretation.
-
-        The placeholders (severity=LOW, score=100, empty recommendation/ai_impact)
-        are enriched by apply_policy() afterwards.
-        """
-        return [Finding.from_signal(s) for s in signals]
-
     def aggregate_dimensions(
-        self, results: list[RuleResult], findings: list[Finding]
+        self, results: list[CollectorResult], signals: list[KnowledgeSignal]
     ) -> dict[str, DimensionScore]:
         """Aggregate collector results into dimension scores.
 
-        Collector scores are recomputed from policy-assessed findings rather than
+        Collector scores are recomputed from policy-assessed signals rather than
         the placeholder scores emitted by collectors.
         """
-        dim_results: dict[str, list[RuleResult]] = {}
+        dim_results: dict[str, list[CollectorResult]] = {}
         for r in results:
-            collector_cls = all_collectors().get(r.rule_id)
+            collector_cls = all_collectors().get(r.collector_id)
             if collector_cls:
                 dim = collector_cls.dimension
                 dim_results.setdefault(dim, []).append(r)
 
         dimensions: dict[str, DimensionScore] = {}
         for dim_name, dim_results_list in dim_results.items():
-            # Recompute collector scores from assessed findings
+            # Recompute collector scores from assessed signals
             collector_scores = []
             for r in dim_results_list:
-                collector_findings = [f for f in findings if f.rule_id == r.rule_id]
-                if collector_findings:
-                    total_penalty = sum(100 - f.score for f in collector_findings)
+                collector_signals = [s for s in signals if s.collector_id == r.collector_id]
+                if collector_signals:
+                    total_penalty = sum(100 - s.score for s in collector_signals)
                     collector_score = max(0, 100 - total_penalty)
                 else:
                     collector_score = 100
                 collector_scores.append(collector_score)
 
             avg_score = int(sum(collector_scores) / len(collector_scores)) if collector_scores else 100
-            rule_ids = [r.rule_id for r in dim_results_list]
-            findings_count = sum(
-                len([f for f in findings if f.rule_id == r.rule_id]) for r in dim_results_list
+            collector_ids = [r.collector_id for r in dim_results_list]
+            signals_count = sum(
+                len([s for s in signals if s.collector_id == r.collector_id]) for r in dim_results_list
             )
 
             dimensions[dim_name] = DimensionScore(
                 name=dim_name,
                 score=avg_score,
-                rule_ids=rule_ids,
-                findings_count=findings_count,
+                collector_ids=collector_ids,
+                signals_count=signals_count,
             )
 
         return dimensions
 
-    def apply_policy(self, findings: list[Finding]) -> None:
+    def apply_policy(self, signals: list[KnowledgeSignal]) -> None:
         """Populate severity, score, ai_impact, and recommendation from policy."""
-        for finding in findings:
-            entry = self.policy.lookup(finding.rule_id, finding.issue_type)
+        for signal in signals:
+            entry = self.policy.lookup(signal.collector_id, signal.signal_type)
             if entry:
-                finding.severity = entry.severity
-                finding.score = 100 - entry.score_penalty
-                finding.ai_impact = entry.ai_impact
-                finding.recommendation = entry.recommendation_template.format(
-                    **finding.evidence
+                signal.severity = entry.severity
+                signal.score = 100 - entry.score_penalty
+                signal.ai_impact = entry.ai_impact
+                signal.recommendation = entry.recommendation_template.format(
+                    **signal.evidence
                 )
             else:
-                finding.ai_impact = "No AI impact description available."
-                finding.recommendation = f"Issue: {finding.issue_type}"
+                signal.ai_impact = "No AI impact description available."
+                signal.recommendation = f"Issue: {signal.signal_type}"
 
     def compute_overall_score(self, dimensions: dict[str, DimensionScore]) -> int:
         """Compute weighted average of dimension scores."""
@@ -243,43 +223,39 @@ class AssessOperation:
 
 
 class DiffOperation:
-    """Computes diffs between two snapshots or assessments.
+    """Computes diffs between two assessments.
 
-    Extracted from SnapshotStore._compute_diff — the diff/regression logic
+    Extracted from AssessmentStore._compute_diff — the diff/regression logic
     is pure computation that doesn't need DB access. This makes it testable
-    in isolation and reusable by both SnapshotStore and AssessmentStore.
+    in isolation and reusable by both AssessmentStore and AssessmentStoreFacade.
     """
 
     @staticmethod
-    def compute_diff(prev: Snapshot, curr: Snapshot) -> RegressionReport:
-        """Compute regression report between two snapshots using stable finding IDs.
-
-        This is the same logic previously in SnapshotStore._compute_diff,
-        extracted as a standalone operation.
-        """
-        prev_by_id = {f.finding_id: f for f in prev.findings}
-        curr_by_id = {f.finding_id: f for f in curr.findings}
+    def compute_diff(prev: KnowledgeAssessment, curr: KnowledgeAssessment) -> AssessmentDiff:
+        """Compute diff between two assessments using stable signal IDs."""
+        prev_by_id = {s.signal_id: s for s in prev.signals}
+        curr_by_id = {s.signal_id: s for s in curr.signals}
 
         prev_ids = set(prev_by_id.keys())
         curr_ids = set(curr_by_id.keys())
 
-        new_findings = [curr_by_id[fid] for fid in curr_ids - prev_ids]
-        resolved_findings = [prev_by_id[fid] for fid in prev_ids - curr_ids]
-        persistent_findings = [curr_by_id[fid] for fid in curr_ids & prev_ids]
+        new_signals = [curr_by_id[sid] for sid in curr_ids - prev_ids]
+        resolved_signals = [prev_by_id[sid] for sid in prev_ids - curr_ids]
+        persistent_signals = [curr_by_id[sid] for sid in curr_ids & prev_ids]
 
         # Detect severity changes
         severity_changes: list[dict[str, Any]] = []
-        for fid in curr_ids & prev_ids:
-            pf = prev_by_id[fid]
-            cf = curr_by_id[fid]
-            if pf.severity != cf.severity:
+        for sid in curr_ids & prev_ids:
+            ps = prev_by_id[sid]
+            cs = curr_by_id[sid]
+            if ps.severity != cs.severity:
                 severity_changes.append({
-                    "finding_id": fid,
-                    "rule_id": cf.rule_id,
-                    "document_path": cf.document_path,
-                    "prev_severity": pf.severity.value,
-                    "curr_severity": cf.severity.value,
-                    "direction": "worse" if _severity_rank(cf.severity) > _severity_rank(pf.severity) else "better",
+                    "signal_id": sid,
+                    "collector_id": cs.collector_id,
+                    "artifact_uri": cs.artifact_uri,
+                    "prev_severity": ps.severity.value,
+                    "curr_severity": cs.severity.value,
+                    "direction": "worse" if _severity_rank(cs.severity) > _severity_rank(ps.severity) else "better",
                 })
 
         # Dimension deltas
@@ -289,7 +265,7 @@ class DiffOperation:
             curr_score = curr.dimensions[dim_name].score if dim_name in curr.dimensions else 0
             dim_deltas[dim_name] = curr_score - prev_score
 
-        new_high = sum(1 for f in new_findings if f.severity in (Severity.HIGH, Severity.CRITICAL))
+        new_high = sum(1 for s in new_signals if s.severity in (Severity.HIGH, Severity.CRITICAL))
 
         # Metric deltas
         prev_contradictions = prev.metrics.get("contradiction_count", 0)
@@ -320,17 +296,17 @@ class DiffOperation:
 
         # Build explanation
         explanation_parts: list[str] = []
-        if new_findings:
-            explanation_parts.append(f"{len(new_findings)} new findings")
-        if resolved_findings:
-            explanation_parts.append(f"{len(resolved_findings)} resolved")
+        if new_signals:
+            explanation_parts.append(f"{len(new_signals)} new signals")
+        if resolved_signals:
+            explanation_parts.append(f"{len(resolved_signals)} resolved")
         if severity_changes:
             worse = sum(1 for s in severity_changes if s["direction"] == "worse")
             better = sum(1 for s in severity_changes if s["direction"] == "better")
             if worse:
-                explanation_parts.append(f"{worse} findings got worse")
+                explanation_parts.append(f"{worse} signals got worse")
             if better:
-                explanation_parts.append(f"{better} findings improved")
+                explanation_parts.append(f"{better} signals improved")
         top_regression = next(
             (c for c in contributor_changes if c["delta_estimated_score_gain"] > 0),
             None,
@@ -359,29 +335,29 @@ class DiffOperation:
 
         recommendation = ""
         if curr.score < prev.score:
-            recommendation = f"Score dropped {prev.score} -> {curr.score}. Review {len(new_findings)} new findings before deployment."
+            recommendation = f"Score dropped {prev.score} -> {curr.score}. Review {len(new_signals)} new signals before deployment."
         elif new_high > 0:
-            recommendation = f"{new_high} new high-severity findings. Review before deployment."
-        elif len(resolved_findings) > 0 and not new_findings:
-            recommendation = f"Improving. {len(resolved_findings)} findings resolved, no new issues."
-        elif not new_findings:
+            recommendation = f"{new_high} new high-severity signals. Review before deployment."
+        elif len(resolved_signals) > 0 and not new_signals:
+            recommendation = f"Improving. {len(resolved_signals)} signals resolved, no new issues."
+        elif not new_signals:
             recommendation = "No regressions detected."
 
-        return RegressionReport(
-            prev_snapshot_id=prev.snapshot_id,
-            curr_snapshot_id=curr.snapshot_id,
+        return AssessmentDiff(
+            prev_assessment_id=prev.assessment_id,
+            curr_assessment_id=curr.assessment_id,
             prev_score=prev.score,
             curr_score=curr.score,
             score_delta=curr.score - prev.score,
-            new_findings=new_findings,
-            resolved_findings=resolved_findings,
-            persistent_findings=persistent_findings,
+            new_signals=new_signals,
+            resolved_signals=resolved_signals,
+            persistent_signals=persistent_signals,
             severity_changes=severity_changes,
             dimension_deltas=dim_deltas,
             new_high_count=new_high,
             increased_contradictions=max(0, curr_contradictions - prev_contradictions),
             increased_topic_entropy=max(0, curr_entropy - prev_entropy),
-            new_orphan_documents=max(0, curr_orphans - prev_orphans),
+            new_orphan_artifacts=max(0, curr_orphans - prev_orphans),
             new_duplicate_clusters=max(0, curr_dupes - prev_dupes),
             score_change_explanation=score_change_explanation,
             contributor_changes=contributor_changes[:10],
@@ -391,10 +367,10 @@ class DiffOperation:
 
     @staticmethod
     def _compute_contributor_changes(
-        prev: Snapshot,
-        curr: Snapshot,
+        prev: KnowledgeAssessment,
+        curr: KnowledgeAssessment,
     ) -> list[dict[str, Any]]:
-        """Compare derived score contributors between two snapshots."""
+        """Compare derived score contributors between two assessments."""
         prev_contributors = {
             c.key: c for c in prev.explain_score(max_contributors=50).dominant_contributors
         }
@@ -412,10 +388,10 @@ class DiffOperation:
 
             prev_gain = prev_c.estimated_score_gain if prev_c else 0.0
             curr_gain = curr_c.estimated_score_gain if curr_c else 0.0
-            prev_count = prev_c.finding_count if prev_c else 0
-            curr_count = curr_c.finding_count if curr_c else 0
-            prev_ids = set(prev_c.finding_ids if prev_c else [])
-            curr_ids = set(curr_c.finding_ids if curr_c else [])
+            prev_count = prev_c.signal_count if prev_c else 0
+            curr_count = curr_c.signal_count if curr_c else 0
+            prev_ids = set(prev_c.signal_ids if prev_c else [])
+            curr_ids = set(curr_c.signal_ids if curr_c else [])
 
             delta = curr_gain - prev_gain
             if delta == 0 and curr_count == prev_count:
@@ -424,24 +400,24 @@ class DiffOperation:
             changes.append({
                 "key": key,
                 "dimension": representative.dimension,
-                "rule": representative.rule_id,
-                "issue_type": representative.issue_type,
+                "collector_id": representative.collector_id,
+                "signal_type": representative.signal_type,
                 "cause": representative.cause,
                 "prev_estimated_score_gain": round(prev_gain, 2),
                 "curr_estimated_score_gain": round(curr_gain, 2),
                 "delta_estimated_score_gain": round(delta, 2),
-                "prev_findings": prev_count,
-                "curr_findings": curr_count,
-                "finding_count_delta": curr_count - prev_count,
-                "added_finding_ids": sorted(curr_ids - prev_ids)[:20],
-                "removed_finding_ids": sorted(prev_ids - curr_ids)[:20],
+                "prev_signals": prev_count,
+                "curr_signals": curr_count,
+                "signal_count_delta": curr_count - prev_count,
+                "added_signal_ids": sorted(curr_ids - prev_ids)[:20],
+                "removed_signal_ids": sorted(prev_ids - curr_ids)[:20],
             })
 
         return sorted(
             changes,
             key=lambda c: (
                 abs(c["delta_estimated_score_gain"]),
-                abs(c["finding_count_delta"]),
+                abs(c["signal_count_delta"]),
             ),
             reverse=True,
         )

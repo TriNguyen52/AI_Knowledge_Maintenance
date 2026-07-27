@@ -8,11 +8,11 @@ from abc import ABC, abstractmethod
 from itertools import islice
 from pathlib import Path
 
-from ai_ready.models import Document, DocumentRelation
+from ai_ready.models import KnowledgeArtifact, Relationship
 
 
 def _add_relation(
-    relations: list[DocumentRelation],
+    relations: list[Relationship],
     source: str,
     target: str,
     relation_type: str,
@@ -20,16 +20,16 @@ def _add_relation(
 ) -> None:
     for relation in relations:
         if (
-            relation.source_path == source
-            and relation.target_path == target
+            relation.source_uri == source
+            and relation.target_uri == target
             and relation.relation_type == relation_type
         ):
             return
 
     relations.append(
-        DocumentRelation(
-            source_path=source,
-            target_path=target,
+        Relationship(
+            source_uri=source,
+            target_uri=target,
             relation_type=relation_type,
             metadata=metadata or {},
         )
@@ -45,14 +45,14 @@ def _relative_path(path: Path, source_root: Path | None) -> str:
     return str(path).replace("\\", "/")
 
 
-def build_document_lookup(documents: list[Document]) -> dict[str, str]:
-    """Build a generic lookup from doc ids, stems, and relative paths to a path."""
+def build_document_lookup(artifacts: list[KnowledgeArtifact]) -> dict[str, str]:
+    """Build a generic lookup from artifact ids, stems, and relative paths to a uri."""
     lookup: dict[str, str] = {}
-    for document in documents:
-        lookup[document.path] = document.path
-        stem = Path(document.path).stem
-        lookup.setdefault(stem, document.path)
-        lookup.setdefault(stem.replace("/", "_"), document.path)
+    for artifact in artifacts:
+        lookup[artifact.uri] = artifact.uri
+        stem = Path(artifact.uri).stem
+        lookup.setdefault(stem, artifact.uri)
+        lookup.setdefault(stem.replace("/", "_"), artifact.uri)
     return lookup
 
 
@@ -101,9 +101,9 @@ class NavigationManifestParser(ABC):
         self,
         path: Path,
         content: str,
-        documents: list[Document],
+        artifacts: list[KnowledgeArtifact],
         source_root: Path,
-    ) -> list[DocumentRelation]:
+    ) -> list[Relationship]:
         """Extract normalized relations from the manifest."""
 
 
@@ -117,9 +117,9 @@ class MkDocsNavigationParser(NavigationManifestParser):
         self,
         path: Path,
         content: str,
-        documents: list[Document],
+        artifacts: list[KnowledgeArtifact],
         source_root: Path,
-    ) -> list[DocumentRelation]:
+    ) -> list[Relationship]:
         docs_dir_match = re.search(r"^docs_dir:\s*(.+)$", content, re.MULTILINE)
         docs_dir = docs_dir_match.group(1).strip().strip('"').strip("'") if docs_dir_match else "docs"
         docs_path = path.parent / docs_dir
@@ -131,9 +131,9 @@ class MkDocsNavigationParser(NavigationManifestParser):
         if not nav_match:
             return []
 
-        lookup = build_document_lookup(documents)
+        lookup = build_document_lookup(artifacts)
         known_paths = set(lookup.values())
-        relations: list[DocumentRelation] = []
+        relations: list[Relationship] = []
         nav_lines = content[nav_match.end():].split("\n")
         self._parse_nav_lines(nav_lines, docs_path, source_root, known_paths, relations, parent_path="")
         return relations
@@ -144,7 +144,7 @@ class MkDocsNavigationParser(NavigationManifestParser):
         docs_path: Path,
         source_root: Path,
         known_paths: set[str],
-        relations: list[DocumentRelation],
+        relations: list[Relationship],
         parent_path: str,
         parent_index_path: str | None = None,
         indent: int = 0,
@@ -246,11 +246,11 @@ class DocusaurusSidebarParser(NavigationManifestParser):
         self,
         path: Path,
         content: str,
-        documents: list[Document],
+        artifacts: list[KnowledgeArtifact],
         source_root: Path,
-    ) -> list[DocumentRelation]:
-        relations: list[DocumentRelation] = []
-        lookup = build_document_lookup(documents)
+    ) -> list[Relationship]:
+        relations: list[Relationship] = []
+        lookup = build_document_lookup(artifacts)
         known_paths = set(lookup.values())
 
         for match in re.finditer(r"items:\s*\[([^\]]+)\]", content, re.DOTALL):
@@ -299,11 +299,11 @@ class AstroNavigationParser(NavigationManifestParser):
         self,
         path: Path,
         content: str,
-        documents: list[Document],
+        artifacts: list[KnowledgeArtifact],
         source_root: Path,
-    ) -> list[DocumentRelation]:
-        relations: list[DocumentRelation] = []
-        lookup = build_document_lookup(documents)
+    ) -> list[Relationship]:
+        relations: list[Relationship] = []
+        lookup = build_document_lookup(artifacts)
         known_paths = set(lookup.values())
 
         for match in re.finditer(r"items:\s*\[([^\]]+)\]", content, re.DOTALL):
@@ -355,14 +355,14 @@ class NavigationRelationExtractor:
     def extract(
         self,
         source_root: Path,
-        documents: list[Document],
+        artifacts: list[KnowledgeArtifact],
         discovered_files: list[Path],
-    ) -> list[DocumentRelation]:
+    ) -> list[Relationship]:
         if not source_root.is_dir():
             return []
 
         candidate_paths = self._candidate_manifest_paths(source_root, discovered_files)
-        relations: list[DocumentRelation] = []
+        relations: list[Relationship] = []
         for manifest_path in candidate_paths:
             try:
                 content = manifest_path.read_text(encoding="utf-8", errors="replace")
@@ -371,11 +371,11 @@ class NavigationRelationExtractor:
 
             for parser in self.parsers:
                 if parser.matches(manifest_path, content):
-                    for relation in parser.extract(manifest_path, content, documents, source_root):
+                    for relation in parser.extract(manifest_path, content, artifacts, source_root):
                         _add_relation(
                             relations,
-                            relation.source_path,
-                            relation.target_path,
+                            relation.source_uri,
+                            relation.target_uri,
                             relation.relation_type,
                             relation.metadata,
                         )
@@ -417,13 +417,13 @@ class NavigationRelationExtractor:
 class InlineLinkRelationExtractor:
     """Infer cross-reference relations from internal markdown links."""
 
-    def extract(self, documents: list[Document]) -> list[DocumentRelation]:
-        relations: list[DocumentRelation] = []
-        known_paths = {document.path for document in documents}
+    def extract(self, artifacts: list[KnowledgeArtifact]) -> list[Relationship]:
+        relations: list[Relationship] = []
+        known_paths = {artifact.uri for artifact in artifacts}
 
-        for document in documents:
-            doc_dir = document.path.rsplit("/", 1)[0] if "/" in document.path else ""
-            for link in document.links:
+        for artifact in artifacts:
+            doc_dir = artifact.uri.rsplit("/", 1)[0] if "/" in artifact.uri else ""
+            for link in artifact.links:
                 if not link.is_internal:
                     continue
 
@@ -433,6 +433,6 @@ class InlineLinkRelationExtractor:
 
                 resolved = resolve_document_reference(target, doc_dir, known_paths)
                 if resolved:
-                    _add_relation(relations, document.path, resolved, "cross_reference")
+                    _add_relation(relations, artifact.uri, resolved, "cross_reference")
 
         return relations

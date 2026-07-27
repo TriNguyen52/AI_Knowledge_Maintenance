@@ -1,14 +1,7 @@
-"""Signal and Assessment stores — new persistence layer.
+"""Signal and Assessment stores — persistence layer.
 
 SignalStore handles signal persistence + lifecycle tracking.
 AssessmentStore handles assessment persistence + diff + trend analysis.
-
-Both stores share the same SQLite database file as SnapshotStore but use
-separate table names (signals, signal_lifecycle, assessments). They are
-additive — SnapshotStore continues to work unchanged with its own tables
-(snapshots, findings, finding_lifecycle).
-
-In future phases, SnapshotStore will delegate to these stores internally.
 """
 
 from __future__ import annotations
@@ -22,11 +15,8 @@ from typing import Any, Iterator
 
 from ai_ready.models import (
     AssessmentDiff,
-    AssessmentDiff as RegressionReport,  # alias for diff return type
     DimensionScore,
     EvolutionView,
-    EvolutionView as TrendReport,  # alias for trend return type
-    Finding,
     KnowledgeAssessment,
     KnowledgeSignal,
     Severity,
@@ -39,7 +29,7 @@ from ai_ready.models import (
 class SignalStore:
     """SQLite-backed signal storage with lifecycle tracking.
 
-    Mirrors the findings + finding_lifecycle tables in SnapshotStore but
+    Mirrors the signal_lifecycle table in AssessmentStore but
     uses signal-centric table names (signals, signal_lifecycle).
     """
 
@@ -105,7 +95,7 @@ class SignalStore:
             """)
 
     def save_signals(
-        self, assessment_id: str, signals: list[Finding], timestamp: str | None = None
+        self, assessment_id: str, signals: list[KnowledgeSignal], timestamp: str | None = None
     ) -> None:
         """Persist signals for an assessment and update lifecycle tracking."""
         if timestamp is None:
@@ -120,13 +110,13 @@ class SignalStore:
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         assessment_id,
-                        s.finding_id,
-                        s.rule_id,
-                        s.issue_type,
+                        s.signal_id,
+                        s.collector_id,
+                        s.signal_type,
                         s.severity.value,
                         s.score,
-                        s.document_id,
-                        s.document_path,
+                        s.artifact_id,
+                        s.artifact_uri,
                         json.dumps(s.evidence),
                         s.recommendation,
                         s.ai_impact,
@@ -137,7 +127,7 @@ class SignalStore:
             self._update_lifecycle(conn, assessment_id, signals, timestamp)
 
     def _update_lifecycle(
-        self, conn: sqlite3.Connection, assessment_id: str, signals: list[Finding], timestamp: str
+        self, conn: sqlite3.Connection, assessment_id: str, signals: list[KnowledgeSignal], timestamp: str
     ) -> None:
         """Update signal lifecycle table based on current assessment signals."""
         prev_assessment = self._get_previous_assessment_id(conn, assessment_id)
@@ -148,7 +138,7 @@ class SignalStore:
             ).fetchall()
             prev_signal_ids = {r["signal_id"] for r in rows}
 
-        curr_signal_ids = {s.finding_id for s in signals}
+        curr_signal_ids = {s.signal_id for s in signals}
 
         # Mark resolved signals
         resolved_ids = prev_signal_ids - curr_signal_ids
@@ -165,7 +155,7 @@ class SignalStore:
         # Upsert current signals
         for s in signals:
             existing = conn.execute(
-                "SELECT * FROM signal_lifecycle WHERE signal_id = ?", (s.finding_id,)
+                "SELECT * FROM signal_lifecycle WHERE signal_id = ?", (s.signal_id,)
             ).fetchone()
 
             severity_entry = {
@@ -194,7 +184,7 @@ class SignalStore:
                        SET last_seen = ?, status = ?, severity_history = ?, assessment_ids = ?,
                            resolved_assessment = ''
                        WHERE signal_id = ?""",
-                    (timestamp, status, json.dumps(sev_history), json.dumps(assessment_ids), s.finding_id),
+                    (timestamp, status, json.dumps(sev_history), json.dumps(assessment_ids), s.signal_id),
                 )
             else:
                 conn.execute(
@@ -203,9 +193,9 @@ class SignalStore:
                         severity_history, assessment_ids, resolved_assessment)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        s.finding_id,
-                        s.rule_id,
-                        s.document_path,
+                        s.signal_id,
+                        s.collector_id,
+                        s.artifact_uri,
                         timestamp,
                         timestamp,
                         SignalStatus.NEW.value,
@@ -300,7 +290,7 @@ class SignalStore:
 class AssessmentStore:
     """SQLite-backed assessment storage with diff and trend analysis.
 
-    Mirrors the snapshots table in SnapshotStore but uses assessment-centric
+    Uses assessment-centric
     table names (assessments). Works with SignalStore for signal persistence.
     """
 
@@ -349,8 +339,8 @@ class AssessmentStore:
                     timestamp,
                     assessment.score,
                     json.dumps({
-                        k: {"name": v.name, "score": v.score, "rule_ids": v.rule_ids,
-                             "findings_count": v.findings_count}
+                        k: {"name": v.name, "score": v.score, "collector_ids": v.collector_ids,
+                             "signals_count": v.signals_count}
                         for k, v in assessment.dimensions.items()
                     }),
                     json.dumps(assessment.metrics),
@@ -426,8 +416,8 @@ class AssessmentStore:
 
     def _compute_diff(self, prev: KnowledgeAssessment, curr: KnowledgeAssessment) -> AssessmentDiff:
         """Compute diff between two assessments using stable signal IDs."""
-        prev_by_id = {s.finding_id: s for s in prev.signals}
-        curr_by_id = {s.finding_id: s for s in curr.signals}
+        prev_by_id = {s.signal_id: s for s in prev.signals}
+        curr_by_id = {s.signal_id: s for s in curr.signals}
 
         prev_ids = set(prev_by_id.keys())
         curr_ids = set(curr_by_id.keys())
@@ -444,8 +434,8 @@ class AssessmentStore:
             if ps.severity != cs.severity:
                 severity_changes.append({
                     "signal_id": sid,
-                    "collector_id": cs.rule_id,
-                    "artifact_uri": cs.document_path,
+                    "collector_id": cs.collector_id,
+                    "artifact_uri": cs.artifact_uri,
                     "prev_severity": ps.severity.value,
                     "curr_severity": cs.severity.value,
                     "direction": "worse" if _severity_rank(cs.severity) > _severity_rank(ps.severity) else "better",
@@ -576,23 +566,23 @@ class AssessmentStore:
         dimensions: dict[str, DimensionScore] = {}
         for k, v in dims_data.items():
             dimensions[k] = DimensionScore(
-                name=v["name"], score=v["score"], rule_ids=v["rule_ids"],
-                findings_count=v["findings_count"],
+                name=v["name"], score=v["score"], collector_ids=v["collector_ids"],
+                signals_count=v["signals_count"],
             )
 
-        signals: list[Finding] = []
+        signals: list[KnowledgeSignal] = []
         srows = conn.execute(
             "SELECT * FROM signals WHERE assessment_id = ?", (row["assessment_id"],)
         ).fetchall()
         for sr in srows:
-            signals.append(Finding(
-                finding_id=sr["signal_id"],
-                rule_id=sr["collector_id"],
-                issue_type=sr["signal_type"],
+            signals.append(KnowledgeSignal(
+                signal_id=sr["signal_id"],
+                collector_id=sr["collector_id"],
+                signal_type=sr["signal_type"],
                 severity=Severity(sr["severity"]),
                 score=sr["score"],
-                document_id=sr["artifact_id"],
-                document_path=sr["artifact_uri"],
+                artifact_id=sr["artifact_id"],
+                artifact_uri=sr["artifact_uri"],
                 evidence=json.loads(sr["evidence"]),
                 recommendation=sr["recommendation"],
                 ai_impact=sr["ai_impact"],
