@@ -1,129 +1,117 @@
 # AI-Ready
 
-AI knowledge observability platform — continuously evaluate whether a knowledge base is AI-ready before deployment and as it evolves over time.
+AI systems are only as reliable as the knowledge they retrieve.
 
-## What It Does
+Even the strongest language models can hallucinate for missing context, disconnected concepts, broken relationships, ambiguous headings, or inconsistent organization. These issues silently reduce retrieval quality, increase hallucinations, and make AI agents less reliable.
 
-AI-Ready analyzes your documentation knowledge base and detects structural properties that cause AI failures:
+**AI-Ready** is a deterministic knowledge observability and continuous improvement platform that evaluates knowledge before it reaches an AI system. Rather than measuring language models or retrieval algorithms, AI-Ready measures the quality of the knowledge itself.
 
-- **Topic Purity** — documents mixing unrelated concepts
-- **Context Independence** — chunks that can't stand alone when retrieved
-- **Heading Quality** — vague headings that provide weak retrieval signals
-- **Link Integrity** — broken links and orphan documents
+The platform transforms documentation, APIs, codebases, runbooks, internal wikis, and other knowledge sources into a unified Knowledge Artifact model. From these artifacts it collects deterministic Knowledge Signals, interprets them into Knowledge Problems, produces versioned Knowledge Assessments, and continuously improves the knowledge base through verified remediation workflows.
 
-## Quick Start
+---
 
-```bash
-# Install
-pip install -e .
+## How It Works
 
-# Scan a knowledge base
-ai-ready scan docs/
+AI-Ready collects knowledge from one or more repositories and transforming every source into a unified Knowledge Artifact representation. Documentation, API specifications, source code, runbooks, and other supported sources are normalized into the same internal model, allowing every analysis to operate independently of where the knowledge originally came from.
 
-# JSON output for CI/CD
-ai-ready scan docs/ --json
+Once the knowledge has been normalized, AI-Ready performs deterministic analysis to collect Knowledge Signals. These signals describe properties such as context independence, topic purity, heading quality, connectivity, retrieval readiness, workflow completeness, and other characteristics that directly influence how effectively AI systems consume knowledge.
 
-# SARIF output for GitHub code scanning
-ai-ready scan docs/ --sarif
+Signals are then interpreted into higher-level Knowledge Problems, representing underlying issues that may affect across many artifacts simultaneously. Multiple signals can contribute to the same problem, allowing AI-Ready to reason about causes rather than symptoms.
 
-# View snapshot history
-ai-ready history
+Each assessment is stored as a versioned snapshot so organizations can compare historical assessments, detect regressions, monitor improvements over time, and understand how changes affect AI readiness.
 
-# Diff two snapshots for regression detection
-ai-ready diff baseline.db current.db
+---
 
-# Continuous monitoring
-ai-ready monitor --path docs/ --interval 300
-```
+## Continuous Knowledge Improvement
 
-## Exit Codes
+The improvement workflow begins by ranking discovered problems according to their expected impact on AI reasoning. Then. AI-Ready combines analysis with large language models to generate fixing proposals. 
 
-| Code | Meaning |
-|------|---------|
-| 0 | Scan successful, thresholds passed |
-| 1 | Readiness threshold failed |
-| 2 | High severity findings present |
-| 3 | Internal analyzer error |
+Every proposed modification passes through human approval before execution. After changes are applied, AI-Ready performs another assessment to verify whether the knowledge actually improved. Improvements are accepted only when the measured assessment demonstrates meaningful progress rather than simply producing plausible edits.
 
-## Configuration
+Over time the platform records proposals outcomes, learns which strategies consistently improve different categories of Knowledge Problems, and uses those historical outcomes to prioritize future remediation attempts.
 
-Create `.ai-ready.yml` in your docs directory:
+---
 
-```yaml
-version: 1
+## Workflow Orchestration
 
-thresholds:
-  overall_score: 85
+The improvement pipeline is orchestrated using Apache Burr.
 
-fail_on:
-  - CRITICAL
+This provides reproducible execution, persistent workflow history, resumable approval checkpoints, workflow forking after failed remediation attempts, OpenTelemetry observability, and automatic regression test generation from production workflows.
 
-weights:
-  retrieval: 0.25
-  context: 0.15
-  consistency: 0.20
-  trust: 0.20
-  connectivity: 0.10
-  workflow: 0.10
+Apache Burr manages the workflow itself. AI-Ready remains responsible for knowledge collection, deterministic analysis, assessment, verification, and reasoning about Knowledge Problems.
 
-rules:
-  topic_purity:
-    enabled: true
-  context_independence:
-    enabled: true
-  heading_quality:
-    enabled: true
-  link_integrity:
-    enabled: true
-```
-
-## AI Readiness Dimensions
-
-| Dimension | Signals |
-|-----------|---------|
-| Retrieval Readiness | Topic Purity, Heading Quality |
-| Context Readiness | Context Independence |
-| Consistency | Terminology, Contradictions |
-| Trustworthiness | Canonical Sources, Freshness |
-| Connectivity | Knowledge Connectivity, Links |
-| Task Completion | Workflow Completeness |
-
-## GitHub Actions Integration
-
-```yaml
-- name: AI readiness scan
-  run: ai-ready scan docs/ --json > report.json
-
-- name: Fail on regression
-  run: ai-ready diff baseline.db current.db
-```
+---
 
 ## Architecture
 
-```
-Connectors (Markdown, Git, GitBook*, Notion*, Confluence*)
-    ↓
-Knowledge Representation Layer (Canonical Document Model)
-    ↓
-AI Readiness Rule Engine (collect → measure → evaluate → report)
-    ↓
-Snapshot Store (SQLite)
-    ↓
-Diff / Regression Engine
-    ↓
-CLI / JSON / SARIF / Prometheus* / GitHub Checks
+```text
+Knowledge Sources
+        │
+        ▼
+Knowledge Artifact Model
+        │
+        ▼
+Deterministic Signal Collection
+        │
+        ▼
+Knowledge Problem Discovery
+        │
+        ▼
+Knowledge Assessment
+        │
+        ▼
+Problem Prioritization
+        │
+        ▼
+LLM Proposal Generation
+        │
+        ▼
+Human Approval
+        │
+        ▼
+Knowledge Modification
+        │
+        ▼
+Verification
+        │
+        ▼
+Historical Learning
 ```
 
-*Future connectors and output formats
+---
 
 ## Design Principles
 
-- **Infrastructure-first** — runs as CLI, CI step, daemon, or container
-- **Deterministic** — no LLM-based scoring, every finding has evidence
-- **Machine-readable** — JSON, SARIF, Prometheus metrics
-- **CI/CD native** — exit codes for pipeline integration
-- **Never modifies the KB** — read-only analysis
+AI-Ready is built on a small number of principles that remain consistent throughout the system.
+
+- Deterministic analysis always comes before AI reasoning. Every assessment should be reproducible regardless of which language model is available.
+
+- Knowledge is treated as infrastructure rather than application data. 
+
+- Evidence is never discarded. Every assessment, proposed modification, verification result, and remediation outcome becomes part of the historical record, allowing organizations to understand not only what changed, but why it changed.
+
+---
+
+## Getting Started
+
+```bash
+pip install -e .
+
+# Scan a knowledge base
+ai-ready scan ./knowledge
+
+# View the assessment
+ai-ready assess
+
+# Compare historical assessments
+ai-ready diff
+
+# Start continuous monitoring
+ai-ready monitor
+```
+
+---
 
 ## License
 
-MIT
+Apache 2.0
