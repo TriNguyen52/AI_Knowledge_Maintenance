@@ -27,6 +27,7 @@ Three core components:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -55,6 +56,17 @@ W_RETRIEVAL = 0.35
 # Default salience threshold — problems below this are skipped
 DEFAULT_SALIENCE_THRESHOLD = 0.15
 
+# ---------------------------------------------------------------------------
+# Recency decay parameters (deterministic, no LLM)
+# ---------------------------------------------------------------------------
+
+# Dual half-life model: fast term captures recent activity, slow floor
+# ensures unreviewed-forever problems keep drifting down instead of parking.
+FAST_HALF_LIFE_DAYS = 21.0    # recent activity boost halves every 21 days
+SLOW_HALF_LIFE_DAYS = 180.0   # floor itself halves every 180 days
+SLOW_FLOOR_WEIGHT = 0.1       # floor amplitude (10% of fast term at t=0)
+DECAY_EPSILON = 0.01           # prevents collapse to exactly 0
+
 
 # ---------------------------------------------------------------------------
 # 1. Problem Salience
@@ -66,7 +78,7 @@ class ProblemSalience:
 
     Every field is deterministic — no LLM involvement. The decomposition
     allows explainability: "this problem was prioritized because
-    encoding=0.9, outcome=0.78, retrieval=0.85".
+    encoding=0.9, outcome=0.78, retrieval=0.85, staleness=0.72".
     """
 
     problem_id: str
@@ -74,7 +86,8 @@ class ProblemSalience:
     outcome: float        # historical success rate for this problem type [0, 1]
     retrieval: float      # dimension impact [0, 1]
     size_penalty: float   # 1 / max(artifact_count, 1) [0, 1]
-    total: float          # weighted sum * size_penalty [0, 1]
+    staleness_factor: float  # recency decay from SignalLifecycle.last_seen [0, 1]
+    total: float          # weighted sum * size_penalty * staleness_factor [0, 1]
     explanation: str      # human-readable decomposition
 
     def to_dict(self) -> dict[str, Any]:
@@ -84,15 +97,78 @@ class ProblemSalience:
             "outcome": round(self.outcome, 4),
             "retrieval": round(self.retrieval, 4),
             "size_penalty": round(self.size_penalty, 4),
+            "staleness_factor": round(self.staleness_factor, 4),
             "total": round(self.total, 4),
             "explanation": self.explanation,
         }
+
+
+def compute_staleness_factor(
+    problem: KnowledgeProblem,
+    signal_lifecycles: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> float:
+    """Compute a recency decay factor from signal lifecycle data.
+
+    Uses a dual half-life model inspired by biological memory:
+    - Fast term: halves every 21 days (recent activity boost)
+    - Slow floor: 0.1 amplitude, halves every 180 days (ensures
+      unreviewed-forever problems keep drifting down, don't park)
+
+    The most recent last_seen across all problem signals is used.
+    Problems whose signals have never been seen get epsilon (0.01),
+    keeping them ordinal for ranking but at minimal weight.
+
+    Pure deterministic computation — no LLM calls.
+
+    Args:
+        problem: The KnowledgeProblem to score.
+        signal_lifecycles: Optional dict mapping signal_id to an object
+            with a ``last_seen`` ISO timestamp string. If None or empty,
+            returns 1.0 (no decay — backwards compatible).
+        now: Optional reference timestamp. Defaults to current UTC time.
+
+    Returns:
+        Staleness factor in [0.01, 1.1]. Higher = more recently active.
+    """
+    if not signal_lifecycles:
+        return 1.0  # no lifecycle data → no decay (backwards compatible)
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    # Collect last_seen timestamps from all problem signals
+    last_seen_times: list[datetime] = []
+    for signal_id in problem.signal_ids:
+        lc = signal_lifecycles.get(signal_id)
+        if lc is None:
+            continue
+        last_seen_str = getattr(lc, "last_seen", None) if not isinstance(lc, dict) else lc.get("last_seen")
+        if not last_seen_str:
+            continue
+        try:
+            last_seen_times.append(datetime.fromisoformat(last_seen_str))
+        except (ValueError, TypeError):
+            continue
+
+    if not last_seen_times:
+        return DECAY_EPSILON  # never seen → minimal weight, still ordinal
+
+    # Use the most recent last_seen (most generous interpretation)
+    most_recent = max(last_seen_times)
+    age_days = (now - most_recent).total_seconds() / 86_400.0
+
+    # Dual half-life decay
+    fast_term = 0.5 ** (age_days / FAST_HALF_LIFE_DAYS)
+    slow_floor = SLOW_FLOOR_WEIGHT * 0.5 ** (age_days / SLOW_HALF_LIFE_DAYS)
+    return max(DECAY_EPSILON, fast_term + slow_floor)
 
 
 def compute_problem_salience(
     problem: KnowledgeProblem,
     assessment: Any,
     history_store: Any = None,
+    signal_lifecycles: dict[str, Any] | None = None,
 ) -> ProblemSalience:
     """Compute a unified salience score for a KnowledgeProblem.
 
@@ -102,6 +178,8 @@ def compute_problem_salience(
         problem: The KnowledgeProblem to score.
         assessment: The KnowledgeAssessment containing signals and dimensions.
         history_store: Optional ImprovementHistoryStore for outcome sub-score.
+        signal_lifecycles: Optional dict mapping signal_id to lifecycle
+            objects with ``last_seen`` timestamps. Enables recency decay.
 
     Returns:
         ProblemSalience with full decomposition.
@@ -158,15 +236,21 @@ def compute_problem_salience(
     artifact_count = len(problem.artifact_uris) if problem.artifact_uris else 1
     size_penalty = 1.0 / max(artifact_count, 1)
 
-    # --- Total: weighted sum * size_penalty ---
-    total = (W_ENCODING * encoding + W_OUTCOME * outcome + W_RETRIEVAL * retrieval) * size_penalty
+    # --- Staleness factor: recency decay from signal lifecycle data ---
+    staleness_factor = compute_staleness_factor(problem, signal_lifecycles)
+
+    # --- Total: weighted sum * size_penalty * staleness_factor ---
+    total = (
+        W_ENCODING * encoding + W_OUTCOME * outcome + W_RETRIEVAL * retrieval
+    ) * size_penalty * staleness_factor
 
     explanation = (
         f"Prioritized because: encoding={encoding:.2f} "
         f"(severity of {len(signal_severities)} signal(s)), "
         f"outcome={outcome:.2f} (historical success rate for '{problem.category}'), "
         f"retrieval={retrieval:.2f} (dimension impact), "
-        f"size_penalty={size_penalty:.2f} ({artifact_count} artifact(s)). "
+        f"size_penalty={size_penalty:.2f} ({artifact_count} artifact(s)), "
+        f"staleness={staleness_factor:.4f} (recency decay). "
         f"Total salience={total:.4f}."
     )
 
@@ -176,6 +260,7 @@ def compute_problem_salience(
         outcome=outcome,
         retrieval=retrieval,
         size_penalty=size_penalty,
+        staleness_factor=staleness_factor,
         total=total,
         explanation=explanation,
     )
@@ -186,6 +271,7 @@ def rank_problems_by_salience(
     assessment: Any,
     history_store: Any = None,
     threshold: float = DEFAULT_SALIENCE_THRESHOLD,
+    signal_lifecycles: dict[str, Any] | None = None,
 ) -> tuple[list[KnowledgeProblem], list[ProblemSalience], list[KnowledgeProblem]]:
     """Rank KnowledgeProblems by salience and filter below threshold.
 
@@ -196,6 +282,8 @@ def rank_problems_by_salience(
         assessment: The KnowledgeAssessment containing signals and dimensions.
         history_store: Optional ImprovementHistoryStore for outcome sub-score.
         threshold: Minimum salience to include (default 0.15).
+        signal_lifecycles: Optional dict mapping signal_id to lifecycle
+            objects with ``last_seen`` timestamps. Enables recency decay.
 
     Returns:
         Tuple of (ranked_problems, salience_scores, skipped_problems).
@@ -205,7 +293,7 @@ def rank_problems_by_salience(
     """
     scored: list[tuple[KnowledgeProblem, ProblemSalience]] = []
     for problem in problems:
-        salience = compute_problem_salience(problem, assessment, history_store)
+        salience = compute_problem_salience(problem, assessment, history_store, signal_lifecycles)
         scored.append((problem, salience))
 
     # Sort by total salience descending

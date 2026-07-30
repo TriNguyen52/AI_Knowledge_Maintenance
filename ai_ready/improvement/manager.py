@@ -123,6 +123,7 @@ class ImprovementManager:
             self.problem_queue = ProblemQueue(
                 history_store=self.history_store,
                 db_path=pq_path,
+                signal_store=assessment_store.signal_store if assessment_store else None,
             )
         else:
             self.problem_queue = None

@@ -28,6 +28,7 @@ from typing import Any
 from ai_ready.improvement.salience import (
     discover_problems_heuristic,
     rank_problems_by_salience,
+    compute_staleness_factor,
     ProblemSalience,
     DEFAULT_SALIENCE_THRESHOLD,
 )
@@ -82,6 +83,7 @@ class ProblemQueue:
         history_store: Any = None,
         db_path: str | Path | None = None,
         salience_threshold: float = DEFAULT_SALIENCE_THRESHOLD,
+        signal_store: Any = None,
     ) -> None:
         """Initialize the problem queue.
 
@@ -91,15 +93,19 @@ class ProblemQueue:
             db_path: Optional SQLite path for persistence. If None,
                 uses in-memory database (non-persistent).
             salience_threshold: Minimum salience to include in the queue.
+            signal_store: Optional SignalStore for recency decay computation.
+                When provided, signal lifecycle data is fetched and used
+                to apply time-aware staleness decay to salience scores.
         """
         self.history_store = history_store
         self.salience_threshold = salience_threshold
+        self.signal_store = signal_store
         self.db_path = str(db_path) if db_path else ":memory:"
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._init_db()
 
     def _init_db(self) -> None:
-        """Initialize the SQLite table for problem queue entries."""
+        """Initialize the SQLite tables for problem queue and suppression."""
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS problem_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,6 +132,17 @@ class ProblemQueue:
             CREATE INDEX IF NOT EXISTS idx_queue_problem_id
             ON problem_queue(problem_id)
         """)
+        # Wont-fix suppression signatures — prevents re-discovery of
+        # triaged noise. Keyed by (category, sorted artifact_uris) signature.
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS wont_fix_signatures (
+                signature TEXT PRIMARY KEY,
+                problem_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                artifact_uris TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL
+            )
+        """)
         self._conn.commit()
 
     def update(
@@ -138,6 +155,14 @@ class ProblemQueue:
         Runs heuristic problem discovery (no LLM) and salience ranking
         (no LLM) on the assessment's signals. New problems are added
         to the queue; existing problems are updated.
+
+        Wont-fix suppression: problems matching a wont_fix signature
+        (category + artifact URIs) are filtered out BEFORE salience
+        computation, preventing wasted computation on triaged noise.
+
+        Recency decay: when a signal_store is configured, signal
+        lifecycle data is fetched and used to apply time-aware
+        staleness decay to salience scores.
 
         Args:
             assessment: The KnowledgeAssessment to analyze.
@@ -163,12 +188,30 @@ class ProblemQueue:
         if not problems:
             return []
 
+        # Filter out wont-fix suppressed problems BEFORE salience computation
+        suppressed_count = 0
+        if self._has_wont_fix_signatures():
+            filtered = []
+            for p in problems:
+                if self._is_suppressed(p):
+                    suppressed_count += 1
+                else:
+                    filtered.append(p)
+            problems = filtered
+
+        if not problems:
+            return []
+
+        # Fetch signal lifecycle data for recency decay (if signal_store available)
+        signal_lifecycles = self._fetch_signal_lifecycles(signal_ids)
+
         # Salience ranking (no LLM)
         ranked_problems, saliences, _skipped = rank_problems_by_salience(
             problems,
             assessment,
             self.history_store,
             threshold=0.0,  # queue all problems, filter on retrieval
+            signal_lifecycles=signal_lifecycles,
         )
 
         # Persist to queue
@@ -186,6 +229,111 @@ class ProblemQueue:
 
         self._conn.commit()
         return entries
+
+    # --- Wont-fix suppression ---
+
+    @staticmethod
+    def _problem_signature(problem: KnowledgeProblem) -> str:
+        """Compute a stable signature for matching re-discovered problems.
+
+        Uses category + sorted artifact URIs so that the same problem
+        discovered from different assessments produces the same signature.
+        """
+        sorted_uris = sorted(problem.artifact_uris) if problem.artifact_uris else []
+        return f"{problem.category}|{'|'.join(sorted_uris)}"
+
+    def _has_wont_fix_signatures(self) -> bool:
+        """Check if any wont-fix signatures exist."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM wont_fix_signatures"
+        ).fetchone()
+        return row[0] > 0 if row else False
+
+    def _is_suppressed(self, problem: KnowledgeProblem) -> bool:
+        """Check if a problem matches a wont-fix suppression signature."""
+        sig = self._problem_signature(problem)
+        row = self._conn.execute(
+            "SELECT 1 FROM wont_fix_signatures WHERE signature = ? LIMIT 1",
+            (sig,),
+        ).fetchone()
+        return row is not None
+
+    def _add_wont_fix_signature(self, problem: KnowledgeProblem) -> None:
+        """Record a wont-fix suppression signature for a problem."""
+        sig = self._problem_signature(problem)
+        from datetime import datetime, timezone
+        self._conn.execute(
+            """INSERT OR IGNORE INTO wont_fix_signatures
+               (signature, problem_id, category, artifact_uris, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                sig,
+                problem.problem_id,
+                problem.category,
+                json.dumps(problem.artifact_uris),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+    def get_wont_fix_signatures(self) -> list[dict[str, Any]]:
+        """Get all wont-fix suppression signatures.
+
+        Returns:
+            List of signature dicts with problem_id, category, artifact_uris.
+        """
+        rows = self._conn.execute(
+            "SELECT signature, problem_id, category, artifact_uris, created_at FROM wont_fix_signatures ORDER BY created_at DESC"
+        ).fetchall()
+        return [
+            {
+                "signature": r[0],
+                "problem_id": r[1],
+                "category": r[2],
+                "artifact_uris": json.loads(r[3]),
+                "created_at": r[4],
+            }
+            for r in rows
+        ]
+
+    def clear_wont_fix_signature(self, signature: str) -> bool:
+        """Remove a wont-fix suppression signature.
+
+        Allows a previously triaged problem to be re-discovered.
+
+        Args:
+            signature: The signature string to remove.
+
+        Returns:
+            True if a signature was removed, False otherwise.
+        """
+        cursor = self._conn.execute(
+            "DELETE FROM wont_fix_signatures WHERE signature = ?",
+            (signature,),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    # --- Signal lifecycle fetch ---
+
+    def _fetch_signal_lifecycles(self, signal_ids: list[str]) -> dict[str, Any] | None:
+        """Fetch signal lifecycle data from the signal store.
+
+        Returns a dict mapping signal_id to SignalLifecycle objects,
+        or None if no signal store is configured.
+        """
+        if self.signal_store is None:
+            return None
+
+        lifecycles: dict[str, Any] = {}
+        for sid in signal_ids:
+            try:
+                lc = self.signal_store.get_lifecycle(sid)
+                if lc is not None:
+                    lifecycles[sid] = lc
+            except Exception:
+                pass  # skip if lifecycle not available
+
+        return lifecycles if lifecycles else None
 
     def _upsert_entry(self, entry: ProblemQueueEntry) -> None:
         """Insert or update a problem queue entry.
@@ -308,6 +456,10 @@ class ProblemQueue:
     def set_status(self, problem_id: str, status: str) -> bool:
         """Update the status of a problem in the queue.
 
+        When status is "wont_fix", a suppression signature is recorded
+        so that future heuristic discovery skips re-discovering the same
+        problem pattern (category + artifact URIs).
+
         Args:
             problem_id: The problem ID to update.
             status: New status ("open", "in_progress", "resolved", "wont_fix").
@@ -319,6 +471,27 @@ class ProblemQueue:
             "UPDATE problem_queue SET status = ? WHERE problem_id = ?",
             (status, problem_id),
         )
+
+        # Register wont-fix suppression signature
+        if status == "wont_fix" and cursor.rowcount > 0:
+            row = self._conn.execute(
+                "SELECT problem_json FROM problem_queue WHERE problem_id = ? ORDER BY id DESC LIMIT 1",
+                (problem_id,),
+            ).fetchone()
+            if row:
+                problem_dict = json.loads(row[0])
+                problem = KnowledgeProblem(
+                    problem_id=problem_dict["problem_id"],
+                    category=problem_dict.get("category", ""),
+                    artifact_uris=problem_dict.get("artifact_uris", []),
+                    signal_ids=problem_dict.get("signal_ids", []),
+                    root_cause_hypotheses=[],
+                    evidence=problem_dict.get("evidence", []),
+                    dimension=problem_dict.get("dimension", ""),
+                    description=problem_dict.get("description", ""),
+                )
+                self._add_wont_fix_signature(problem)
+
         self._conn.commit()
         return cursor.rowcount > 0
 
