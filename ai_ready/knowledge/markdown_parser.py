@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from pathlib import Path
 
@@ -48,6 +49,57 @@ class MarkdownDocumentParser:
             content=content,
             metadata=metadata,
         )
+
+    def parse_content(
+        self, content: str, source_uri: str, source_path: str = ""
+    ) -> KnowledgeArtifact:
+        """Parse markdown content from a string (e.g., from S3 or any remote source).
+
+        Args:
+            content: The raw text content of the document.
+            source_uri: The URI to use as the artifact's identifier (relative path).
+            source_path: The original path/key of the content (for extension detection).
+
+        Returns:
+            KnowledgeArtifact with parsed headings, sections, links, etc.
+        """
+        ext = os.path.splitext(source_path or source_uri)[1].lower()
+        artifact_id = hashlib.sha256(source_uri.encode()).hexdigest()[:16]
+        metadata = self._extract_frontmatter(content)
+        body = self._strip_frontmatter(content)
+
+        headings = self._extract_headings(body, ext)
+        sections = self._extract_sections(body, headings)
+        paragraphs = self._extract_paragraphs(sections)
+        links = self._extract_links(body)
+        code_blocks = self._extract_code_blocks(body)
+
+        title = self._extract_title_from_metadata(metadata, headings, source_uri)
+
+        doc_content = DocumentContent(
+            headings=headings,
+            sections=sections,
+            paragraphs=paragraphs,
+            links=links,
+            code_blocks=code_blocks,
+        )
+
+        return KnowledgeArtifact(
+            id=artifact_id,
+            uri=source_uri,
+            title=title,
+            content=doc_content,
+            metadata=metadata,
+        )
+
+    def _extract_title_from_metadata(
+        self, metadata: dict, headings: list[Heading], uri: str
+    ) -> str:
+        if "title" in metadata:
+            return metadata["title"]
+        if headings:
+            return headings[0].text
+        return os.path.splitext(os.path.basename(uri))[0]
 
     def _relative_path(self, filepath: Path, source_root: Path | None) -> str:
         if source_root and source_root.is_dir():

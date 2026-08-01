@@ -27,8 +27,9 @@ def _ensure_builtin_sdks() -> None:
     if _BUILTINS_LOADED:
         return
 
-    # Importing the markdown SDK registers the default local-file handler.
+    # Importing SDKs registers them via the @register_knowledge_sdk decorator.
     from ai_ready.knowledge import markdown  # noqa: F401
+    from ai_ready.knowledge import s3  # noqa: F401
 
     _BUILTINS_LOADED = True
 

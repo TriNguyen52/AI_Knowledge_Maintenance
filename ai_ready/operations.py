@@ -133,6 +133,14 @@ class AssessOperation:
         for r in results:
             metrics.update(r.metrics)
 
+        # Compute comparability fingerprint from the measurement config
+        from ai_ready.fingerprint import compute_fingerprint
+        collector_ids = [r.collector_id for r in results]
+        fingerprint = compute_fingerprint(
+            enabled_collectors=collector_ids,
+            weights=self.weights,
+        )
+
         # Create assessment
         assessment_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         metadata: dict[str, Any] = {"source": source}
@@ -148,6 +156,7 @@ class AssessOperation:
             signals=signals,
             metrics=metrics,
             metadata=metadata,
+            fingerprint=fingerprint.to_dict(),
         )
 
     def aggregate_dimensions(
@@ -233,6 +242,17 @@ class DiffOperation:
     @staticmethod
     def compute_diff(prev: KnowledgeAssessment, curr: KnowledgeAssessment) -> AssessmentDiff:
         """Compute diff between two assessments using stable signal IDs."""
+        # --- Comparability check (deterministic, no LLM) ---
+        from ai_ready.fingerprint import fingerprints_match, explain_mismatch
+        comparable = fingerprints_match(
+            getattr(prev, "fingerprint", None),
+            getattr(curr, "fingerprint", None),
+        )
+        comparability_warning = "" if comparable else explain_mismatch(
+            getattr(prev, "fingerprint", None),
+            getattr(curr, "fingerprint", None),
+        )
+
         prev_by_id = {s.signal_id: s for s in prev.signals}
         curr_by_id = {s.signal_id: s for s in curr.signals}
 
@@ -363,6 +383,8 @@ class DiffOperation:
             contributor_changes=contributor_changes[:10],
             recommendation=recommendation,
             explanation=explanation,
+            comparable=comparable,
+            comparability_warning=comparability_warning,
         )
 
     @staticmethod

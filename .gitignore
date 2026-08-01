@@ -12,6 +12,10 @@ build/
 venv/
 env/
 
+# Secret
+*.env
+.env.example
+
 # IDE
 .vscode/
 .idea/
@@ -43,6 +47,11 @@ scan_summary.py
 fastapi_scan.json
 fetch_reddit.py
 _audit_state.py
+setup_cockroachdb.py
+SUBMISSION.md
+certs/
+verify_imports.py
+
 # Documents
 docs
 tests

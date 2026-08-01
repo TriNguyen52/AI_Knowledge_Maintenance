@@ -387,7 +387,7 @@ Provide your root cause analysis as JSON. Remember: distinguish observations fro
 @action(reads=["root_cause_analysis", "knowledge_problems", "affected_artifact_uris",
                "prior_failures", "assessment_id", "prior_diagnosis", "prior_strategy",
                "prior_verification", "decision_trace", "assessment_summary", "cumulative_tokens",
-               "problem_saliences"],
+               "problem_saliences", "prior_modification_steps"],
         writes=["proposals", "selected_proposal_idx", "current_stage", "llm_metadata",
                 "decision_trace", "cumulative_tokens"])
 def generate_proposal(state: State, llm_gateway: Any = None, history_store: Any = None) -> State:
@@ -414,6 +414,7 @@ def generate_proposal(state: State, llm_gateway: Any = None, history_store: Any 
     prior_failures = state.get("prior_failures", [])
     prior_diagnosis = state.get("prior_diagnosis", {})
     prior_strategy = state.get("prior_strategy", {})
+    prior_modification_steps = state.get("prior_modification_steps", [])
     cumulative_tokens = state.get("cumulative_tokens", 0)
 
     # Reuse the assessment summary from analyze_issue instead of
@@ -461,6 +462,33 @@ The following strategy was tried in a prior attempt and FAILED:
 {prior_strategy_summary}
 
 You MUST propose a DIFFERENT strategy. Explain why your proposal differs from the prior failed attempt."""
+
+    # Prior rejected modification steps — concrete changes that were
+    # attempted and failed. The LLM must not repeat the same concrete
+    # steps even under a different strategy name.
+    prior_steps_text = ""
+    if prior_modification_steps:
+        steps_lines = []
+        for entry in prior_modification_steps:
+            attempt = entry.get("attempt_number", "?")
+            strat = entry.get("strategy", "unknown")
+            reason = entry.get("failure_reason", "unknown")
+            steps_json = json.dumps(
+                entry.get("modification_steps", []),
+                indent=2,
+                default=str,
+            )[:800]
+            steps_lines.append(
+                f"### Attempt #{attempt} — strategy: {strat}\n"
+                f"Failure reason: {reason}\n"
+                f"Modification steps that were tried:\n{steps_json}"
+            )
+        prior_steps_text = f"""## Prior Rejected Modification Steps — DO NOT REPEAT
+The following concrete modification steps were attempted in prior attempts and FAILED.
+Do NOT propose the same modification steps again, even under a different strategy name.
+
+{chr(10).join(steps_lines)}
+"""
 
     # Get structured historical context from history store
     remediation_context_str = "No historical context available."
@@ -565,6 +593,8 @@ Respond in JSON format:
 {prior_text}
 
 {prior_attempt_text}
+
+{prior_steps_text}
 
 ## Historical Remediation Outcomes (Source 2: What Worked Before)
 {remediation_context_str}
@@ -714,6 +744,36 @@ def execute_change(state: State, executor: Any = None) -> State:
         # the normal workflow.
         from ai_ready.improvement.executor import KnowledgeExecutor
         executor = KnowledgeExecutor()  # Dry-run mode
+
+    # --- Edit budget gate (deterministic, no LLM) ---
+    # Reject proposals that would change more than MAX_EDIT_BUDGET_PCT
+    # of any single artifact, preventing destructive overwrites.
+    from ai_ready.improvement.salience import check_edit_budget
+    budget_violations: list[dict[str, Any]] = []
+    for uri in artifact_uris:
+        within_budget, edit_delta, reason = check_edit_budget(
+            modification_steps, uri
+        )
+        if not within_budget:
+            budget_violations.append({
+                "artifact_uri": uri,
+                "edit_delta": round(edit_delta, 3),
+                "reason": reason,
+            })
+
+    if budget_violations:
+        logger.warning(
+            f"execute_change rejected by edit budget gate: "
+            f"{len(budget_violations)} artifact(s) exceed budget"
+        )
+        return state.update(
+            current_stage=RemediationStatus.FAILED_EXECUTION.value,
+            execution_history=[{
+                "error": "edit_budget_exceeded",
+                "success": False,
+                "violations": budget_violations,
+            }],
+        )
 
     try:
         execution_steps = executor.execute(modification_steps, artifact_uris)
@@ -1026,7 +1086,7 @@ def verify_improvement(state: State, assessment_store: Any = None,
 @action(reads=["current_stage", "proposals", "selected_proposal_idx", "verification_results",
                "root_cause_analysis", "knowledge_problems", "attempt_number", "execution_history",
                "approval_status", "decision_trace"],
-        writes=["prior_failures", "prior_diagnosis", "prior_strategy", "prior_verification",
+        writes=["prior_failures", "prior_modification_steps", "prior_diagnosis", "prior_strategy", "prior_verification",
                 "current_stage", "decision_trace"])
 def handle_failure(state: State) -> State:
     """Record failure and prepare state for potential forking.
@@ -1087,6 +1147,21 @@ def handle_failure(state: State) -> State:
     prior_strategy = proposals[selected_idx] if selected_idx < len(proposals) else {}
     prior_verification = verification
 
+    # Preserve the exact modification steps that were attempted so the
+    # next proposal generation can avoid repeating the same concrete
+    # changes under a different strategy name.
+    prior_modification_steps = list(state.get("prior_modification_steps", []))
+    if selected_idx < len(proposals):
+        attempted_steps = proposals[selected_idx].get("modification_steps", [])
+        if attempted_steps:
+            prior_modification_steps.append({
+                "attempt_number": attempt_number,
+                "strategy": strategy,
+                "modification_steps": attempted_steps,
+                "failure_reason": verification.get("failure_explanation", "")
+                                 or verification.get("summary", "unknown"),
+            })
+
     # Update DecisionTrace with final outcome
     decision_trace = DecisionTrace.from_dict(state.get("decision_trace", {}))
     if approval_status == "rejected":
@@ -1104,6 +1179,7 @@ def handle_failure(state: State) -> State:
 
     return state.update(
         prior_failures=prior_failures,
+        prior_modification_steps=prior_modification_steps,
         prior_diagnosis=prior_diagnosis,
         prior_strategy=prior_strategy,
         prior_verification=prior_verification,

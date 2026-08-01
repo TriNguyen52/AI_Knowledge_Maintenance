@@ -449,6 +449,7 @@ class KnowledgeAssessment:
     signals: list[KnowledgeSignal] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    fingerprint: dict[str, Any] = field(default_factory=dict)
 
     def explain_score(self, max_contributors: int = 5) -> ScoreExplanation:
         """Explain the assessment score using existing dimensions and signals.
@@ -471,6 +472,15 @@ class KnowledgeAssessment:
             )
         else:
             summary = "Signals exist, but no score contributor could be estimated."
+
+        # Append worst-dimension roll-up so weak spots don't hide in averages
+        if self.worst_dimension:
+            worst_score = self.dimensions[self.worst_dimension].score
+            summary += f" Worst dimension: {self.worst_dimension} ({worst_score}/100)."
+        if self.critical_dimensions:
+            summary += (
+                f" Critical dimensions (below 50): {', '.join(self.critical_dimensions)}."
+            )
 
         return ScoreExplanation(
             score=self.score,
@@ -497,7 +507,49 @@ class KnowledgeAssessment:
             "signals": [s.to_dict() for s in self.signals],
             "metrics": self.metrics,
             "metadata": self.metadata,
+            "fingerprint": self.fingerprint,
+            "worst_dimension": self.worst_dimension,
+            "critical_dimensions": self.critical_dimensions,
         }
+
+    @property
+    def verdict(self) -> str:
+        """Multi-level health verdict label (HEALTHY/MODERATE/DEGRADING/CRITICAL/INSUFFICIENT_DATA/STALE).
+
+        Computed on demand by ai_ready.verdicts.compute_verdict().
+        Returns only the label string; for the full reason, call
+        compute_verdict() directly.
+        """
+        from ai_ready.verdicts import compute_verdict
+        return compute_verdict(self).label.value
+
+    @property
+    def worst_dimension(self) -> str:
+        """Name of the lowest-scoring dimension, or '' if no dimensions.
+
+        Surfaces the weakest area so it doesn't hide behind a good
+        average.  Ties are broken by signal count (more signals =
+        worse, since more work is needed).
+        """
+        if not self.dimensions:
+            return ""
+        return min(
+            self.dimensions.items(),
+            key=lambda kv: (kv[1].score, -kv[1].signals_count),
+        )[0]
+
+    @property
+    def critical_dimensions(self) -> list[str]:
+        """Dimensions scoring below 50 (critical threshold).
+
+        These are dimensions where knowledge health is so poor that
+        averaging them into the overall score masks the problem.
+        """
+        return [
+            name
+            for name, dim in self.dimensions.items()
+            if dim.score < 50
+        ]
 
     def _dominant_dimensions(self) -> list[dict[str, Any]]:
         weights = self._effective_weights()
@@ -709,6 +761,8 @@ class AssessmentDiff:
     contributor_changes: list[dict[str, Any]] = field(default_factory=list)
     recommendation: str = ""
     explanation: str = ""
+    comparable: bool = True
+    comparability_warning: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -732,6 +786,8 @@ class AssessmentDiff:
             "contributor_changes": self.contributor_changes,
             "recommendation": self.recommendation,
             "explanation": self.explanation,
+            "comparable": self.comparable,
+            "comparability_warning": self.comparability_warning,
         }
 
 
@@ -745,6 +801,7 @@ class EvolutionView:
     dimension_trends: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     trajectory: str = ""  # "improving", "worsening", "stable"
     summary: str = ""
+    worst_dimension_trend: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -754,4 +811,5 @@ class EvolutionView:
             "dimension_trends": self.dimension_trends,
             "trajectory": self.trajectory,
             "summary": self.summary,
+            "worst_dimension_trend": self.worst_dimension_trend,
         }

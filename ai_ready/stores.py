@@ -511,6 +511,7 @@ class AssessmentStore:
         score_trend = []
         signal_trend = []
         dim_trends: dict[str, list[dict[str, Any]]] = {}
+        worst_dimension_trend: list[dict[str, Any]] = []
 
         for a in assessments:
             score_trend.append({
@@ -527,6 +528,12 @@ class AssessmentStore:
                     "assessment_id": a.assessment_id,
                     "score": dim.score,
                 })
+            worst_dimension_trend.append({
+                "assessment_id": a.assessment_id,
+                "worst_dimension": a.worst_dimension,
+                "worst_score": a.dimensions[a.worst_dimension].score if a.worst_dimension else None,
+                "critical_dimensions": a.critical_dimensions,
+            })
 
         # Determine trajectory
         if len(score_trend) >= 2:
@@ -556,6 +563,7 @@ class AssessmentStore:
             dimension_trends=dim_trends,
             trajectory=trajectory,
             summary=". ".join(summary_parts) + ".",
+            worst_dimension_trend=worst_dimension_trend,
         )
 
     # --- Row converter ---

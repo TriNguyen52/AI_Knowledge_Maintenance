@@ -449,6 +449,7 @@ def initial_state(
         "attempt_number": 1,
         "forked_from_app_id": "",
         "prior_failures": prior_failures or [],
+        "prior_modification_steps": [],
         "prior_diagnosis": {},
         "prior_strategy": {},
         "prior_verification": {},

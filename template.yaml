@@ -1,0 +1,235 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AI Knowledge Maintenance — Agentic knowledge assessment and remediation
+  using CockroachDB as persistent memory and Amazon Bedrock for LLM reasoning.
+
+  Architecture:
+  - CockroachDB Cloud: Persistent agent memory (state, embeddings, signals, outcomes)
+  - Amazon Bedrock: LLM reasoning (Claude 3.5 Sonnet) + embeddings (Titan v2)
+  - AWS Lambda: Serverless execution (assessment, remediation, S3-trigger)
+  - Amazon S3: Knowledge artifact storage
+  - EventBridge: Scheduled assessments
+  - API Gateway: On-demand assessment/remediation/status
+  - SQS DLQ: Failed event handling for resilience
+
+Parameters:
+  CockroachDBUrl:
+    Type: String
+    Description: CockroachDB Cloud connection string (postgresql://...)
+    NoEcho: true
+  KnowledgeBucket:
+    Type: String
+    Description: S3 bucket containing knowledge artifacts (.md, .mdx, .txt)
+    Default: ai-knowledge-base
+  KnowledgePrefix:
+    Type: String
+    Description: S3 prefix within the bucket (optional)
+    Default: ""
+  AssessmentSchedule:
+    Type: String
+    Description: EventBridge schedule expression for periodic assessments
+    Default: rate(1 hour)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 1024
+    Timeout: 300
+    Environment:
+      Variables:
+        COCKROACH_DB_URL: !Ref CockroachDBUrl
+        S3_KNOWLEDGE_BUCKET: !Ref KnowledgeBucket
+        S3_KNOWLEDGE_PREFIX: !Ref KnowledgePrefix
+        LLM_PROVIDER: bedrock
+        BEDROCK_MODEL: anthropic.claude-3-5-sonnet-20241022-v2:0
+    DeadLetterQueue:
+      Type: SQS
+      LogicalResourceId: RemediationDLQ
+
+Resources:
+  # --------------------------------------------------------
+  # SQS Dead Letter Queue for failed Lambda invocations
+  # --------------------------------------------------------
+  AssessmentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ai-knowledge-assess-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  RemediationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ai-knowledge-remediate-dlq
+      MessageRetentionPeriod: 1209600
+
+  # --------------------------------------------------------
+  # S3 Bucket for knowledge artifacts
+  # --------------------------------------------------------
+  KnowledgeBaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref KnowledgeBucket
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+
+  # --------------------------------------------------------
+  # Lambda: Assessment runner (scheduled + API-triggered)
+  # --------------------------------------------------------
+  AssessmentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ai-knowledge-assess
+      Handler: ai_ready.cloud.lambda_handler.lambda_handler
+      CodeUri: .
+      Policies:
+        - S3ReadPolicy:
+            Bucket: !Ref KnowledgeBaseBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+                - bedrock:ConverseStream
+              Resource: "*"
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt AssessmentDLQ.QueueName
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref AssessmentSchedule
+            Description: Periodic knowledge assessment
+            Enabled: true
+        ApiAssess:
+          Type: Api
+          Properties:
+            Path: /assess
+            Method: POST
+
+  # --------------------------------------------------------
+  # Lambda: Remediation runner (API-triggered)
+  # --------------------------------------------------------
+  RemediationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ai-knowledge-remediate
+      Handler: ai_ready.cloud.lambda_handler.lambda_handler
+      CodeUri: .
+      Policies:
+        - S3ReadPolicy:
+            Bucket: !Ref KnowledgeBaseBucket
+        - S3WritePolicy:
+            Bucket: !Ref KnowledgeBaseBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+                - bedrock:ConverseStream
+              Resource: "*"
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt RemediationDLQ.QueueName
+      Events:
+        ApiRemediate:
+          Type: Api
+          Properties:
+            Path: /remediate
+            Method: POST
+        ApiStatus:
+          Type: Api
+          Properties:
+            Path: /status
+            Method: GET
+
+  # --------------------------------------------------------
+  # Lambda: S3-triggered incremental assessment
+  # --------------------------------------------------------
+  S3TriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ai-knowledge-s3-trigger
+      Handler: ai_ready.cloud.lambda_handler.lambda_handler
+      CodeUri: .
+      Policies:
+        - S3ReadPolicy:
+            Bucket: !Ref KnowledgeBaseBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource: "*"
+      Events:
+        S3Upload:
+          Type: S3
+          Properties:
+            Bucket: !Ref KnowledgeBaseBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .md
+
+  # --------------------------------------------------------
+  # CloudWatch Logs (30-day retention)
+  # --------------------------------------------------------
+  AssessmentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/ai-knowledge-assess
+      RetentionInDays: 30
+
+  RemediationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/ai-knowledge-remediate
+      RetentionInDays: 30
+
+  S3TriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/ai-knowledge-s3-trigger
+      RetentionInDays: 30
+
+  # --------------------------------------------------------
+  # CloudWatch Alarms for observability
+  # --------------------------------------------------------
+  AssessmentErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ai-knowledge-assess-errors
+      AlarmDescription: Assessment Lambda error rate
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: ai-knowledge-assess
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Stage"
+  AssessmentFunction:
+    Description: Assessment Lambda ARN
+    Value: !GetAtt AssessmentFunction.Arn
+  RemediationFunction:
+    Description: Remediation Lambda ARN
+    Value: !GetAtt RemediationFunction.Arn
+  AssessmentDLQ:
+    Description: Dead letter queue for failed assessments
+    Value: !GetAtt AssessmentDLQ.QueueUrl
+  RemediationDLQ:
+    Description: Dead letter queue for failed remediations
+    Value: !GetAtt RemediationDLQ.QueueUrl

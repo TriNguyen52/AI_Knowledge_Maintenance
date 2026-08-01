@@ -1,0 +1,5 @@
+# Lambda deployment requirements
+boto3>=1.34.0
+psycopg2-binary>=2.9.0
+pyyaml>=6.0
+markdown-it-py>=3.0.0

@@ -67,6 +67,12 @@ SLOW_HALF_LIFE_DAYS = 180.0   # floor itself halves every 180 days
 SLOW_FLOOR_WEIGHT = 0.1       # floor amplitude (10% of fast term at t=0)
 DECAY_EPSILON = 0.01           # prevents collapse to exactly 0
 
+# ---------------------------------------------------------------------------
+# Edit budget — maximum fraction of an artifact that may be changed
+# ---------------------------------------------------------------------------
+
+MAX_EDIT_BUDGET_PCT = 0.20      # 20% — reject proposals that change more
+
 
 # ---------------------------------------------------------------------------
 # 1. Problem Salience
@@ -587,3 +593,94 @@ class SkipEvent:
             "timestamp": self.timestamp,
             "context": self.context,
         }
+
+
+# ---------------------------------------------------------------------------
+# Edit budget — deterministic gate for remediation proposals
+# ---------------------------------------------------------------------------
+
+def compute_edit_delta(
+    modification_steps: list[dict[str, Any]],
+    artifact_uri: str,
+) -> float:
+    """Estimate the fraction of an artifact that a set of steps will change.
+
+    This is a *conservative* heuristic: it estimates the proportion of
+    the artifact touched by the proposed modifications.  When the
+    fraction exceeds MAX_EDIT_BUDGET_PCT (20%), the proposal is
+    rejected to prevent destructive overwrites.
+
+    The estimate uses step_type to classify the scope of each change:
+
+    +-------------------------+----------+-----------------------------------+
+    | step_type               | weight   | rationale                         |
+    +=========================+==========+===================================+
+    | replace_document        | 1.0      | replaces the entire artifact      |
+    | rewrite_section         | 0.3      | replaces a major section (~30%)   |
+    | update_document         | 0.15     | partial content update (~15%)     |
+    | add_metadata            | 0.05     | metadata only, content untouched  |
+    | add_section             | 0.1      | appends new content (~10%)        |
+    | delete_section          | 0.2      | removes content (~20%)            |
+    | rename                  | 0.05     | small reference rename             |
+    | (other / unknown)       | 0.1      | conservative default               |
+    +-------------------------+----------+-----------------------------------+
+
+    Multiple steps targeting the same artifact are summed (capped at 1.0).
+
+    Args:
+        modification_steps: The proposal's modification_steps list.
+        artifact_uri: The artifact being evaluated (steps targeting
+            other artifacts are ignored).
+
+    Returns:
+        Float in [0.0, 1.0] representing the estimated fraction changed.
+    """
+    _STEP_WEIGHTS: dict[str, float] = {
+        "replace_document": 1.0,
+        "rewrite_section": 0.3,
+        "update_document": 0.15,
+        "add_metadata": 0.05,
+        "add_section": 0.1,
+        "delete_section": 0.2,
+        "rename": 0.05,
+    }
+    _DEFAULT_WEIGHT = 0.1
+
+    total = 0.0
+    for step in modification_steps:
+        step_uri = step.get("artifact_uri", "")
+        if step_uri and step_uri != artifact_uri:
+            continue
+        step_type = step.get("step_type", "unknown")
+        weight = _STEP_WEIGHTS.get(step_type, _DEFAULT_WEIGHT)
+        total += weight
+
+    return min(total, 1.0)
+
+
+def check_edit_budget(
+    modification_steps: list[dict[str, Any]],
+    artifact_uri: str,
+    max_pct: float = MAX_EDIT_BUDGET_PCT,
+) -> tuple[bool, float, str]:
+    """Check whether a proposal stays within the edit budget.
+
+    Args:
+        modification_steps: The proposal's modification_steps list.
+        artifact_uri: The artifact being modified.
+        max_pct: Maximum allowed fraction (default 20%).
+
+    Returns:
+        Tuple of (within_budget, edit_delta, reason).
+        If within_budget is False, reason explains the rejection.
+    """
+    delta = compute_edit_delta(modification_steps, artifact_uri)
+    if delta > max_pct:
+        return (
+            False,
+            delta,
+            f"Edit budget exceeded: proposal would change {delta:.0%} of "
+            f"artifact '{artifact_uri}' (max allowed: {max_pct:.0%}). "
+            f"Reject to prevent destructive overwrite.",
+        )
+    return True, delta, ""
