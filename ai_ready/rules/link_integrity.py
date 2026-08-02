@@ -22,6 +22,7 @@ class LinkIntegrityCollector(SignalCollector):
     id = "link_integrity"
     severity_default = Severity.MEDIUM
     dimension = "connectivity"
+    scope = "cross_artifact"
 
     def __init__(self) -> None:
         self._source_path: str | None = None

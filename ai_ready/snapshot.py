@@ -7,12 +7,8 @@ SignalLifecycle, EvolutionView) exclusively.
 
 from __future__ import annotations
 
-import json
-import sqlite3
-from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from ai_ready.models import (
     AssessmentDiff,
@@ -21,11 +17,11 @@ from ai_ready.models import (
     SignalLifecycle,
     SignalStatus,
 )
-from ai_ready.stores import AssessmentStore, SignalStore
+from ai_ready.stores import AssessmentStore, SignalStore, _SQLiteStoreMixin
 from ai_ready.operations import DiffOperation
 
 
-class AssessmentStoreFacade:
+class AssessmentStoreFacade(_SQLiteStoreMixin):
     """SQLite-backed assessment storage with lifecycle tracking.
 
     Delegates persistence to AssessmentStore + SignalStore. All methods
@@ -38,20 +34,6 @@ class AssessmentStoreFacade:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._assessment_store = AssessmentStore(db_path)
         self._signal_store = self._assessment_store.signal_store
-
-    @contextmanager
-    def _conn(self) -> Iterator[sqlite3.Connection]:
-        """Context manager that properly opens and closes a connection."""
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     # --- Assessment CRUD (delegates to AssessmentStore) ---
 
@@ -129,20 +111,7 @@ class AssessmentStoreFacade:
                    LIMIT ?""",
                 (SignalStatus.RESOLVED.value, latest.assessment_id, limit),
             ).fetchall()
-            return [
-                SignalLifecycle(
-                    signal_id=r["signal_id"],
-                    collector_id=r["collector_id"],
-                    artifact_uri=r["artifact_uri"],
-                    first_seen=r["first_seen"],
-                    last_seen=r["last_seen"],
-                    status=SignalStatus(r["status"]),
-                    severity_history=json.loads(r["severity_history"]),
-                    assessment_ids=json.loads(r["assessment_ids"]),
-                    resolved_assessment=r["resolved_assessment"],
-                )
-                for r in rows
-            ]
+            return [self._signal_store._row_to_lifecycle(r) for r in rows]
 
     def get_signal_stats(self) -> dict[str, Any]:
         """Get summary stats about signal lifecycle."""

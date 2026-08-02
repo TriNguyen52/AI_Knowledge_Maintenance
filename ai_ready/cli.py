@@ -37,7 +37,7 @@ from ai_ready.output import (
     format_sarif,
     format_terminal,
 )
-from ai_ready.knowledge.loader import load_knowledge_base
+from ai_ready.knowledge.registry import load_knowledge_source
 from ai_ready.pipeline import AssessmentPipeline
 from ai_ready.snapshot import AssessmentStoreFacade
 
@@ -95,7 +95,7 @@ def _detect_git_commit(source: str | Path) -> str:
 
 def _load_kb(source: Path, config: Config) -> tuple[list, list]:
     """Load artifacts and relations from source."""
-    knowledge_source = load_knowledge_base(source)
+    knowledge_source = load_knowledge_source(source)
     return knowledge_source.artifacts, knowledge_source.relationships
 
 

@@ -31,7 +31,7 @@ from ai_ready.knowledge.registry import register_knowledge_sdk
 from ai_ready.models import KnowledgeArtifact, Relationship
 
 
-SUPPORTED_EXTENSIONS = {".md", ".markdown", ".mdx", ".txt", ".rst"}
+from ai_ready.knowledge.discovery import SUPPORTED_EXTENSIONS
 
 
 @register_knowledge_sdk

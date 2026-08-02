@@ -30,6 +30,7 @@ from ai_ready.models import (
     Severity,
 )
 from ai_ready.rules import SignalCollector, all_collectors
+from ai_ready.knowledge.discovery import SUPPORTED_EXTENSIONS
 
 
 # ---------------------------------------------------------------------------
@@ -54,89 +55,6 @@ class ChangeEvent:
     artifact_uri: str
     artifact: KnowledgeArtifact | None = None
     links_changed: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Collector dependencies
-# ---------------------------------------------------------------------------
-
-@dataclass
-class CollectorDependency:
-    """Declares what a collector depends on, driving incremental execution.
-
-    Attributes:
-        collector_id: The collector's identifier
-        scope: "per_artifact" if the collector only reads one artifact at a time,
-               "cross_artifact" if it needs the full bundle
-        needs_full_bundle_on_link_change: If True, any link change triggers a full
-                                          re-evaluation of this collector
-    """
-    collector_id: str
-    scope: str  # "per_artifact" | "cross_artifact"
-    needs_full_bundle_on_link_change: bool = False
-
-    def is_affected_by(self, event: ChangeEvent) -> bool:
-        """Whether this collector's signals may change due to this event."""
-        if event.event_type == "deleted":
-            return True
-        if event.event_type == "added":
-            return True
-        if event.event_type == "modified":
-            if self.scope == "per_artifact":
-                return True
-            if self.scope == "cross_artifact":
-                return event.links_changed
-        return False
-
-    def get_affected_uris(
-        self, event: ChangeEvent, all_uris: set[str]
-    ) -> set[str]:
-        """Which artifact URIs need re-evaluation for this collector + event.
-
-        For per-artifact collectors: only the changed artifact itself.
-        For cross-artifact collectors on link changes: all artifacts (full bundle).
-        For cross-artifact collectors on content-only changes: empty set (skip).
-        """
-        if event.event_type == "deleted":
-            if self.scope == "cross_artifact":
-                return all_uris
-            return set()  # deleted artifact is gone, no signals to recompute
-
-        if event.event_type == "added":
-            if self.scope == "cross_artifact":
-                return all_uris
-            return {event.artifact_uri}
-
-        if event.event_type == "modified":
-            if self.scope == "per_artifact":
-                return {event.artifact_uri}
-            if self.scope == "cross_artifact" and event.links_changed:
-                return all_uris
-            return set()  # content-only change, cross-artifact collector not affected
-
-        return set()
-
-
-# Registry of collector dependencies
-_COLLECTOR_DEPENDENCIES: dict[str, CollectorDependency] = {
-    "topic_purity": CollectorDependency(
-        collector_id="topic_purity",
-        scope="per_artifact",
-    ),
-    "heading_quality": CollectorDependency(
-        collector_id="heading_quality",
-        scope="per_artifact",
-    ),
-    "context_independence": CollectorDependency(
-        collector_id="context_independence",
-        scope="per_artifact",
-    ),
-    "link_integrity": CollectorDependency(
-        collector_id="link_integrity",
-        scope="cross_artifact",
-        needs_full_bundle_on_link_change=True,
-    ),
-}
 
 
 # ---------------------------------------------------------------------------
@@ -212,31 +130,43 @@ class IncrementalExecutor:
             elif event.event_type == "deleted":
                 deleted_uris.add(event.artifact_uri)
 
-        per_doc_collectors = ["topic_purity", "heading_quality", "context_independence"]
+        # Classify collectors by scope using collector metadata
+        registry = all_collectors()
+        per_artifact_collectors: list[str] = []
+        cross_artifact_collectors: list[str] = []
+        for cid, cls in registry.items():
+            if self.pipeline.enabled_collectors and cid not in self.pipeline.enabled_collectors:
+                continue
+            if cls.scope == "cross_artifact":
+                cross_artifact_collectors.append(cid)
+            else:
+                per_artifact_collectors.append(cid)
+
         per_doc_affected = added_uris | modified_uris
 
-        link_integrity_affected: set[str] = set()
-        link_integrity_needs_full = bool(link_changed_uris or added_uris or deleted_uris)
-        if link_integrity_needs_full:
-            link_integrity_affected = all_uris
+        cross_artifact_affected: set[str] = set()
+        cross_artifact_needs_full = bool(link_changed_uris or added_uris or deleted_uris)
+        if cross_artifact_needs_full:
+            cross_artifact_affected = all_uris
 
         # --- Invalidate signals from previous assessment ---
         # Build set of (collector_id, artifact_uri) pairs to invalidate
         invalidated: set[tuple[str, str]] = set()
 
-        for collector_id in per_doc_collectors:
+        for collector_id in per_artifact_collectors:
             for uri in per_doc_affected:
                 invalidated.add((collector_id, uri))
 
-        if link_integrity_needs_full:
-            # Invalidate all link_integrity signals
+        if cross_artifact_needs_full:
+            # Invalidate all cross-artifact collector signals
             for s in prev_assessment.signals:
-                if s.collector_id == "link_integrity":
+                if s.collector_id in cross_artifact_collectors:
                     invalidated.add((s.collector_id, s.artifact_uri))
 
         # Also invalidate signals for deleted artifacts (any collector)
+        all_collector_ids = per_artifact_collectors + cross_artifact_collectors
         for uri in deleted_uris:
-            for collector_id in per_doc_collectors + ["link_integrity"]:
+            for collector_id in all_collector_ids:
                 invalidated.add((collector_id, uri))
 
         # --- Keep signals that are not invalidated ---
@@ -264,32 +194,28 @@ class IncrementalExecutor:
                     relationships=relationships,  # relationships don't affect per-artifact collectors
                     source=source,
                 )
-                registry = all_collectors()
-                for collector_id in per_doc_collectors:
+                for collector_id in per_artifact_collectors:
                     if collector_id not in registry:
-                        continue
-                    if self.pipeline.enabled_collectors and collector_id not in self.pipeline.enabled_collectors:
                         continue
                     collector = registry[collector_id]()
                     result = collector.run(mini_bundle)
                     results.append(result)
                     new_signals.extend(result.signals)
 
-        # Run link_integrity on full bundle if needed
-        if link_integrity_needs_full:
-            registry = all_collectors()
-            collector_id = "link_integrity"
-            if collector_id in registry:
-                if not self.pipeline.enabled_collectors or collector_id in self.pipeline.enabled_collectors:
-                    full_bundle = ArtifactBundle(
-                        artifacts=all_artifacts,
-                        relationships=relationships,
-                        source=source,
-                    )
-                    collector = registry[collector_id]()
-                    result = collector.run(full_bundle)
-                    results.append(result)
-                    new_signals.extend(result.signals)
+        # Run cross-artifact collectors on full bundle if needed
+        if cross_artifact_needs_full:
+            for collector_id in cross_artifact_collectors:
+                if collector_id not in registry:
+                    continue
+                full_bundle = ArtifactBundle(
+                    artifacts=all_artifacts,
+                    relationships=relationships,
+                    source=source,
+                )
+                collector = registry[collector_id]()
+                result = collector.run(full_bundle)
+                results.append(result)
+                new_signals.extend(result.signals)
 
         if new_signals:
             self.pipeline.apply_policy(new_signals)
@@ -309,12 +235,14 @@ class IncrementalExecutor:
 
         # --- Create updated assessment ---
         assessment_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        link_fingerprints = _compute_link_fingerprints(all_artifacts)
         metadata: dict[str, Any] = {
             "source": source,
             "artifact_count": len(all_artifacts),
             "relationship_count": len(relationships),
             "incremental": True,
             "changed_artifacts": len(changed_uris),
+            "link_fingerprints": link_fingerprints,
         }
         if git_commit:
             metadata["git_commit"] = git_commit
@@ -389,6 +317,26 @@ class IncrementalExecutor:
 # Change detection
 # ---------------------------------------------------------------------------
 
+def _compute_link_fingerprints(artifacts: list[KnowledgeArtifact]) -> dict[str, frozenset[str]]:
+    """Compute a fingerprint of internal links for each artifact.
+
+    Returns a mapping ``{uri: frozenset(internal_link_targets)}`` that can be
+    stored in assessment metadata and compared on the next cycle to detect
+    link changes without re-reading the previous artifact content.
+    """
+    fingerprints: dict[str, frozenset[str]] = {}
+    for artifact in artifacts:
+        content = artifact.content
+        links = content.links if hasattr(content, "links") else content.get("links", [])
+        internal_targets = frozenset(
+            link.target if hasattr(link, "target") else link["target"]
+            for link in links
+            if (link.is_internal if hasattr(link, "is_internal") else link.get("is_internal", True))
+        )
+        fingerprints[artifact.uri] = internal_targets
+    return fingerprints
+
+
 def detect_changes(
     source_path: Any,
     prev_assessment: KnowledgeAssessment | None,
@@ -422,6 +370,9 @@ def detect_changes(
     if not prev_uris and prev_artifact_count > 0:
         return []
 
+    # Retrieve previous link fingerprints from assessment metadata
+    prev_link_fps: dict[str, frozenset[str]] = prev_assessment.metadata.get("link_fingerprints", {})
+
     # Detect changes
     events: list[ChangeEvent] = []
 
@@ -442,16 +393,19 @@ def detect_changes(
             artifact=None,
         ))
 
-    # Modified artifacts — compare links
+    # Modified artifacts — compare links against stored fingerprints
+    current_link_fps = _compute_link_fingerprints(current_artifacts)
     for uri in current_uris & prev_uris:
         artifact = current_by_uri[uri]
-        current_internal_links = {link.target for link in artifact.links if link.is_internal}
+        current_links = current_link_fps.get(uri, frozenset())
+        prev_links = prev_link_fps.get(uri, frozenset())
+        links_changed = current_links != prev_links
 
         events.append(ChangeEvent(
             event_type="modified",
             artifact_uri=uri,
             artifact=artifact,
-            links_changed=True,
+            links_changed=links_changed,
         ))
 
     return events
@@ -494,6 +448,8 @@ def detect_changes_via_git(
             return []
 
         current_by_uri = {a.uri: a for a in current_artifacts}
+        prev_link_fps: dict[str, frozenset[str]] = prev_assessment.metadata.get("link_fingerprints", {})
+        current_link_fps = _compute_link_fingerprints(current_artifacts)
         events: list[ChangeEvent] = []
 
         for line in lines:
@@ -507,7 +463,7 @@ def detect_changes_via_git(
             file_path = file_path.replace("\\", "/")
 
             # Only care about supported file types
-            if not any(file_path.endswith(ext) for ext in [".md", ".markdown", ".mdx", ".txt", ".rst"]):
+            if not any(file_path.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
                 continue
 
             artifact_uri = None
@@ -550,13 +506,15 @@ def detect_changes_via_git(
                 # Modified (M) or unknown
                 if artifact_uri:
                     artifact = current_by_uri[artifact_uri]
-                    current_links = {link.target for link in artifact.links if link.is_internal}
+                    current_links = current_link_fps.get(artifact_uri, frozenset())
+                    prev_links = prev_link_fps.get(artifact_uri, frozenset())
+                    links_changed = current_links != prev_links
 
                     events.append(ChangeEvent(
                         event_type="modified",
                         artifact_uri=artifact_uri,
                         artifact=artifact,
-                        links_changed=True,  # Conservative
+                        links_changed=links_changed,
                     ))
 
         return events

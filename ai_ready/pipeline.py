@@ -24,17 +24,7 @@ from ai_ready.models import (
     Severity,
 )
 from ai_ready.rules import SignalCollector, all_collectors
-from ai_ready.operations import CollectOperation, AssessOperation
-
-# Default dimension weights
-DEFAULT_WEIGHTS: dict[str, float] = {
-    "retrieval": 0.25,
-    "context": 0.15,
-    "consistency": 0.20,
-    "trust": 0.20,
-    "connectivity": 0.10,
-    "workflow": 0.10,
-}
+from ai_ready.operations import CollectOperation, AssessOperation, DEFAULT_WEIGHTS
 
 # Default thresholds
 DEFAULT_THRESHOLDS = {

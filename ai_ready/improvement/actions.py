@@ -36,6 +36,8 @@ from ai_ready.improvement.salience import (
     check_signal_delta,
     discover_problems_heuristic,
     rank_problems_by_salience,
+    cluster_problems_by_root_cause,
+    ProblemSalience,
     SkipEvent,
     DEFAULT_SALIENCE_THRESHOLD,
 )
@@ -46,12 +48,15 @@ from ai_ready.improvement.prompts import (
     build_history_context,
     cluster_signals,
     build_assessment_summary,
+    build_systemic_cluster_summary,
 )
 from ai_ready.improvement.heuristics import (
     heuristic_analysis,
     heuristic_problems,
     heuristic_proposal,
+    heuristic_systemic_proposal,
     reject_generic_proposals,
+    deduplicate_modification_steps,
     parse_hypotheses_and_problems,
     parse_proposals,
 )
@@ -387,10 +392,11 @@ Provide your root cause analysis as JSON. Remember: distinguish observations fro
 @action(reads=["root_cause_analysis", "knowledge_problems", "affected_artifact_uris",
                "prior_failures", "assessment_id", "prior_diagnosis", "prior_strategy",
                "prior_verification", "decision_trace", "assessment_summary", "cumulative_tokens",
-               "problem_saliences", "prior_modification_steps"],
+               "problem_saliences", "prior_modification_steps", "systemic_clusters"],
         writes=["proposals", "selected_proposal_idx", "current_stage", "llm_metadata",
-                "decision_trace", "cumulative_tokens"])
-def generate_proposal(state: State, llm_gateway: Any = None, history_store: Any = None) -> State:
+                "decision_trace", "cumulative_tokens", "systemic_clusters"])
+def generate_proposal(state: State, llm_gateway: Any = None, history_store: Any = None,
+                      assessment_store: Any = None) -> State:
     """Generate improvement strategies based on root cause analysis.
 
     Retrieves structured historical context (successful/failed strategies,
@@ -401,12 +407,22 @@ def generate_proposal(state: State, llm_gateway: Any = None, history_store: Any 
       2. Historical remediation outcomes (what worked/failed before)
       3. Prior failed attempts from forking (what to avoid)
 
+    Systemic Clustering (deterministic, no LLM):
+      Before generating proposals, ranked KnowledgeProblems are clustered
+      by root cause pattern using cluster_problems_by_root_cause(). The
+      LLM receives systemic cluster summaries instead of individual
+      problems, enabling KB-wide systemic proposals rather than
+      per-artifact fixes. After LLM generates proposals, modification
+      steps are deduplicated to prevent the executor from applying
+      the same change multiple times.
+
     Writes:
-      proposals: list of RemediationProposal dicts
+      proposals: list of RemediationProposal dicts (deduplicated steps)
       selected_proposal_idx: 0 (first proposal by default)
       current_stage: "proposal_generated"
       llm_metadata: updated with call info
       decision_trace: updated with proposal-stage reasoning
+      systemic_clusters: list of SystemicCluster dicts
     """
     root_causes = state.get("root_cause_analysis", [])
     knowledge_problems = state.get("knowledge_problems", [])
@@ -422,8 +438,41 @@ def generate_proposal(state: State, llm_gateway: Any = None, history_store: Any 
     assessment_summary = state.get("assessment_summary", "")
     if not assessment_summary:
         assessment_summary = build_assessment_summary(
-            state.get("signal_ids", []), artifact_uris, None
+            state.get("signal_ids", []), artifact_uris, assessment_store
         )
+
+    # --- Systemic Clustering (deterministic, no LLM) ---
+    # Cluster ranked KnowledgeProblems by root cause pattern. This
+    # groups problems beyond (collector, type, artifact) into systemic
+    # patterns (directory clusters, shared evidence, systemic types).
+    # The LLM receives cluster summaries instead of individual problems,
+    # enabling KB-wide systemic proposals.
+    knowledge_problem_objects = [KnowledgeProblem.from_dict(kp) for kp in knowledge_problems]
+    salience_scores = state.get("problem_saliences", [])
+
+    # Reconstruct ProblemSalience objects for the clustering function
+    salience_objects: list[ProblemSalience] = []
+    if salience_scores:
+        for s_dict in salience_scores:
+            salience_objects.append(ProblemSalience(
+                problem_id=s_dict.get("problem_id", ""),
+                encoding=s_dict.get("encoding", 0.0),
+                outcome=s_dict.get("outcome", 0.0),
+                retrieval=s_dict.get("retrieval", 0.0),
+                size_penalty=s_dict.get("size_penalty", 0.0),
+                staleness_factor=s_dict.get("staleness_factor", 1.0),
+                total=s_dict.get("total", 0.0),
+                explanation=s_dict.get("explanation", ""),
+            ))
+
+    assessment = assessment_store.latest() if assessment_store else None
+    systemic_clusters = cluster_problems_by_root_cause(
+        knowledge_problem_objects,
+        salience_objects if salience_objects else None,
+        assessment,
+    )
+    systemic_cluster_dicts = [sc.to_dict() for sc in systemic_clusters]
+    systemic_cluster_summary = build_systemic_cluster_summary(systemic_cluster_dicts)
 
     # Build context for LLM — keep prompts compact to avoid rate limits
     root_cause_text = json.dumps(root_causes, indent=2, default=str)[:1500]
@@ -533,17 +582,20 @@ PREFER strategies with EMA > 0.5. AVOID strategies with EMA < 0.3 unless you hav
 
 Your goal: improve the OVERALL KNOWLEDGE SYSTEM, not just fix individual signals. Signals are symptoms — your strategies should address the underlying system issues that produce them.
 
+SYSTEMIC PROPOSALS: Problems have been clustered by root cause pattern (see "Systemic Pattern Analysis" below). When multiple problems share a pattern (e.g., all broken links from the same moved page, or generic headings across multiple documents), propose a SINGLE systemic fix that addresses the entire cluster rather than separate per-artifact fixes. This reduces redundant modification steps and addresses root causes at the KB level.
+
 Your job:
 1. Propose 1-3 concrete strategies for improving the knowledge quality system
 2. For each strategy, describe specific modification steps — recommend MINIMAL modifications that maximize long-term knowledge quality
-3. Estimate the expected impact on quality scores — be specific and realistic
-4. List potential risks — including the risk of making things worse
-5. AVOID strategies that have failed in prior attempts — never retry the same strategy under a different name
-6. PREFER strategies that have succeeded historically for similar issues
-7. Explain your reasoning for each strategy — why this strategy, why not alternatives, what tradeoffs you considered
-8. For each strategy, state your confidence (0.0 to 1.0) that it will work
-9. List assumptions your strategy depends on — what must be true for this to work
-10. Describe how to roll back the change if it makes things worse
+3. When addressing a systemic cluster, create ONE modification step per affected artifact (not one per problem)
+4. Estimate the expected impact on quality scores — be specific and realistic
+5. List potential risks — including the risk of making things worse
+6. AVOID strategies that have failed in prior attempts — never retry the same strategy under a different name
+7. PREFER strategies that have succeeded historically for similar issues
+8. Explain your reasoning for each strategy — why this strategy, why not alternatives, what tradeoffs you considered
+9. For each strategy, state your confidence (0.0 to 1.0) that it will work
+10. List assumptions your strategy depends on — what must be true for this to work
+11. Describe how to roll back the change if it makes things worse
 
 Each strategy should include modification_steps as a list of dicts with:
   - step_type: one of "update_document", "add_metadata", "create_relationship", "remove_relationship", "archive_artifact", "merge_artifacts", "split_artifact"
@@ -578,6 +630,10 @@ Respond in JSON format:
 ## Assessment Summary (reused from analysis)
 {assessment_summary}
 
+## Systemic Pattern Analysis (deterministic clustering — no LLM)
+Problems have been clustered by root cause pattern. Address each cluster with a systemic fix rather than individual per-artifact fixes.
+{systemic_cluster_summary}
+
 ## Root Cause Analysis (Source 1: What's Wrong)
 {root_cause_text}
 
@@ -604,7 +660,13 @@ Propose 1-3 improvement strategies as JSON. Focus on improving the knowledge sys
 
     try:
         if llm_gateway is None:
-            proposals = [heuristic_proposal(root_causes, artifact_uris, prior_strategies)]
+            # Use systemic heuristic proposal when clusters are available
+            if systemic_clusters:
+                proposals = [heuristic_systemic_proposal(
+                    systemic_clusters, artifact_uris, prior_strategies
+                )]
+            else:
+                proposals = [heuristic_proposal(root_causes, artifact_uris, prior_strategies)]
             llm_meta = {"provider": "none", "model": "heuristic"}
         else:
             response = llm_gateway.chat(
@@ -629,6 +691,11 @@ Propose 1-3 improvement strategies as JSON. Focus on improving the knowledge sys
         # to be actionable are filtered out
         proposals = reject_generic_proposals(proposals, prior_strategies)
 
+        # Deduplicate modification steps across proposals — prevents
+        # the executor from applying the same change multiple times
+        # when the LLM generates overlapping steps for systemic clusters
+        proposals = deduplicate_modification_steps(proposals)
+
         # Track cumulative tokens across all actions
         action_tokens = (llm_meta.get("prompt_tokens", 0) or 0) + (llm_meta.get("completion_tokens", 0) or 0)
         cumulative_tokens += action_tokens
@@ -638,8 +705,8 @@ Propose 1-3 improvement strategies as JSON. Focus on improving the knowledge sys
         decision_trace.historical_context_used = remediation_context_str[:500]
         if proposals:
             decision_trace.proposal_reasoning = (
-                f"Generated {len(proposals)} proposal(s). "
-                f"Top strategy: {proposals[0].strategy}. "
+                f"Generated {len(proposals)} proposal(s) from {len(systemic_clusters)} "
+                f"systemic cluster(s). Top strategy: {proposals[0].strategy}. "
                 f"Reasoning: {getattr(proposals[0], 'reasoning', 'N/A')}"
             )
 
@@ -650,6 +717,7 @@ Propose 1-3 improvement strategies as JSON. Focus on improving the knowledge sys
             "llm_metadata": {**state.get("llm_metadata", {}), "generate_proposal": llm_meta},
             "decision_trace": decision_trace.to_dict(),
             "cumulative_tokens": cumulative_tokens,
+            "systemic_clusters": systemic_cluster_dicts,
         }
 
         if not proposals:

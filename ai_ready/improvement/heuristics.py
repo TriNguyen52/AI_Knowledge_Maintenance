@@ -20,6 +20,7 @@ from ai_ready.improvement.models import (
     RootCauseHypothesis,
     KnowledgeProblem,
     RemediationProposal,
+    SystemicCluster,
 )
 from ai_ready.improvement.parsing import parse_llm_json
 
@@ -192,3 +193,163 @@ def parse_proposals(content: str) -> list[RemediationProposal]:
             expected_impact="unknown",
             risks=["LLM parsing failure"],
         )]
+
+
+# ---------------------------------------------------------------------------
+# Modification step deduplication (deterministic, no LLM)
+# ---------------------------------------------------------------------------
+
+def _step_signature(step: dict[str, Any]) -> str:
+    """Compute a normalizable signature for a modification step.
+
+    Two steps with the same signature are considered duplicates
+    and can be merged. The signature is based on:
+      - step_type (exact match required)
+      - artifact_uri (exact match required)
+      - description (normalized: lowercased, stripped, whitespace-collapsed)
+
+    Parameters are NOT included in the signature because different
+    proposals may use different parameter names for the same operation.
+    """
+    step_type = step.get("step_type", "unknown")
+    artifact_uri = step.get("artifact_uri", "")
+    description = step.get("description", "")
+    # Normalize description: lowercase, strip, collapse whitespace
+    normalized_desc = " ".join(description.lower().strip().split())
+    return f"{step_type}|{artifact_uri}|{normalized_desc}"
+
+
+def deduplicate_modification_steps(
+    proposals: list[RemediationProposal],
+) -> list[RemediationProposal]:
+    """Deduplicate modification steps across proposals.
+
+    When multiple proposals contain the same modification step (same
+    step_type, same artifact_uri, same normalized description), the
+    duplicate steps are removed from all but the first proposal that
+    contains them. This prevents the executor from applying the same
+    change multiple times.
+
+    Steps are considered duplicates only if ALL of:
+      - Same step_type
+      - Same artifact_uri
+      - Same normalized description (case-insensitive, whitespace-collapsed)
+
+    Args:
+        proposals: List of RemediationProposal objects to deduplicate.
+
+    Returns:
+        New list of RemediationProposal with deduplicated steps.
+        Proposals that become empty after deduplication are removed.
+    """
+    if not proposals:
+        return proposals
+
+    seen_signatures: set[str] = set()
+    result: list[RemediationProposal] = []
+
+    for proposal in proposals:
+        deduped_steps: list[dict[str, Any]] = []
+        for step in proposal.modification_steps:
+            sig = _step_signature(step)
+            if sig not in seen_signatures:
+                seen_signatures.add(sig)
+                deduped_steps.append(step)
+
+        # Skip proposals that have no remaining steps after dedup
+        if not deduped_steps:
+            logger.info(
+                f"Removing proposal '{proposal.strategy}' — all "
+                f"steps were duplicates of earlier proposals"
+            )
+            continue
+
+        # Create a new proposal with deduplicated steps
+        new_proposal = RemediationProposal(
+            strategy=proposal.strategy,
+            description=proposal.description,
+            expected_impact=proposal.expected_impact,
+            risks=proposal.risks,
+            affected_artifact_uris=proposal.affected_artifact_uris,
+            modification_steps=deduped_steps,
+            root_cause_idx=proposal.root_cause_idx,
+            reasoning=proposal.reasoning,
+            affected_dimensions=proposal.affected_dimensions,
+            confidence=proposal.confidence,
+            assumptions=proposal.assumptions,
+            rollback_considerations=proposal.rollback_considerations,
+        )
+        result.append(new_proposal)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Heuristic systemic proposal (no LLM required)
+# ---------------------------------------------------------------------------
+
+def heuristic_systemic_proposal(
+    systemic_clusters: list[SystemicCluster],
+    artifact_uris: list[str],
+    prior_strategies: list[str],
+) -> RemediationProposal:
+    """Produce a systemic proposal from SystemicClusters without LLM.
+
+    When no LLM is available, this function generates a proposal that
+    addresses the highest-salience systemic cluster. It creates
+    modification steps for each affected artifact in the cluster.
+
+    Args:
+        systemic_clusters: List of SystemicCluster objects, sorted by
+            cluster_salience descending.
+        artifact_uris: All affected artifact URIs (fallback scope).
+        prior_strategies: Strategy names to avoid (prior failures).
+
+    Returns:
+        A RemediationProposal addressing the top systemic cluster.
+    """
+    if not systemic_clusters:
+        return heuristic_proposal([], artifact_uris, prior_strategies)
+
+    # Pick the highest-salience cluster
+    top_cluster = systemic_clusters[0]
+    cluster_artifacts = top_cluster.artifact_uris or artifact_uris
+
+    # Build a strategy name from the pattern type
+    strategy = f"systemic_{top_cluster.pattern_type}"
+    if strategy in prior_strategies:
+        strategy = f"systemic_{top_cluster.pattern_type}_v2"
+
+    # Create modification steps for each affected artifact
+    modification_steps = [
+        {
+            "step_type": "update_document",
+            "artifact_uri": uri,
+            "description": (
+                f"Address {top_cluster.pattern_type} pattern: "
+                f"{top_cluster.pattern_description[:100]}"
+            ),
+            "parameters": {
+                "cluster_id": top_cluster.cluster_id,
+                "pattern_type": top_cluster.pattern_type,
+            },
+        }
+        for uri in cluster_artifacts
+    ]
+
+    return RemediationProposal(
+        strategy=strategy,
+        description=(
+            f"Systemic proposal: address {top_cluster.pattern_type} pattern "
+            f"affecting {len(cluster_artifacts)} artifact(s). "
+            f"{top_cluster.pattern_description}"
+        ),
+        expected_impact=f"Resolve {len(top_cluster.signal_ids)} signal(s) across {len(cluster_artifacts)} artifact(s)",
+        risks=["Heuristic proposal — no LLM analysis of specific changes needed"],
+        affected_artifact_uris=cluster_artifacts,
+        modification_steps=modification_steps,
+        reasoning=f"Generated from systemic cluster '{top_cluster.cluster_id}' (salience={top_cluster.cluster_salience:.3f})",
+        confidence=0.3,
+        assumptions=["Artifacts are still accessible and modifiable"],
+        rollback_considerations="Revert individual document updates to restore prior state",
+    )

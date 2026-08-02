@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Iterator
 
 from ai_ready.knowledge.base import KnowledgeCapability, KnowledgeSDK
-from ai_ready.knowledge.discovery import LocalFileDiscovery
+from ai_ready.knowledge.discovery import LocalFileDiscovery, SUPPORTED_EXTENSIONS
 from ai_ready.knowledge.markdown_parser import MarkdownDocumentParser
-from ai_ready.knowledge.navigation import InlineLinkRelationExtractor, NavigationRelationExtractor
+from ai_ready.knowledge.navigation import InlineLinkRelationExtractor, NavigationRelationExtractor, _add_relation, _relative_path
 from ai_ready.knowledge.registry import register_knowledge_sdk
 from ai_ready.models import KnowledgeArtifact, Relationship
 
@@ -40,7 +40,7 @@ class MarkdownKnowledgeSDK(KnowledgeSDK):
         path = Path(source)
         return path.exists() and (
             path.is_dir()
-            or path.suffix.lower() in {".md", ".markdown", ".mdx", ".txt", ".rst"}
+            or path.suffix.lower() in SUPPORTED_EXTENSIONS
         )
 
     def connect(self, source: str | Path) -> None:
@@ -52,7 +52,7 @@ class MarkdownKnowledgeSDK(KnowledgeSDK):
     def iter_artifacts(self) -> Iterator[KnowledgeArtifact]:
         self._ensure_artifacts()
         for file_path in self._discovered_files:
-            relative_path = self._parser._relative_path(file_path, self._source)
+            relative_path = _relative_path(file_path, self._source)
             artifact = self._artifact_cache.get(relative_path)
             if artifact is not None:
                 yield artifact
@@ -92,12 +92,6 @@ class MarkdownKnowledgeSDK(KnowledgeSDK):
 
         deduped: list[Relationship] = []
         for rel in relationships:
-            if not any(
-                existing.source_uri == rel.source_uri
-                and existing.target_uri == rel.target_uri
-                and existing.relation_type == rel.relation_type
-                for existing in deduped
-            ):
-                deduped.append(rel)
+            _add_relation(deduped, rel.source_uri, rel.target_uri, rel.relation_type, rel.metadata)
 
         self._relationship_cache = deduped

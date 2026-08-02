@@ -34,6 +34,7 @@ class SignalCollector(ABC):
     id: str = "base"
     severity_default: Severity = Severity.LOW
     dimension: str = "retrieval"
+    scope: str = "per_artifact"  # "per_artifact" | "cross_artifact"
 
     @abstractmethod
     def collect(self, bundle: ArtifactBundle) -> dict[str, Any]:

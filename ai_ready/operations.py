@@ -29,6 +29,16 @@ from ai_ready.models import (
 )
 from ai_ready.rules import SignalCollector, all_collectors
 
+# Default dimension weights — shared by AssessOperation and AssessmentPipeline
+DEFAULT_WEIGHTS: dict[str, float] = {
+    "retrieval": 0.25,
+    "context": 0.15,
+    "consistency": 0.20,
+    "trust": 0.20,
+    "connectivity": 0.10,
+    "workflow": 0.10,
+}
+
 
 class CollectOperation:
     """Runs collectors against an artifact bundle and produces raw signals.
@@ -93,7 +103,6 @@ class AssessOperation:
         weights: dict[str, float] | None = None,
         policy: InterpretationPolicy | None = None,
     ) -> None:
-        from ai_ready.pipeline import DEFAULT_WEIGHTS
         self.weights = weights if weights is not None else DEFAULT_WEIGHTS
         self.policy = policy if policy is not None else InterpretationPolicy()
 
@@ -143,11 +152,22 @@ class AssessOperation:
 
         # Create assessment
         assessment_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        metadata: dict[str, Any] = {"source": source}
+        link_fingerprints = {
+            a.uri: frozenset(
+                link.target if hasattr(link, "target") else link["target"]
+                for link in (a.content.links if hasattr(a.content, "links") else a.content.get("links", []))
+                if (link.is_internal if hasattr(link, "is_internal") else link.get("is_internal", True))
+            )
+            for a in artifacts
+        }
+        metadata: dict[str, Any] = {
+            "source": source,
+            "artifact_count": len(artifacts),
+            "relationship_count": len(bundle.relationships),
+            "link_fingerprints": link_fingerprints,
+        }
         if git_commit:
             metadata["git_commit"] = git_commit
-        metadata["artifact_count"] = len(artifacts)
-        metadata["relationship_count"] = len(bundle.relationships)
 
         return KnowledgeAssessment(
             assessment_id=assessment_id,
@@ -174,12 +194,17 @@ class AssessOperation:
                 dim = collector_cls.dimension
                 dim_results.setdefault(dim, []).append(r)
 
+        # Group signals by collector_id for O(1) lookup
+        signals_by_collector: dict[str, list[KnowledgeSignal]] = {}
+        for s in signals:
+            signals_by_collector.setdefault(s.collector_id, []).append(s)
+
         dimensions: dict[str, DimensionScore] = {}
         for dim_name, dim_results_list in dim_results.items():
             # Recompute collector scores from assessed signals
             collector_scores = []
             for r in dim_results_list:
-                collector_signals = [s for s in signals if s.collector_id == r.collector_id]
+                collector_signals = signals_by_collector.get(r.collector_id, [])
                 if collector_signals:
                     total_penalty = sum(100 - s.score for s in collector_signals)
                     collector_score = max(0, 100 - total_penalty)
@@ -190,7 +215,7 @@ class AssessOperation:
             avg_score = int(sum(collector_scores) / len(collector_scores)) if collector_scores else 100
             collector_ids = [r.collector_id for r in dim_results_list]
             signals_count = sum(
-                len([s for s in signals if s.collector_id == r.collector_id]) for r in dim_results_list
+                len(signals_by_collector.get(r.collector_id, [])) for r in dim_results_list
             )
 
             dimensions[dim_name] = DimensionScore(

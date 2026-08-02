@@ -202,16 +202,21 @@ class ArtifactBundle:
     relationships: list[Relationship] = field(default_factory=list)
     source: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    _artifact_index: dict[str, KnowledgeArtifact] = field(default_factory=dict, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._rebuild_index()
+
+    def _rebuild_index(self) -> None:
+        """Rebuild the URI → artifact lookup index."""
+        self._artifact_index = {a.uri: a for a in self.artifacts}
 
     @property
     def artifact_count(self) -> int:
         return len(self.artifacts)
 
     def get_artifact(self, uri: str) -> KnowledgeArtifact | None:
-        for artifact in self.artifacts:
-            if artifact.uri == uri:
-                return artifact
-        return None
+        return self._artifact_index.get(uri)
 
     def get_children(self, uri: str) -> list[str]:
         return [

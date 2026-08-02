@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 from ai_ready.models import CodeBlock, DocumentContent, Heading, KnowledgeArtifact, Link, Paragraph, Section
+from ai_ready.knowledge.navigation import _relative_path
 
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 RST_HEADING_RE = re.compile(r"^([^\n]+)\n([=\-~`'\"^_*+#])\2+\s*$", re.MULTILINE)
@@ -102,12 +103,7 @@ class MarkdownDocumentParser:
         return os.path.splitext(os.path.basename(uri))[0]
 
     def _relative_path(self, filepath: Path, source_root: Path | None) -> str:
-        if source_root and source_root.is_dir():
-            try:
-                return str(filepath.relative_to(source_root)).replace("\\", "/")
-            except ValueError:
-                pass
-        return str(filepath).replace("\\", "/")
+        return _relative_path(filepath, source_root)
 
     def _extract_frontmatter(self, text: str) -> dict:
         match = FRONTMATTER_RE.match(text)

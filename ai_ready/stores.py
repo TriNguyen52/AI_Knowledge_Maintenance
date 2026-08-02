@@ -22,21 +22,17 @@ from ai_ready.models import (
     Severity,
     SignalLifecycle,
     SignalStatus,
-    _severity_rank,
 )
+from ai_ready.operations import DiffOperation
 
 
-class SignalStore:
-    """SQLite-backed signal storage with lifecycle tracking.
+class _SQLiteStoreMixin:
+    """Mixin providing a shared SQLite connection context manager.
 
-    Mirrors the signal_lifecycle table in AssessmentStore but
-    uses signal-centric table names (signals, signal_lifecycle).
+    Expects ``self.db_path`` to be a ``Path`` pointing to the database file.
     """
 
-    def __init__(self, db_path: str | Path) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+    db_path: Path
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -50,6 +46,19 @@ class SignalStore:
             raise
         finally:
             conn.close()
+
+
+class SignalStore(_SQLiteStoreMixin):
+    """SQLite-backed signal storage with lifecycle tracking.
+
+    Mirrors the signal_lifecycle table in AssessmentStore but
+    uses signal-centric table names (signals, signal_lifecycle).
+    """
+
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
 
     def _init_db(self) -> None:
         with self._conn() as conn:
@@ -287,7 +296,7 @@ class SignalStore:
         )
 
 
-class AssessmentStore:
+class AssessmentStore(_SQLiteStoreMixin):
     """SQLite-backed assessment storage with diff and trend analysis.
 
     Uses assessment-centric
@@ -299,19 +308,6 @@ class AssessmentStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.signal_store = SignalStore(db_path)
         self._init_db()
-
-    @contextmanager
-    def _conn(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def _init_db(self) -> None:
         with self._conn() as conn:
@@ -400,99 +396,23 @@ class AssessmentStore:
     # --- Diff ---
 
     def diff(self, prev_id: str, curr_id: str) -> AssessmentDiff | None:
-        """Compute diff between two assessments by ID."""
+        """Compute diff between two assessments by ID.
+
+        Delegates to DiffOperation.compute_diff for the full contributor-change
+        analysis, fingerprint comparability check, and metric deltas.
+        """
         prev = self.load(prev_id)
         curr = self.load(curr_id)
         if not prev or not curr:
             return None
-        return self._compute_diff(prev, curr)
+        return DiffOperation.compute_diff(prev, curr)
 
     def diff_latest(self) -> AssessmentDiff | None:
         """Diff the two most recent assessments."""
         history = self.history(limit=2)
         if len(history) < 2:
             return None
-        return self._compute_diff(history[1], history[0])
-
-    def _compute_diff(self, prev: KnowledgeAssessment, curr: KnowledgeAssessment) -> AssessmentDiff:
-        """Compute diff between two assessments using stable signal IDs."""
-        prev_by_id = {s.signal_id: s for s in prev.signals}
-        curr_by_id = {s.signal_id: s for s in curr.signals}
-
-        prev_ids = set(prev_by_id.keys())
-        curr_ids = set(curr_by_id.keys())
-
-        new_signals = [curr_by_id[sid] for sid in curr_ids - prev_ids]
-        resolved_signals = [prev_by_id[sid] for sid in prev_ids - curr_ids]
-        persistent_signals = [curr_by_id[sid] for sid in curr_ids & prev_ids]
-
-        # Detect severity changes
-        severity_changes: list[dict[str, Any]] = []
-        for sid in curr_ids & prev_ids:
-            ps = prev_by_id[sid]
-            cs = curr_by_id[sid]
-            if ps.severity != cs.severity:
-                severity_changes.append({
-                    "signal_id": sid,
-                    "collector_id": cs.collector_id,
-                    "artifact_uri": cs.artifact_uri,
-                    "prev_severity": ps.severity.value,
-                    "curr_severity": cs.severity.value,
-                    "direction": "worse" if _severity_rank(cs.severity) > _severity_rank(ps.severity) else "better",
-                })
-
-        # Dimension deltas
-        dim_deltas: dict[str, int] = {}
-        for dim_name in set(list(prev.dimensions.keys()) + list(curr.dimensions.keys())):
-            prev_score = prev.dimensions[dim_name].score if dim_name in prev.dimensions else 0
-            curr_score = curr.dimensions[dim_name].score if dim_name in curr.dimensions else 0
-            dim_deltas[dim_name] = curr_score - prev_score
-
-        new_high = sum(1 for s in new_signals if s.severity in (Severity.HIGH, Severity.CRITICAL))
-
-        # Build explanation
-        explanation_parts: list[str] = []
-        if new_signals:
-            explanation_parts.append(f"{len(new_signals)} new signals")
-        if resolved_signals:
-            explanation_parts.append(f"{len(resolved_signals)} resolved")
-        if severity_changes:
-            worse = sum(1 for s in severity_changes if s["direction"] == "worse")
-            better = sum(1 for s in severity_changes if s["direction"] == "better")
-            if worse:
-                explanation_parts.append(f"{worse} signals got worse")
-            if better:
-                explanation_parts.append(f"{better} signals improved")
-        if not explanation_parts:
-            explanation_parts.append("No changes detected")
-        explanation = "; ".join(explanation_parts) + "."
-
-        recommendation = ""
-        if curr.score < prev.score:
-            recommendation = f"Score dropped {prev.score} -> {curr.score}. Review {len(new_signals)} new signals before deployment."
-        elif new_high > 0:
-            recommendation = f"{new_high} new high-severity signals. Review before deployment."
-        elif len(resolved_signals) > 0 and not new_signals:
-            recommendation = f"Improving. {len(resolved_signals)} signals resolved, no new issues."
-        elif not new_signals:
-            recommendation = "No regressions detected."
-
-        return AssessmentDiff(
-            prev_assessment_id=prev.assessment_id,
-            curr_assessment_id=curr.assessment_id,
-            prev_score=prev.score,
-            curr_score=curr.score,
-            score_delta=curr.score - prev.score,
-            new_signals=new_signals,
-            resolved_signals=resolved_signals,
-            persistent_signals=persistent_signals,
-            severity_changes=severity_changes,
-            dimension_deltas=dim_deltas,
-            new_high_count=new_high,
-            score_change_explanation={"summary": explanation, "score_delta": curr.score - prev.score},
-            recommendation=recommendation,
-            explanation=explanation,
-        )
+        return DiffOperation.compute_diff(history[1], history[0])
 
     # --- Trend ---
 

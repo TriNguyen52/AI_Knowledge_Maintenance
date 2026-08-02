@@ -46,6 +46,77 @@ def build_signal_context(
     return "\n".join(lines) if lines else "No matching signals found."
 
 
+def build_systemic_cluster_summary(
+    systemic_clusters: list[dict[str, Any]],
+) -> str:
+    """Build a compact text summary of systemic clusters for LLM prompts.
+
+    This summary groups KnowledgeProblems by their root cause pattern,
+    showing the LLM systemic patterns rather than individual problems.
+    This enables the LLM to generate KB-wide systemic proposals instead
+    of per-artifact fixes.
+
+    Each cluster is summarized as:
+      - Cluster ID and pattern type
+      - Pattern description
+      - Number of problems, signals, and artifacts
+      - Shared evidence references
+      - Cluster salience
+
+    Args:
+        systemic_clusters: List of SystemicCluster dicts (from
+            cluster_problems_by_root_cause).
+
+    Returns:
+        A compact text summary suitable for LLM prompts.
+    """
+    if not systemic_clusters:
+        return "No systemic clusters identified."
+
+    lines: list[str] = []
+    lines.append(f"Systemic Pattern Analysis ({len(systemic_clusters)} cluster(s)):")
+    lines.append("")
+
+    for cluster in systemic_clusters:
+        cluster_id = cluster.get("cluster_id", "?")
+        pattern_type = cluster.get("pattern_type", "unknown")
+        description = cluster.get("pattern_description", "")
+        problem_count = len(cluster.get("problem_ids", []))
+        signal_count = len(cluster.get("signal_ids", []))
+        artifact_count = len(cluster.get("artifact_uris", []))
+        shared_evidence = cluster.get("shared_evidence", [])
+        salience = cluster.get("cluster_salience", 0.0)
+
+        # Pattern type label for readability
+        pattern_labels = {
+            "directory_cluster": "Directory Cluster",
+            "systemic_type": "Systemic Type",
+            "shared_evidence": "Shared Evidence",
+            "shared_category": "Shared Category",
+            "singleton": "Individual Problem",
+        }
+        pattern_label = pattern_labels.get(pattern_type, pattern_type)
+
+        lines.append(f"  [{pattern_label}] {cluster_id} (salience={salience:.3f}):")
+        lines.append(f"    {description}")
+        lines.append(
+            f"    Scope: {problem_count} problem(s), {signal_count} signal(s), "
+            f"{artifact_count} artifact(s)"
+        )
+        if shared_evidence:
+            evidence_str = "; ".join(shared_evidence[:3])
+            lines.append(f"    Shared evidence: {evidence_str}")
+        # Show first few artifact URIs
+        artifacts = cluster.get("artifact_uris", [])
+        if artifacts:
+            shown = artifacts[:5]
+            suffix = f" (+{len(artifacts) - 5} more)" if len(artifacts) > 5 else ""
+            lines.append(f"    Artifacts: {', '.join(shown)}{suffix}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def build_artifact_context(
     artifact_uris: list[str],
     assessment_store: Any,

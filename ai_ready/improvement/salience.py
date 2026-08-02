@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from ai_ready.improvement.models import KnowledgeProblem, RootCauseHypothesis
+from ai_ready.improvement.models import KnowledgeProblem, RootCauseHypothesis, SystemicCluster
 
 logger = logging.getLogger(__name__)
 
@@ -570,7 +570,304 @@ def discover_problems_heuristic(
 
 
 # ---------------------------------------------------------------------------
-# 4. Skip Event (for visible no-ops)
+# 4. Root-Cause-Level Clustering (deterministic, no LLM)
+# ---------------------------------------------------------------------------
+
+def _directory_prefix(uri: str) -> str:
+    """Extract the directory prefix from an artifact URI.
+
+    For file paths like "docs/api/auth.md" → "docs/api/"
+    For URIs like "https://example.com/docs/api/auth" → "https://example.com/docs/api/"
+    Falls back to the parent directory or empty string for bare names.
+    """
+    # Normalize separators
+    normalized = uri.replace("\\", "/")
+    idx = normalized.rfind("/")
+    if idx > 0:
+        return normalized[:idx + 1]
+    return ""
+
+
+def _extract_evidence_refs(evidence_summary: str) -> list[str]:
+    """Extract normalizable evidence references from an evidence summary.
+
+    Extracts quoted strings and common reference patterns from the
+    evidence summary text. These are used to detect shared-evidence
+    patterns (e.g., same broken link target, same heading text).
+    """
+    refs: list[str] = []
+    # Extract quoted strings (single quotes used in evidence summaries)
+    import re
+    # Match content within single quotes
+    for m in re.finditer(r"'([^']+)'", evidence_summary):
+        ref = m.group(1).strip().lower()
+        if ref and len(ref) > 2:
+            refs.append(ref)
+    # Also extract content within double quotes
+    for m in re.finditer(r'"([^"]+)"', evidence_summary):
+        ref = m.group(1).strip().lower()
+        if ref and len(ref) > 2:
+            refs.append(ref)
+    return refs
+
+
+def cluster_problems_by_root_cause(
+    problems: list[KnowledgeProblem],
+    saliences: list[ProblemSalience] | None = None,
+    assessment: Any = None,
+) -> list[SystemicCluster]:
+    """Cluster KnowledgeProblems into systemic groups by root cause patterns.
+
+    Pure deterministic computation — no LLM calls. Groups problems
+    beyond the (collector, type, artifact) level by identifying
+    deeper patterns:
+
+    1. **directory_cluster**: Artifacts sharing a directory prefix
+       (e.g., all broken links in docs/api/ → page-move pattern)
+    2. **systemic_type**: Same signal_type across 2+ artifacts
+       (process-level issue, not individual artifact)
+    3. **shared_evidence**: Problems sharing common evidence references
+       (e.g., same broken link target, same template heading)
+    4. **shared_category**: Problems with the same category that don't
+       fit other patterns (broad systemic pattern)
+
+    Each problem is assigned to exactly one cluster (highest-priority
+    pattern wins). Singletons (problems that don't match any pattern)
+    get their own cluster with pattern_type="singleton".
+
+    Args:
+        problems: Ranked KnowledgeProblems to cluster.
+        saliences: Optional ProblemSalience list (parallel to problems).
+            Used to compute cluster_salience as the max member salience.
+        assessment: Optional KnowledgeAssessment for evidence extraction.
+
+    Returns:
+        List of SystemicCluster, sorted by cluster_salience descending.
+    """
+    if not problems:
+        return []
+
+    # Build salience lookup
+    salience_map: dict[str, float] = {}
+    if saliences:
+        for s in saliences:
+            salience_map[s.problem_id] = s.total
+    else:
+        for p in problems:
+            salience_map[p.problem_id] = 0.5  # neutral default
+
+    # Build signal → evidence lookup from assessment
+    signal_evidence: dict[str, dict[str, Any]] = {}
+    if assessment:
+        for signal in assessment.signals:
+            signal_evidence[signal.signal_id] = signal.evidence if isinstance(signal.evidence, dict) else {}
+
+    clusters: list[SystemicCluster] = []
+    assigned_problem_ids: set[str] = set()
+    cluster_counter = 0
+
+    # --- Pattern 1: Directory clusters ---
+    # Group problems whose artifacts share a directory prefix.
+    # Only applies when 2+ artifacts share the same directory.
+    dir_to_problems: dict[str, list[KnowledgeProblem]] = {}
+    for problem in problems:
+        for uri in problem.artifact_uris:
+            prefix = _directory_prefix(uri)
+            if prefix:
+                dir_to_problems.setdefault(prefix, []).append(problem)
+
+    for prefix, dir_problems in dir_to_problems.items():
+        # Only cluster if 2+ distinct problems share this directory
+        unique_problems = list({p.problem_id: p for p in dir_problems}.values())
+        if len(unique_problems) < 2:
+            continue
+        # Only include problems not already assigned
+        unassigned = [p for p in unique_problems if p.problem_id not in assigned_problem_ids]
+        if len(unassigned) < 2:
+            continue
+
+        cluster_counter += 1
+        all_signal_ids: list[str] = []
+        all_artifact_uris: list[str] = []
+        for p in unassigned:
+            all_signal_ids.extend(p.signal_ids)
+            all_artifact_uris.extend(p.artifact_uris)
+        max_salience = max(salience_map.get(p.problem_id, 0.0) for p in unassigned)
+
+        clusters.append(SystemicCluster(
+            cluster_id=f"sc_dir_{cluster_counter}",
+            pattern_type="directory_cluster",
+            pattern_description=(
+                f"Multiple problems in directory '{prefix}' ({len(unassigned)} problems, "
+                f"{len(set(all_artifact_uris))} artifacts). Likely a page-move or "
+                f"directory-level restructuring issue."
+            ),
+            problem_ids=[p.problem_id for p in unassigned],
+            signal_ids=list(set(all_signal_ids)),
+            artifact_uris=list(set(all_artifact_uris)),
+            shared_evidence=[f"Shared directory: {prefix}"],
+            cluster_salience=max_salience,
+        ))
+        assigned_problem_ids.update(p.problem_id for p in unassigned)
+
+    # --- Pattern 2: Systemic type clusters ---
+    # Group problems with the same signal_type (from category) across
+    # 2+ artifacts that haven't been assigned yet.
+    type_to_problems: dict[str, list[KnowledgeProblem]] = {}
+    for problem in problems:
+        if problem.problem_id in assigned_problem_ids:
+            continue
+        # Use category as the type proxy (it encodes signal_type)
+        type_to_problems.setdefault(problem.category, []).append(problem)
+
+    for category, type_problems in type_to_problems.items():
+        # Only cluster if 2+ artifacts are affected across these problems
+        all_artifacts = set()
+        for p in type_problems:
+            all_artifacts.update(p.artifact_uris)
+        if len(all_artifacts) < 2 or len(type_problems) < 1:
+            continue
+        # Skip if only 1 problem with 1 artifact (not systemic)
+        if len(type_problems) == 1 and len(all_artifacts) == 1:
+            continue
+
+        cluster_counter += 1
+        all_signal_ids: list[str] = []
+        for p in type_problems:
+            all_signal_ids.extend(p.signal_ids)
+        max_salience = max(salience_map.get(p.problem_id, 0.0) for p in type_problems)
+
+        clusters.append(SystemicCluster(
+            cluster_id=f"sc_type_{cluster_counter}",
+            pattern_type="systemic_type",
+            pattern_description=(
+                f"Systemic {category} issue across {len(all_artifacts)} artifact(s) "
+                f"({len(type_problems)} problem(s)). Indicates a process or pipeline-level "
+                f"problem rather than individual artifact issues."
+            ),
+            problem_ids=[p.problem_id for p in type_problems],
+            signal_ids=list(set(all_signal_ids)),
+            artifact_uris=list(set(all_artifacts)),
+            shared_evidence=[f"Shared signal type: {category}"],
+            cluster_salience=max_salience,
+        ))
+        assigned_problem_ids.update(p.problem_id for p in type_problems)
+
+    # --- Pattern 3: Shared evidence clusters ---
+    # Group problems whose signals share common evidence references
+    # (e.g., same broken link target, same heading text).
+    ref_to_problems: dict[str, list[KnowledgeProblem]] = {}
+    for problem in problems:
+        if problem.problem_id in assigned_problem_ids:
+            continue
+        # Extract evidence refs from the problem's evidence_summary
+        refs = _extract_evidence_refs(problem.evidence_summary)
+        # Also extract from signal evidence in the assessment
+        for sid in problem.signal_ids:
+            ev = signal_evidence.get(sid, {})
+            # Check common evidence fields
+            for field in ("target", "heading", "reference", "link_target"):
+                val = ev.get(field, "")
+                if val and isinstance(val, str):
+                    refs.append(val.strip().lower())
+
+        for ref in refs:
+            ref_to_problems.setdefault(ref, []).append(problem)
+
+    for ref, ref_problems in ref_to_problems.items():
+        unique_problems = list({p.problem_id: p for p in ref_problems}.values())
+        if len(unique_problems) < 2:
+            continue
+        unassigned = [p for p in unique_problems if p.problem_id not in assigned_problem_ids]
+        if len(unassigned) < 2:
+            continue
+
+        cluster_counter += 1
+        all_signal_ids: list[str] = []
+        all_artifact_uris: list[str] = []
+        for p in unassigned:
+            all_signal_ids.extend(p.signal_ids)
+            all_artifact_uris.extend(p.artifact_uris)
+        max_salience = max(salience_map.get(p.problem_id, 0.0) for p in unassigned)
+
+        clusters.append(SystemicCluster(
+            cluster_id=f"sc_evidence_{cluster_counter}",
+            pattern_type="shared_evidence",
+            pattern_description=(
+                f"Problems share evidence reference '{ref[:80]}' ({len(unassigned)} problems, "
+                f"{len(set(all_artifact_uris))} artifacts). Same root reference suggests a "
+                f"template, shared source, or common dependency issue."
+            ),
+            problem_ids=[p.problem_id for p in unassigned],
+            signal_ids=list(set(all_signal_ids)),
+            artifact_uris=list(set(all_artifact_uris)),
+            shared_evidence=[f"Shared reference: {ref[:120]}"],
+            cluster_salience=max_salience,
+        ))
+        assigned_problem_ids.update(p.problem_id for p in unassigned)
+
+    # --- Pattern 4: Shared category (catch-all for same-category problems) ---
+    cat_to_problems: dict[str, list[KnowledgeProblem]] = {}
+    for problem in problems:
+        if problem.problem_id in assigned_problem_ids:
+            continue
+        cat_to_problems.setdefault(problem.category, []).append(problem)
+
+    for category, cat_problems in cat_to_problems.items():
+        if len(cat_problems) < 2:
+            continue
+
+        cluster_counter += 1
+        all_signal_ids: list[str] = []
+        all_artifact_uris: list[str] = []
+        for p in cat_problems:
+            all_signal_ids.extend(p.signal_ids)
+            all_artifact_uris.extend(p.artifact_uris)
+        max_salience = max(salience_map.get(p.problem_id, 0.0) for p in cat_problems)
+
+        clusters.append(SystemicCluster(
+            cluster_id=f"sc_category_{cluster_counter}",
+            pattern_type="shared_category",
+            pattern_description=(
+                f"Multiple {category} problems ({len(cat_problems)} problems, "
+                f"{len(set(all_artifact_uris))} artifacts). Broad pattern suggesting "
+                f"a systemic {category} issue across the knowledge base."
+            ),
+            problem_ids=[p.problem_id for p in cat_problems],
+            signal_ids=list(set(all_signal_ids)),
+            artifact_uris=list(set(all_artifact_uris)),
+            shared_evidence=[f"Shared category: {category}"],
+            cluster_salience=max_salience,
+        ))
+        assigned_problem_ids.update(p.problem_id for p in cat_problems)
+
+    # --- Singletons: unassigned problems get their own cluster ---
+    for problem in problems:
+        if problem.problem_id in assigned_problem_ids:
+            continue
+        cluster_counter += 1
+        clusters.append(SystemicCluster(
+            cluster_id=f"sc_singleton_{cluster_counter}",
+            pattern_type="singleton",
+            pattern_description=(
+                f"Individual {problem.category} problem on {', '.join(problem.artifact_uris[:3])}. "
+                f"No systemic pattern detected."
+            ),
+            problem_ids=[problem.problem_id],
+            signal_ids=problem.signal_ids,
+            artifact_uris=problem.artifact_uris,
+            shared_evidence=[],
+            cluster_salience=salience_map.get(problem.problem_id, 0.0),
+        ))
+        assigned_problem_ids.add(problem.problem_id)
+
+    # Sort by cluster salience descending
+    clusters.sort(key=lambda c: c.cluster_salience, reverse=True)
+    return clusters
+
+
+# ---------------------------------------------------------------------------
+# 5. Skip Event (for visible no-ops)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -596,7 +893,7 @@ class SkipEvent:
 
 
 # ---------------------------------------------------------------------------
-# Edit budget — deterministic gate for remediation proposals
+# 6. Edit budget — deterministic gate for remediation proposals
 # ---------------------------------------------------------------------------
 
 def compute_edit_delta(
