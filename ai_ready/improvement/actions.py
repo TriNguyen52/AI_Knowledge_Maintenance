@@ -936,6 +936,38 @@ def verify_improvement(state: State, assessment_store: Any = None,
             ).to_dict(),
         )
 
+    # RELOAD artifacts from disk — the executor modified files on disk,
+    # but the artifacts list in memory still has the pre-execution content.
+    # Without reloading, verification would see stale content and report
+    # 0 signals resolved even when files were actually fixed.
+    if source:
+        try:
+            from ai_ready.knowledge.registry import load_knowledge_source
+            fresh_knowledge = load_knowledge_source(source)
+            # Filter to the same set of artifact URIs that were originally assessed
+            original_uris = {a.uri for a in artifacts}
+            fresh_artifacts = [
+                a for a in fresh_knowledge.artifacts if a.uri in original_uris
+            ]
+            if fresh_artifacts:
+                artifacts = fresh_artifacts
+                # Also refresh relationships from the fresh load
+                fresh_rels = [
+                    r for r in fresh_knowledge.relationships
+                    if r.source_uri in original_uris and r.target_uri in original_uris
+                ]
+                if fresh_rels:
+                    relationships = fresh_rels
+                logger.info(
+                    f"verify_improvement: reloaded {len(artifacts)} artifacts "
+                    f"and {len(relationships or [])} relationships from disk"
+                )
+        except Exception as e:
+            logger.warning(
+                f"verify_improvement: could not reload artifacts from disk "
+                f"(using stale in-memory copies): {e}"
+            )
+
     try:
         after_assessment = assessment_pipeline.run(
             artifacts=artifacts,

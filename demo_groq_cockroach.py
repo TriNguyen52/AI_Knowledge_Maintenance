@@ -304,7 +304,7 @@ def phase_4_persist_cockroach(store, assessment, artifacts, source, git_commit):
 # Phase 5: Run improvement workflow with Groq LLM
 # ---------------------------------------------------------------------------
 
-def phase_5_improvement(assessment, pipeline, artifacts, relationships, source, git_commit, auto_approve):
+def phase_5_improvement(assessment, pipeline, artifacts, relationships, source, git_commit, auto_approve, cockroach_store=None):
     banner("PHASE 5: Run Improvement Workflow (Groq LLM + Burr State Machine)")
     print("  LLM Provider: Groq (llama-3.3-70b-versatile)")
     print("  Workflow: analyze_issue → generate_proposal → review_approval → execute_change → verify_improvement")
@@ -376,6 +376,7 @@ def phase_5_improvement(assessment, pipeline, artifacts, relationships, source, 
         enable_otel=False,
         max_fork_attempts=3,
         problem_queue=custom_pq,
+        cockroach_store=cockroach_store,
     )
     print("  ImprovementManager ready.")
 
@@ -699,7 +700,8 @@ def main() -> None:
 
     # Phase 5: Run improvement workflow
     manager, app_id, final_state = phase_5_improvement(
-        assessment, pipeline, artifacts, relationships, source, git_commit, args.auto_approve
+        assessment, pipeline, artifacts, relationships, source, git_commit, args.auto_approve,
+        cockroach_store=store,
     )
 
     # Phase 6: Show CockroachDB state
