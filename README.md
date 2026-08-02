@@ -210,30 +210,6 @@ AI-Ready supports multiple LLM providers for the improvement workflow:
 
 Set `LLM_PROVIDER` in `.env` to switch providers. Assessment (signal collection) is always deterministic and does not require any LLM.
 
-## Architecture
-
-```
-ai_ready/
-├── models.py                # Domain primitives: KnowledgeArtifact, KnowledgeSignal, KnowledgeAssessment
-├── operations.py            # CollectOperation + AssessOperation (signal collection & scoring)
-├── pipeline.py              # AssessmentPipeline (facade)
-├── evaluation_policy.py     # InterpretationPolicy (signal enrichment)
-├── invariants.py            # Schema/policy version invariants
-├── fingerprint.py           # Comparability fingerprint for assessment diffing
-├── verdicts.py              # Multi-level health verdicts (HEALTHY → CRITICAL)
-├── incremental.py           # IncrementalExecutor (change detection + selective re-collection)
-├── cli.py                   # CLI entry point (ai-ready command)
-├── config.py                # .ai-ready.yml configuration
-├── rules/                   # 10 signal collectors
-├── knowledge/               # Knowledge SDKs (Markdown, S3) + relation extraction
-├── improvement/             # Burr workflow: salience, problem queue, history, actions, forking
-├── storage/                 # CockroachDB persistent memory (55 methods, vector search, transactions)
-├── llm/                     # LLM gateway (Groq, Bedrock, OpenAI, Anthropic, Ollama)
-├── cloud/                   # AWS Lambda handlers + MCP server (11 tools)
-├── connectors/              # Legacy connector aliases
-└── output/                  # Terminal, JSON, SARIF formatters
-```
-
 ## Design Principles
 
 - **Deterministic before AI.** Every assessment is reproducible regardless of which language model is available. Signal collection never calls an LLM.
@@ -241,20 +217,6 @@ ai_ready/
 - **Evidence is never discarded.** Every assessment, proposed modification, verification result, and remediation outcome becomes part of the historical record.
 - **Conservative bias throughout.** No-CI paths give cautious verdicts. Underpowered assessments produce no conclusion rather than a false one. Fail closed on reuse.
 
-## Contributing
-
-Contributions are welcome! To get started:
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/your-feature-name`
-3. Make your changes and add tests
-4. Run the test suite: `pytest`
-5. Run the linter: `ruff check .`
-6. Commit with a clear message: `git commit -m "Add: your feature description"`
-7. Push and open a pull request
-
-Please use specific file names when staging (`git add path/to/file.py`) rather than `git add .` to avoid including unintended files.
-
 ## License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License.
