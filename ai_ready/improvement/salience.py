@@ -13,7 +13,8 @@ Three core components:
    - encoding: signal severity distribution (how bad the signals are)
    - outcome: historical success rate for this problem type (learned from history)
    - retrieval: dimension impact (how much room to improve)
-   - size_penalty: problems affecting many artifacts are harder to fix
+   - size_penalty: logarithmic decay (1/(1+log2(N))) — gentle penalty for
+     broad problems, preserves salience up to ~100 artifacts
 
 2. **Signal-Delta Eligibility** — Deterministic gate that checks whether
    new signals have appeared since the last analysis. Prevents wasted
@@ -54,7 +55,7 @@ W_OUTCOME = 0.25
 W_RETRIEVAL = 0.35
 
 # Default salience threshold — problems below this are skipped
-DEFAULT_SALIENCE_THRESHOLD = 0.15
+DEFAULT_SALIENCE_THRESHOLD = 0.05
 
 # ---------------------------------------------------------------------------
 # Recency decay parameters (deterministic, no LLM)
@@ -91,7 +92,7 @@ class ProblemSalience:
     encoding: float       # signal severity distribution [0, 1]
     outcome: float        # historical success rate for this problem type [0, 1]
     retrieval: float      # dimension impact [0, 1]
-    size_penalty: float   # 1 / max(artifact_count, 1) [0, 1]
+    size_penalty: float   # 1 / (1 + log2(artifact_count)) [0, 1]
     staleness_factor: float  # recency decay from SignalLifecycle.last_seen [0, 1]
     total: float          # weighted sum * size_penalty * staleness_factor [0, 1]
     explanation: str      # human-readable decomposition
@@ -239,8 +240,11 @@ def compute_problem_salience(
             retrieval = sum(dim_scores) / len(dim_scores)
 
     # --- Size penalty: problems affecting many artifacts are harder to fix ---
+    # Logarithmic decay: 1 artifact → 1.0, 5 → 0.31, 10 → 0.24, 20 → 0.19, 100 → 0.13
+    # This preserves salience for broad problems while slightly deprioritizing
+    # very large ones (500+ artifacts) that are too vague to act on.
     artifact_count = len(problem.artifact_uris) if problem.artifact_uris else 1
-    size_penalty = 1.0 / max(artifact_count, 1)
+    size_penalty = 1.0 / (1.0 + math.log2(max(artifact_count, 1)))
 
     # --- Staleness factor: recency decay from signal lifecycle data ---
     staleness_factor = compute_staleness_factor(problem, signal_lifecycles)
@@ -940,6 +944,22 @@ def compute_edit_delta(
         "add_section": 0.1,
         "delete_section": 0.2,
         "rename": 0.05,
+        # Relationship steps — low weight, just adds links to index page
+        "create_relationship": 0.05,
+        "remove_relationship": 0.05,
+        "add_cross_reference": 0.05,
+        "add_cross_references": 0.05,
+        # Link fix aliases — same as update_document
+        "fix_broken_link": 0.15,
+        "fix_broken_links": 0.15,
+        "fix_dangling_reference": 0.15,
+        "fix_dangling_references": 0.15,
+        "rewrite_content": 0.15,
+        # Orphan fixes
+        "link_orphaned_document": 0.05,
+        "link_orphaned_documents": 0.05,
+        # Automated checking — metadata level
+        "implement_automated_link_checking": 0.05,
     }
     _DEFAULT_WEIGHT = 0.1
 

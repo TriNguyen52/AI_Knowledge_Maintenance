@@ -49,7 +49,7 @@ class ArtifactRecord:
     source: str
     content: str
     metadata: str  # JSON string
-    embedding: list[float] | None = None  # VECTOR(1536) in CockroachDB
+    embedding: list[float] | None = None  # VECTOR(384) in CockroachDB
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 

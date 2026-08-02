@@ -17,6 +17,7 @@ Usage:
         assessment_pipeline=pipeline,
         history_store=history_store,
         executor=executor,
+        cockroach_store=cockroach_db,  # optional: enables dual-write
     )
 
     # Start an improvement from an assessment
@@ -28,6 +29,13 @@ Usage:
     # If it failed, try forking
     if manager.should_retry(app_id):
         forked_app_id = manager.fork_and_retry(app_id)
+
+When cockroach_store is provided alongside history_store (or
+history_db_path), the manager wraps them in a DualHistoryStore that
+dual-writes outcomes to both SQLite and CockroachDB, and merges
+remediation context from both sources during proposal generation.
+This closes the institutional memory loop across local and distributed
+storage without changing any workflow action code.
 """
 
 from __future__ import annotations
@@ -49,6 +57,7 @@ from ai_ready.improvement.application import (
 )
 from ai_ready.improvement.forking import fork_from_proposal, should_fork
 from ai_ready.improvement.history import ImprovementHistoryStore, OutcomeEMATracker
+from ai_ready.improvement.dual_history import DualHistoryStore
 from ai_ready.improvement.test_generation import generate_test
 from ai_ready.improvement.diagnosis_quality import DiagnosisQualityTracker
 from ai_ready.improvement.problem_queue import ProblemQueue
@@ -84,6 +93,7 @@ class ImprovementManager:
         max_fork_attempts: int = 3,
         diagnosis_quality_tracker: Any = None,
         problem_queue: Any = None,
+        cockroach_store: Any = None,
     ) -> None:
         self.llm_gateway = llm_gateway
         self.assessment_store = assessment_store
@@ -97,14 +107,28 @@ class ImprovementManager:
         self.enable_tracking = enable_tracking
         self.enable_otel = enable_otel
         self.max_fork_attempts = max_fork_attempts
+        self.cockroach_store = cockroach_store
 
         # Initialize history store if not provided
         if history_store:
-            self.history_store = history_store
+            sqlite_store = history_store
         elif history_db_path:
-            self.history_store = ImprovementHistoryStore(history_db_path)
+            sqlite_store = ImprovementHistoryStore(history_db_path)
         else:
-            self.history_store = None
+            sqlite_store = None
+
+        # Wrap in DualHistoryStore if CockroachDB is available
+        if sqlite_store and cockroach_store:
+            self.history_store = DualHistoryStore(
+                sqlite_store=sqlite_store,
+                cockroach_store=cockroach_store,
+            )
+            logger.info(
+                "ImprovementManager initialized with DualHistoryStore "
+                "(SQLite + CockroachDB). Outcomes will sync to both stores."
+            )
+        else:
+            self.history_store = sqlite_store
 
         # Initialize diagnosis quality tracker if not provided
         if diagnosis_quality_tracker:
@@ -579,3 +603,41 @@ class ImprovementManager:
             List of ProblemSalience dicts.
         """
         return self.get_state(app_id).get("problem_saliences", [])
+
+    def get_cockroach_metrics(self) -> dict[str, Any]:
+        """Get remediation metrics from CockroachDB specifically.
+
+        When a DualHistoryStore is configured, this returns the
+        CockroachDB-specific metrics sub-dict. Otherwise returns
+        empty dict.
+
+        Returns:
+            CockroachDB remediation metrics, or empty dict.
+        """
+        if self.cockroach_store is None:
+            return {}
+        try:
+            return self.cockroach_store.get_remediation_metrics()
+        except Exception as e:
+            logger.warning(f"Failed to read CockroachDB metrics: {e}")
+            return {}
+
+    def get_cockroach_decision_traces(self, outcome_id: str) -> list[dict[str, Any]]:
+        """Get decision traces from CockroachDB for a specific outcome.
+
+        Retrieves the full reasoning chain (analysis, proposal, approval,
+        execution, verification, final_outcome) stored in CockroachDB.
+
+        Args:
+            outcome_id: The CockroachDB remediation outcome ID.
+
+        Returns:
+            List of decision trace dicts, or empty list if unavailable.
+        """
+        if self.cockroach_store is None:
+            return []
+        try:
+            return self.cockroach_store.get_decision_traces(outcome_id)
+        except Exception as e:
+            logger.warning(f"Failed to read CockroachDB traces: {e}")
+            return []

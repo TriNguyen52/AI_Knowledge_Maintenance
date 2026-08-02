@@ -26,6 +26,17 @@ from ai_ready.models import (
 from ai_ready.operations import DiffOperation
 
 
+def _json_safe(obj: Any) -> Any:
+    """Recursively convert non-JSON-serializable types (frozenset, set) to lists."""
+    if isinstance(obj, (frozenset, set)):
+        return sorted(obj) if all(isinstance(x, (str, int, float)) for x in obj) else list(obj)
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 class _SQLiteStoreMixin:
     """Mixin providing a shared SQLite connection context manager.
 
@@ -340,7 +351,7 @@ class AssessmentStore(_SQLiteStoreMixin):
                         for k, v in assessment.dimensions.items()
                     }),
                     json.dumps(assessment.metrics),
-                    json.dumps(assessment.metadata),
+                    json.dumps(_json_safe(assessment.metadata)),
                 ),
             )
 
