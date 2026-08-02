@@ -15,7 +15,7 @@
 
 > **AI systems are only as reliable as the knowledge they retrieve.**
 >
-> Even the strongest language models hallucinate when documentation has missing context, disconnected concepts, broken links, ambiguous headings, or inconsistent terminology. These issues silently degrade retrieval quality — and no one notices until an AI gives the wrong answer.
+> Even the strongest language models hallucinate when knowledge base has missing context, disconnected concepts, broken links, ambiguous headings, or inconsistent terminology. These issues silently degrade retrieval quality — and no one notices until an AI gives the wrong answer.
 
 AI-Ready is a deterministic knowledge observability platform that evaluates knowledge **before** it reaches an AI system. Rather than measuring language models or retrieval algorithms, AI-Ready measures the quality of the knowledge itself.
 
@@ -23,13 +23,12 @@ AI-Ready is a deterministic knowledge observability platform that evaluates know
 
 - **10 Deterministic Signal Collectors** across 6 dimensions — retrieval, context, consistency, trust, connectivity, and workflow. No LLM required for assessment.
 - **Knowledge Problem Discovery** — clusters signals into root-cause problems instead of treating each symptom in isolation.
-- **Salience-Based Prioritization** — ranks problems by their expected impact on AI reasoning, so the most consequential issues are addressed first.
-- **Continuous Improvement Loop** — generates remediation proposals via LLM, applies changes after human approval, and verifies whether the knowledge actually improved.
-- **Institutional Memory** — tracks which remediation strategies worked and which failed (EMA-scored), so the agent gets progressively better at resolving recurring problem types.
+- **Issue Prioritization** — ranks problems by their expected impact on AI reasoning, so the most consequential issues are addressed first.
+- **Continuous Improvement Loop** — generates proposals via LLM, applies changes after human approval, and verifies whether the knowledge actually improved.
+- **Feedback Loop Memory** — tracks which proposals worked and which failed (EMA-scored), so the agent gets progressively better at resolving recurring problem types.
 - **Workflow Orchestration** — Apache Burr state machine with resumable approval checkpoints, workflow forking after failed attempts, and automatic regression test generation.
 - **Persistent Agent Memory** — CockroachDB stores artifacts with vector embeddings, signals, assessments, agent workflow state, and remediation history. The agent reads its own past outcomes before making new decisions.
 - **MCP Server** — 11 tools that let external AI agents (Claude Code, Cursor, VS Code Copilot) query the knowledge maintenance agent's memory.
-- **Multiple Output Formats** — terminal tables, JSON, and SARIF for CI/CD integration.
 - **Incremental Assessment** — only re-runs collectors affected by changes, with git-based change detection.
 
 ## Quick Start
