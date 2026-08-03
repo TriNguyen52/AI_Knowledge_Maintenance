@@ -225,9 +225,11 @@ def handle_tool_call(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any
     invokes a tool. All queries are read-only (safe by default).
     """
     from ai_ready.storage.cockroach import CockroachDBStore
-    from ai_ready.llm.bedrock import BedrockProvider
+    from ai_ready.llm.embeddings import EmbeddingProvider
 
-    store = CockroachDBStore()
+    db_url = os.environ.get("COCKROACH_DB_URL", "")
+    store = CockroachDBStore(connection_string=db_url)
+    store.connect()
 
     if tool_name == "get_knowledge_health":
         latest = store.get_latest_assessment()
@@ -276,9 +278,9 @@ def handle_tool_call(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any
         query = arguments.get("query", "")
         limit = arguments.get("limit", 10)
 
-        # Generate embedding via Bedrock
-        bedrock = BedrockProvider()
-        query_embedding = bedrock.embed_text(query)
+        # Generate embedding via EmbeddingProvider (HuggingFace/TF-IDF)
+        embedder = EmbeddingProvider(dim=384)
+        query_embedding = embedder.embed(query)
 
         results = store.search_artifacts_semantic(query_embedding, limit=limit)
         return {
@@ -287,7 +289,7 @@ def handle_tool_call(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any
                     "artifact_uri": artifact.artifact_uri,
                     "artifact_type": artifact.artifact_type,
                     "similarity": round(similarity, 4),
-                    "title": json.loads(artifact.metadata).get("title", ""),
+                    "title": json.loads(artifact.metadata).get("title", "") if artifact.metadata else "",
                 }
                 for artifact, similarity in results
             ],

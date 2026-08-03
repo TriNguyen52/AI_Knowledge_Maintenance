@@ -1070,6 +1070,10 @@ def verify_improvement(state: State, assessment_store: Any = None,
             elif all(o in (VerificationOutcome.RESOLVED.value,
                           VerificationOutcome.PARTIALLY_RESOLVED.value) for o in outcomes):
                 overall_outcome = VerificationOutcome.PARTIALLY_RESOLVED.value
+            elif score_diff > 0:
+                # Score improved even though no signals were fully resolved —
+                # the remediation had a partial positive effect.
+                overall_outcome = VerificationOutcome.PARTIALLY_RESOLVED.value
             else:
                 overall_outcome = VerificationOutcome.UNCHANGED.value
 

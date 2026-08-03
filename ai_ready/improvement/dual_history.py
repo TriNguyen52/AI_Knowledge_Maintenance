@@ -271,6 +271,9 @@ class DualHistoryStore:
                         crdb_context.get("last_decision_traces", [])
                     )
                     context["cockroach_total_attempts"] = crdb_attempts
+                    context["cockroach_fallback_used"] = (
+                        crdb_context.get("fallback_used", False)
+                    )
 
                     # Update total to reflect the larger of the two stores
                     context["total_prior_attempts"] = max(
@@ -283,6 +286,7 @@ class DualHistoryStore:
                         f"prior attempts, "
                         f"{len(context['cockroach_decision_traces'])} "
                         f"decision traces"
+                        f"{' (fallback: broad match)' if crdb_context.get('fallback_used') else ''}"
                     )
             except Exception as e:
                 logger.warning(

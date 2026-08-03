@@ -157,7 +157,9 @@ class HuggingFaceEmbedder:
                     timeout=30,
                 )
             if resp.status_code != 200:
-                logger.warning("HuggingFace API returned %d, falling back to TF-IDF", resp.status_code)
+                if not hasattr(self, '_warned'):
+                    logger.warning("HuggingFace API returned %d, falling back to TF-IDF", resp.status_code)
+                    self._warned = True
                 return None
 
             data = resp.json()

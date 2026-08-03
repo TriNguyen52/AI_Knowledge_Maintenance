@@ -178,6 +178,21 @@ class KnowledgeExecutor:
             "link_orphaned_document": self._handle_create_relationship,
             "link_orphaned_documents": self._handle_create_relationship,
             "implement_automated_link_checking": self._handle_add_metadata,
+            # Abstract/process step types — map to document update
+            "create_pipeline": self._handle_update_document,
+            "link_validation_pipeline": self._handle_update_document,
+            "schedule_audit": self._handle_update_document,
+            "documentation_audit": self._handle_update_document,
+            "update_documentation_guidelines": self._handle_update_document,
+            "documentation_guidelines": self._handle_update_document,
+            "provide_author_training": self._handle_add_metadata,
+            "author_training": self._handle_add_metadata,
+            "review_document": self._handle_update_document,
+            "improve_structure": self._handle_update_document,
+            "reorganize_document": self._handle_update_document,
+            "add_context": self._handle_update_document,
+            "add_summary": self._handle_update_document,
+            "consolidate_content": self._handle_update_document,
         }
         handler = handlers.get(step_type)
         if handler is None:
