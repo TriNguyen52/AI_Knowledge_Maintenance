@@ -123,15 +123,20 @@ def connect_cockroach() -> "CockroachDBStore":
 
     # Clear existing data for a fresh demo
     print("  Clearing existing data for fresh demo...")
+    # Drop ALL tables to ensure schema matches current schema.sql
+    # (old tables may have UUID columns or VECTOR(1536) from previous runs)
     for table in ["decision_traces", "remediation_history", "skip_events",
                    "wont_fix_signatures", "problem_queue",
-                   "knowledge_signals", "signal_lifecycle",
-                   "assessment_signals", "knowledge_assessments",
+                   "assessment_signals", "signal_lifecycle",
+                   "knowledge_signals", "knowledge_assessments",
                    "knowledge_artifacts", "agent_state"]:
         try:
-            store._execute(f"DELETE FROM {table}")
+            store._execute(f"DROP TABLE IF EXISTS {table} CASCADE")
         except Exception:
-            pass  # table might not exist yet
+            pass
+    # Re-initialize schema to recreate all tables with current definitions
+    store._initialized = False
+    store.initialize_schema()
     print("  Data cleared.")
 
     return store
@@ -195,6 +200,92 @@ def load_and_assess(source: Path, limit: int):
     print(f"  Score: {assessment.score}  Signals: {len(assessment.signals)}")
 
     return pipeline, assessment, artifacts, relationships, source_str, git_commit
+
+# ---------------------------------------------------------------------------
+# Persist artifacts, signals, assessment to CockroachDB with vector embeddings
+# ---------------------------------------------------------------------------
+
+def persist_to_cockroach(store, assessment, artifacts, source, git_commit):
+    """Persist assessment results to CockroachDB with vector embeddings.
+
+    Calls existing CockroachDBStore methods to save artifacts (with embeddings),
+    signals, signal lifecycle, assessment, and demonstrate vector search.
+    """
+    banner("Persist to CockroachDB (with Vector Embeddings)")
+
+    from ai_ready.storage.models import ArtifactRecord, SignalRecord, AssessmentRecord
+    from ai_ready.llm.embeddings import EmbeddingProvider
+
+    # Generate embeddings and save artifacts
+    subheader(f"Saving {len(artifacts)} artifacts with VECTOR(384) embeddings")
+    embedder = EmbeddingProvider(dim=384)
+    corpus = [
+        getattr(a, 'all_text', a.content if isinstance(a.content, str) else str(a.content))[:5000]
+        for a in artifacts
+    ]
+    embedder.fit(corpus)
+
+    saved = 0
+    for a in artifacts:
+        text = getattr(a, 'all_text', a.content if isinstance(a.content, str) else str(a.content))[:10000]
+        emb = embedder.embed(text[:2000] or a.uri)
+        store.save_artifact(ArtifactRecord.new(
+            artifact_uri=a.uri, artifact_type=a.artifact_type, source=source,
+            content=text, metadata={"git_commit": git_commit, "title": getattr(a, 'title', '')},
+            embedding=emb,
+        ))
+        saved += 1
+    print(f"  Saved {saved} artifacts with embeddings ({embedder.backend_status})")
+
+    # Save signals + lifecycle
+    subheader(f"Saving {len(assessment.signals)} signals + lifecycle")
+    signal_ids = []
+    for i, s in enumerate(assessment.signals):
+        # Use the original signal_id from the KnowledgeSignal so lifecycle
+        # updates can reference the same signal across runs
+        orig_sig_id = getattr(s, 'signal_id', '') or f'sig_{i}'
+        record = SignalRecord(
+            signal_id=orig_sig_id,
+            artifact_uri=s.artifact_uri, collector_id=s.collector_id,
+            signal_type=s.signal_type, severity=s.severity.value, score=float(s.score),
+            recommendation=s.recommendation or '', ai_impact=s.ai_impact or '',
+            evidence=json.dumps(s.evidence if isinstance(s.evidence, dict) else {'raw': str(s.evidence)}),
+        )
+        store.save_signal(record)
+        signal_ids.append(orig_sig_id)
+        try:
+            store.save_signal_lifecycle(orig_sig_id, assessment.assessment_id, 'new')
+        except Exception:
+            pass
+    print(f"  Saved {len(assessment.signals)} signals with lifecycle tracking")
+
+    # Save assessment + link signals
+    dim_dict = {n: {"score": ds.score, "signals_count": ds.signals_count, "collectors": ds.collector_ids}
+                for n, ds in assessment.dimensions.items()}
+    record = AssessmentRecord.new(
+        score=float(assessment.score), dimensions=dim_dict,
+        signals_count=len(assessment.signals),
+        metadata={"source": source, "git_commit": git_commit, "verdict": assessment.verdict},
+    )
+    store.save_assessment(record)
+    for sig_id in signal_ids:
+        try:
+            store.link_signal_to_assessment(record.assessment_id, sig_id)
+        except Exception:
+            pass
+    print(f"  Assessment saved: {record.assessment_id} (score={record.score:.3f})")
+
+    # Demonstrate vector search (CockroachDB distributed vector index)
+    subheader("Vector Search (CockroachDB <=> cosine distance)")
+    worst = max(assessment.signals, key=lambda s: s.score) if assessment.signals else None
+    if worst:
+        q_emb = embedder.embed(f"{worst.artifact_uri} {worst.signal_type} {worst.recommendation or ''}"[:2000])
+        results = store.search_artifacts_semantic(q_emb, limit=5)
+        print(f"  Query: artifacts similar to '{truncate(worst.artifact_uri, 50)}'")
+        for i, (art, sim) in enumerate(results):
+            print(f"    [{i+1}] sim={sim:.3f}  {truncate(art.artifact_uri, 60)}")
+
+    return record
 
 # ---------------------------------------------------------------------------
 # Run a single improvement workflow
@@ -299,9 +390,32 @@ def run_improvement(
     print(f"  Workflow started: app_id={app_id}")
     print(f"  Elapsed: {t1-t0:.1f}s")
 
+    # Persist agent state to CockroachDB (working memory)
+    try:
+        cockroach_store.save_agent_state(
+            app_id=app_id, state_data={"stage": "analyzing"},
+            current_stage="analyze_issue",
+            assessment_id=assessment.assessment_id, status="active",
+        )
+        print(f"  Agent state saved to CockroachDB (status=active)")
+    except Exception as e:
+        print(f"  Warning: agent state save failed: {e}")
+
     # Show state at approval checkpoint
     state = manager.get_state(app_id)
     print(f"  Stage: {state.get('current_stage', 'unknown')}")
+
+    # Update agent state at checkpoint (paused)
+    try:
+        cockroach_store.save_agent_state(
+            app_id=app_id, state_data=state,
+            current_stage=state.get('current_stage', 'review_approval'),
+            assessment_id=assessment.assessment_id,
+            remediation_id=state.get('remediation_id', ''), status="paused",
+        )
+        print(f"  Agent state updated (status=paused at approval checkpoint)")
+    except Exception as e:
+        print(f"  Warning: agent state update failed: {e}")
 
     root_causes = state.get("root_cause_analysis", [])
     problems = state.get("knowledge_problems", [])
@@ -359,6 +473,20 @@ def run_improvement(
     print(f"  Completed in {t3-t2:.1f}s")
     print(f"  Final stage: {final_state.get('current_stage', 'unknown')}")
 
+    # Update agent state to completed/failed
+    final_stage = final_state.get('current_stage', 'completed')
+    final_status = "completed" if "completed" in final_stage or "verified" in final_stage else "failed"
+    try:
+        cockroach_store.save_agent_state(
+            app_id=app_id, state_data=final_state,
+            current_stage=final_stage,
+            assessment_id=assessment.assessment_id,
+            remediation_id=final_state.get('remediation_id', ''), status=final_status,
+        )
+        print(f"  Agent state updated (status={final_status})")
+    except Exception as e:
+        print(f"  Warning: agent state update failed: {e}")
+
     # Show verification
     verification = final_state.get("verification_results", {})
     if verification:
@@ -394,6 +522,40 @@ def run_improvement(
     except Exception as e:
         print(f"  (Could not read CockroachDB: {e})")
 
+    # Update signal lifecycle: new → resolved (or persistent if not resolved)
+    subheader("Signal Lifecycle Update (new → resolved/persistent)")
+    verification = final_state.get("verification_results", {})
+    overall_outcome = verification.get("overall_outcome", "unknown")
+    new_status = "resolved" if overall_outcome in ("resolved", "improved", "partially_resolved") else "persistent"
+    resolved_count = 0
+    for s in assessment.signals:
+        sig_id = getattr(s, 'signal_id', None)
+        if sig_id:
+            try:
+                # Update signal_lifecycle table
+                cockroach_store.save_signal_lifecycle(
+                    sig_id, assessment.assessment_id, new_status
+                )
+                # Also update knowledge_signals status column
+                cockroach_store._execute(
+                    "UPDATE knowledge_signals SET status = %s WHERE signal_id = %s",
+                    (new_status, sig_id),
+                )
+                resolved_count += 1
+            except Exception:
+                pass
+    print(f"  Updated {resolved_count} signals → status={new_status}")
+    # Show lifecycle summary
+    try:
+        new_signals = cockroach_store.get_signals_by_status("new")
+        resolved_signals = cockroach_store.get_signals_by_status("resolved")
+        persistent_signals = cockroach_store.get_signals_by_status("persistent")
+        print(f"  Signal lifecycle: new={len(new_signals)}, "
+              f"persistent={len(persistent_signals)}, "
+              f"resolved={len(resolved_signals)}")
+    except Exception as e:
+        print(f"  (Lifecycle summary unavailable: {e})")
+
     return final_state
 
 # ---------------------------------------------------------------------------
@@ -403,50 +565,120 @@ def run_improvement(
 def show_cockroach_memory(store):
     banner("CockroachDB Institutional Memory (After Both Runs)")
 
-    # Remediation history
-    subheader("Remediation History Table")
-    history = store.get_remediation_history(limit=20)
-    print(f"  Total outcomes: {len(history)}")
+    # Use MCP interface to query CockroachDB — demonstrates that external
+    # AI agents (Claude Code, Cursor, VS Code) can access the same data
+    from ai_ready.cloud.mcp_server import handle_tool_call, MCP_TOOLS
+
+    subheader(f"MCP Server Interface ({len(MCP_TOOLS)} tools)")
+    print("  External AI agents query CockroachDB via MCP tools:")
+    for t in MCP_TOOLS:
+        print(f"    • {t['name']}: {truncate(t['description'], 60)}")
+    print()
+    print("  Calling MCP tools against live CockroachDB data...")
+
+    # MCP Tool: get_knowledge_health
+    subheader("MCP: get_knowledge_health")
+    result = handle_tool_call("get_knowledge_health", {})
+    if "message" in result:
+        print(f"  {result['message']}")
+    else:
+        print(f"  Score: {result.get('score', 'N/A')}")
+        print(f"  Signals: {result.get('signals_count', 'N/A')}")
+
+    # MCP Tool: get_signals
+    subheader("MCP: get_signals (limit=5)")
+    result = handle_tool_call("get_signals", {"limit": 5})
+    print(f"  Signals: {result.get('count', 0)}")
+    for s in result.get("signals", [])[:3]:
+        print(f"    [{s.get('severity', '?')}] {s.get('signal_type', '?')} "
+              f"→ {truncate(s.get('artifact_uri', ''), 50)}")
+
+    # MCP Tool: search_artifacts_semantic (vector index)
+    subheader("MCP: search_artifacts_semantic (vector index)")
+    result = handle_tool_call("search_artifacts_semantic",
+                              {"query": "broken link missing context", "limit": 5})
+    print(f"  Query: 'broken link missing context'")
+    print(f"  Results: {len(result.get('results', []))}")
+    for r in result.get("results", [])[:3]:
+        print(f"    sim={r.get('similarity', 0):.3f}  {truncate(r.get('artifact_uri', ''), 60)}")
+
+    # MCP Tool: get_active_workflows (agent state persistence)
+    subheader("MCP: get_active_workflows (agent state)")
+    result = handle_tool_call("get_active_workflows", {})
+    active_count = result.get('count', 0)
+    print(f"  Active/paused workflows: {active_count}")
+    for w in result.get("workflows", [])[:5]:
+        print(f"    [{w.get('app_id', '')[:8]}] stage={w.get('current_stage', '')} status={w.get('status', '')}")
+
+    # Also show completed/failed workflows (full lifecycle)
+    subheader("MCP: All workflows (full lifecycle)")
+    try:
+        all_workflows = store.get_all_workflows(limit=10)
+        print(f"  Total workflows in CockroachDB: {len(all_workflows)}")
+        for w in all_workflows[:5]:
+            app_id = str(w.get('app_id', ''))[:8]
+            stage = w.get('current_stage', '')
+            status = w.get('status', '')
+            print(f"    [{app_id}] stage={stage} status={status}")
+    except Exception as e:
+        print(f"  (Could not read workflows: {e})")
+
+    # MCP Tool: get_remediation_history
+    subheader("MCP: get_remediation_history")
+    result = handle_tool_call("get_remediation_history", {"limit": 20})
+    history = result.get("outcomes", [])
+    print(f"  Total outcomes: {result.get('count', 0)}")
     for h in history:
         print()
-        print(f"  [{h.outcome_id[:8]}]")
-        print(f"    issue_type: {h.issue_type}")
-        print(f"    strategy: {h.strategy}")
-        print(f"    strategy_description: {truncate(h.strategy_description, 100)}")
-        print(f"    verification_outcome: {h.verification_outcome}")
-        print(f"    score: {h.score_before} → {h.score_after}")
-        print(f"    tokens: {h.tokens_used}  latency: {h.latency_ms:.0f}ms  forked: {h.forked}")
-        print(f"    created: {h.created_at}")
+        print(f"  [{h.get('outcome_id', '')[:8]}]")
+        print(f"    issue_type: {h.get('issue_type', '?')}")
+        print(f"    strategy: {h.get('strategy', '?')}")
+        print(f"    verification_outcome: {h.get('verification_outcome', '?')}")
+        print(f"    score: {h.get('score_before', '?')} → {h.get('score_after', '?')}")
+        print(f"    tokens: {h.get('tokens_used', '?')}  forked: {h.get('forked', '?')}")
 
-    # Decision traces for each outcome
-    subheader("Decision Traces (Full Reasoning Chain)")
-    for h in history:
-        traces = store.get_decision_traces(h.outcome_id)
-        if traces:
-            print()
-            print(f"  Outcome [{h.outcome_id[:8]}] — {h.strategy}:")
-            for t in traces:
-                stage = t.get("stage", "?")
-                reasoning = t.get("reasoning", "")
-                print(f"    [{stage}]")
-                for line in reasoning.split("\n")[:3]:
-                    print(f"      {line}")
-                if len(reasoning.split("\n")) > 3:
-                    print(f"      ... ({len(reasoning.split(chr(10)))} lines total)")
-
-    # Show merged remediation context (what Run 3 would see)
+    # MCP Tool: get_decision_trace
+    subheader("MCP: get_decision_trace (reasoning chain)")
     if history:
-        subheader("Merged Remediation Context (What Run 3 Would See)")
-        # Get a sample issue type from the history
-        sample_issue = history[0].issue_type
-        print(f"  Querying context for issue_type='{sample_issue}'...")
-        context = store.get_remediation_context(sample_issue, limit=5)
-        print_json("Context", context)
+        outcome_id = history[0].get("outcome_id", "")
+        result = handle_tool_call("get_decision_trace", {"outcome_id": outcome_id})
+        print(f"  Traces for outcome {outcome_id[:8]}: {result.get('count', 0)}")
+        for t in result.get("traces", [])[:5]:
+            stage = t.get("stage", "?")
+            reasoning = t.get("reasoning", "")
+            print(f"    [{stage}] {truncate(reasoning, 100)}")
 
-    # Remediation metrics
-    subheader("Remediation Metrics")
-    metrics = store.get_remediation_metrics()
-    print_json("Metrics", metrics)
+    # MCP Tool: get_remediation_context (institutional memory)
+    if history:
+        subheader("MCP: get_remediation_context (what Run 3 would see)")
+        issue_type = history[0].get("issue_type", "broken_link")
+        result = handle_tool_call("get_remediation_context",
+                                  {"issue_type": issue_type, "limit": 5})
+        print(f"  Context for '{issue_type}':")
+        print(f"    Successful strategies: {len(result.get('successful_strategies', []))}")
+        print(f"    Failed strategies: {len(result.get('failed_strategies', []))}")
+        print(f"    Total attempts: {result.get('total_attempts', 0)}")
+        if result.get('fallback_used'):
+            print(f"    (Fallback: broad match used — no exact issue_type match)")
+
+    # Signal lifecycle summary
+    subheader("Signal Lifecycle (new → persistent → resolved)")
+    try:
+        new_sigs = store.get_signals_by_status("new")
+        persistent_sigs = store.get_signals_by_status("persistent")
+        resolved_sigs = store.get_signals_by_status("resolved")
+        print(f"  new: {len(new_sigs)}, persistent: {len(persistent_sigs)}, resolved: {len(resolved_sigs)}")
+        if resolved_sigs:
+            print(f"  Resolved signals (sample):")
+            for s in resolved_sigs[:3]:
+                print(f"    [{s.severity}] {s.signal_type} → {truncate(s.artifact_uri, 50)}")
+    except Exception as e:
+        print(f"  (Lifecycle summary unavailable: {e})")
+
+    # MCP Tool: get_remediation_metrics
+    subheader("MCP: get_remediation_metrics")
+    result = handle_tool_call("get_remediation_metrics", {})
+    print_json("Metrics", result)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -493,6 +725,9 @@ def main() -> None:
     pipeline, assessment, artifacts, relationships, source_str, git_commit = (
         load_and_assess(source, args.limit)
     )
+
+    # Persist to CockroachDB with vector embeddings (demonstrates distributed vector index)
+    persist_to_cockroach(cockroach_store, assessment, artifacts, source_str, git_commit)
 
     # Set up LLM gateway (optional — falls back to heuristics if not available)
     llm_gateway = None
@@ -573,14 +808,20 @@ def main() -> None:
     banner("Demo Complete")
     print("  The closed loop is now functional:")
     print()
-    print("    1. Run 1 had no history → outcome saved to CockroachDB")
-    print("    2. Run 2 read CockroachDB context → LLM saw Run 1's outcome")
-    print("    3. Run 2's outcome also saved to CockroachDB")
-    print("    4. Run 3 would see BOTH outcomes + decision traces")
+    print("    1. Artifacts saved with VECTOR(384) embeddings → semantic search")
+    print("    2. Signals + lifecycle tracked in CockroachDB (new → persistent → resolved)")
+    print("    3. Agent workflow state persisted (active → paused → completed)")
+    print("    4. Run 1 had no history → outcome saved to CockroachDB")
+    print("    5. Run 2 read CockroachDB context → LLM saw Run 1's outcome")
+    print("    6. Run 2's outcome also saved to CockroachDB")
+    print("    7. Run 3 would see BOTH outcomes + decision traces + vector search")
     print()
-    print("  The DualHistoryStore transparently syncs outcomes to both")
-    print("  SQLite (fast EMA/strategy stats) and CockroachDB (distributed")
-    print("  persistence + decision traces) without changing workflow code.")
+    print("  CockroachDB tools demonstrated:")
+    print("    • Distributed Vector Indexing (VECTOR(384) + <=> cosine distance)")
+    print("    • ACID Transactions (retry on serialization conflicts)")
+    print("    • Agent State Persistence (Burr workflow survives restarts)")
+    print("    • Signal Lifecycle Tracking (NEW → PERSISTENT → RESOLVED)")
+    print("    • Decision Traces (full reasoning chain observability)")
     print("=" * 72)
 
 

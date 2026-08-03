@@ -888,6 +888,18 @@ class CockroachDBStore:
             """
         )
 
+    def get_all_workflows(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Get all workflows (active, paused, completed, failed) — full lifecycle."""
+        return self._execute_fetchall(
+            """
+            SELECT app_id, current_stage, status, assessment_id, updated_at
+            FROM agent_state
+            ORDER BY updated_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+
     def update_agent_status(self, app_id: str, status: str) -> None:
         """Update workflow status (e.g., 'paused' at approval checkpoint)."""
         self._execute(
@@ -911,14 +923,19 @@ class CockroachDBStore:
 
         This makes the agent progressively better at resolving problems
         of the same type — it learns from its institutional memory.
+
+        Fallback: If no exact match is found for the issue_type, falls back
+        to returning all recent outcomes. This handles the case where the
+        LLM generates different category names for the same underlying
+        problem across runs (e.g., "broken_links" vs "poor_maintenance").
         """
         successful = self.get_successful_strategies(issue_type)
         failed = self.get_failed_strategies(issue_type)
 
-        # Get recent outcomes with decision traces
+        # Get recent outcomes with decision traces (exact match)
         recent = self._execute_fetchall(
             """
-            SELECT r.outcome_id, r.strategy, r.verification_outcome,
+            SELECT r.outcome_id, r.issue_type, r.strategy, r.verification_outcome,
                    r.score_before, r.score_after, r.proposal_reasoning,
                    r.tokens_used, r.created_at
             FROM remediation_history r
@@ -928,6 +945,45 @@ class CockroachDBStore:
             """,
             (issue_type, limit),
         )
+
+        # Fallback: if no exact match, get all recent outcomes
+        # The LLM may generate different category names for the same problem
+        fallback_used = False
+        if not recent:
+            recent = self._execute_fetchall(
+                """
+                SELECT r.outcome_id, r.issue_type, r.strategy, r.verification_outcome,
+                       r.score_before, r.score_after, r.proposal_reasoning,
+                       r.tokens_used, r.created_at
+                FROM remediation_history r
+                ORDER BY r.created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            if recent:
+                fallback_used = True
+                # Also get all successful/failed strategies (not filtered by type)
+                successful = self._execute_fetchall(
+                    """
+                    SELECT strategy, count(*) as count,
+                           avg(score_after - score_before) as avg_improvement
+                    FROM remediation_history
+                    WHERE verification_outcome IN ('resolved', 'improved')
+                    GROUP BY strategy ORDER BY avg_improvement DESC LIMIT %s
+                    """,
+                    (limit,),
+                )
+                failed = self._execute_fetchall(
+                    """
+                    SELECT strategy, count(*) as count,
+                           avg(score_after - score_before) as avg_improvement
+                    FROM remediation_history
+                    WHERE verification_outcome NOT IN ('resolved', 'improved')
+                    GROUP BY strategy ORDER BY count DESC LIMIT %s
+                    """,
+                    (limit,),
+                )
 
         # Fetch decision traces for the most recent outcome
         traces = []
@@ -941,6 +997,7 @@ class CockroachDBStore:
             "recent_outcomes": recent,
             "last_decision_traces": traces,
             "total_attempts": len(recent),
+            "fallback_used": fallback_used,
         }
 
     def get_similar_problems(

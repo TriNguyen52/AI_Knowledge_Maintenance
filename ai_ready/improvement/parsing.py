@@ -114,6 +114,17 @@ def repair_json(json_str: str) -> str:
     # Remove trailing commas before } or ]
     result = re.sub(r',\s*([}\]])', r'\1', result)
 
+    # Fix within-line missing commas between structural elements.
+    # Only match } or ] (not ") followed by " or { or [ to avoid
+    # false positives inside string values.
+    # Pattern: }  "  → }, "  (missing comma after object, next is key)
+    # Pattern: ]  "  → ], "  (missing comma after array, next is key)
+    # Pattern: }  {  → }, {  (missing comma between objects in array)
+    # Pattern: ]  [  → ], [  (missing comma between arrays in array)
+    # Pattern: }  [  → }, [  (missing comma between object and array)
+    # Pattern: ]  {  → ], {  (missing comma between array and object)
+    result = re.sub(r'([}\]])\s+(["\[\{])', r'\1, \2', result)
+
     return result
 
 
@@ -122,7 +133,9 @@ def parse_llm_json(content: str) -> dict | list:
 
     Tries in order:
     1. Direct json.loads on the extracted JSON
-    2. json.loads on the repaired JSON
+    2. json.loads on the line-based + structural repaired JSON
+    3. json.loads on aggressively repaired JSON (adds commas between any
+       closing/opening delimiter, including " to ", as a last resort)
 
     Args:
         content: Raw LLM response text.
@@ -137,5 +150,18 @@ def parse_llm_json(content: str) -> dict | list:
     try:
         return json.loads(json_str)
     except json.JSONDecodeError:
+        pass
+    # Second attempt: line-based + structural repair
+    try:
         repaired = repair_json(json_str)
         return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+    # Third attempt: aggressive repair — add commas between any closing
+    # and opening delimiter (including " to ") as a last resort.
+    try:
+        aggressive = re.sub(r'(["\]\}])\s+(["\[\{])', r'\1, \2', json_str)
+        aggressive = re.sub(r',\s*([}\]])', r'\1', aggressive)
+        return json.loads(aggressive)
+    except json.JSONDecodeError as e:
+        raise e
