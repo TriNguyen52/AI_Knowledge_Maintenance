@@ -23,8 +23,9 @@ Environment variables required:
     AWS_REGION — AWS region
     S3_KNOWLEDGE_BUCKET — S3 bucket containing knowledge artifacts
     S3_KNOWLEDGE_PREFIX — S3 prefix (optional, defaults to "")
-    BEDROCK_MODEL — Bedrock model ID (optional, defaults to Claude 3.5 Sonnet)
-    LLM_PROVIDER — "bedrock" or "groq" (optional, defaults to "bedrock")
+    GROQ_API_KEY — Groq API key for LLM access (required for remediation)
+    LLM_PROVIDER — "groq" (default) or "bedrock"
+    SALIENCE_THRESHOLD — minimum salience for problems (optional, default 0.01)
 """
 
 from __future__ import annotations
@@ -57,6 +58,24 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         dict with statusCode, body (JSON string), and headers.
     """
     try:
+        # Fix 2e: Unwrap API Gateway event shape if present
+        if "httpMethod" in event and "body" in event:
+            # API Gateway REST format: {"httpMethod": "POST", "body": "..."}
+            import json as _json
+            body = event.get("body", "{}")
+            if isinstance(body, str):
+                event = _json.loads(body) if body else {}
+            else:
+                event = body
+        elif "routeKey" in event and "body" in event:
+            # API Gateway HTTP format
+            body = event.get("body", "{}")
+            if isinstance(body, str):
+                import json as _json
+                event = _json.loads(body) if body else {}
+            else:
+                event = body
+
         action = event.get("action", "assess")
 
         if action == "assess":
@@ -101,15 +120,13 @@ def run_assessment(event: dict[str, Any]) -> dict[str, Any]:
     """
     from ai_ready.knowledge.s3 import S3KnowledgeSDK
     from ai_ready.storage.cockroach import CockroachDBStore
-    from ai_ready.storage.models import (
-        ArtifactRecord, SignalRecord, AssessmentRecord, ProblemRecord,
-    )
+    from ai_ready.storage.models import ProblemRecord
+    from ai_ready.storage.persistence import persist_assessment
     from ai_ready.operations import CollectOperation, AssessOperation
     from ai_ready.improvement.salience import (
         discover_problems_heuristic,
         rank_problems_by_salience,
     )
-    from ai_ready.llm.bedrock import BedrockProvider
 
     start_time = time.monotonic()
 
@@ -152,24 +169,7 @@ def run_assessment(event: dict[str, Any]) -> dict[str, Any]:
     else:
         store.initialize_schema()
 
-    # 3. Generate embeddings via Bedrock and store artifacts
-    bedrock = BedrockProvider()
-    for artifact in bundle.artifacts:
-        content_text = _artifact_to_text(artifact)
-        embedding = bedrock.embed_artifact(
-            artifact.uri, content_text, artifact.metadata
-        )
-        record = ArtifactRecord.new(
-            artifact_uri=artifact.uri,
-            artifact_type="document",
-            source=s3_uri,
-            content=content_text,
-            metadata=artifact.metadata,
-            embedding=embedding,
-        )
-        store.save_artifact(record)
-
-    # 4. Run collectors — CollectOperation.run takes a list of artifacts
+    # 3. Run collectors — CollectOperation.run takes a list of artifacts
     collect_op = CollectOperation()
     results, all_signals, artifact_bundle = collect_op.run(
         artifacts=bundle.artifacts,
@@ -177,7 +177,7 @@ def run_assessment(event: dict[str, Any]) -> dict[str, Any]:
         source=s3_uri,
     )
 
-    # 5. Assess — AssessOperation.run takes results, signals, artifacts, bundle
+    # 4. Assess — AssessOperation.run takes results, signals, artifacts, bundle
     assess_op = AssessOperation()
     assessment = assess_op.run(
         results=results,
@@ -187,46 +187,28 @@ def run_assessment(event: dict[str, Any]) -> dict[str, Any]:
         source=s3_uri,
     )
 
-    # 6. Store signals in CockroachDB
-    signal_count = 0
-    signal_id_map: dict[str, str] = {}  # internal_id → uuid for DB
-    for signal in all_signals:
-        signal_uuid = str(__import__("uuid").uuid4())
-        signal_record = SignalRecord.new(
-            artifact_uri=signal.artifact_uri,
-            collector_id=signal.collector_id,
-            signal_type=signal.signal_type,
-            severity=signal.severity.value if hasattr(signal.severity, "value") else str(signal.severity),
-            score=signal.score,
-            recommendation=signal.recommendation or "",
-            ai_impact=signal.ai_impact or "",
-            evidence=signal.evidence if isinstance(signal.evidence, dict) else {},
-        )
-        store.save_signal(signal_record)
-        # Map internal signal id to DB uuid for problem discovery
-        signal_id_map[signal.signal_id if hasattr(signal, 'signal_id') else f"sig_{signal_count}"] = signal_record.signal_id
-        signal_count += 1
-
-    # 7. Store assessment
-    assessment_record = AssessmentRecord.new(
-        score=assessment.score,
-        dimensions={d.dimension: d.score for d in assessment.dimensions},
-        signals_count=signal_count,
-        metadata={
-            "source": s3_uri,
-            "artifact_count": len(bundle.artifacts),
-            **({"dedup_key": dedup_key} if dedup_key else {}),
-        },
+    # 5. Persist assessment (P4): artifacts+embeddings, signals+lifecycle,
+    #    assessment record — all via canonical persist_assessment()
+    persist_result = persist_assessment(
+        store=store,
+        assessment=assessment,
+        signals=all_signals,
+        artifacts=bundle.artifacts,
+        source=s3_uri,
+        dedup_key=dedup_key,
     )
-    store.save_assessment(assessment_record)
+    assessment_record_id = persist_result["assessment_id"]
+    signal_count = persist_result["signal_count"]
+    signal_id_map = persist_result["signal_id_map"]
 
     # 8. Discover and rank problems
-    # discover_problems_heuristic(signal_ids, assessment) → (problems, hypotheses)
-    # rank_problems_by_salience(problems, assessment, history_store, threshold) → (ranked, saliences, skipped)
+    # P8: Use configurable salience threshold (default 0.01)
+    salience_threshold = float(os.environ.get("SALIENCE_THRESHOLD", "0.01"))
     signal_ids = list(signal_id_map.keys())
     problems, hypotheses = discover_problems_heuristic(signal_ids, assessment)
     ranked, saliences, skipped = rank_problems_by_salience(
         problems, assessment, history_store=None,
+        threshold=salience_threshold,
     )
 
     # Store top problems in queue
@@ -251,7 +233,7 @@ def run_assessment(event: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "action": "assess",
-        "assessment_id": assessment_record.assessment_id,
+        "assessment_id": assessment_record_id,
         "score": assessment.score,
         "dimensions": {d.dimension: d.score for d in assessment.dimensions},
         "artifact_count": len(bundle.artifacts),
@@ -292,7 +274,6 @@ def run_remediation(event: dict[str, Any]) -> dict[str, Any]:
     """
     from ai_ready.storage.cockroach import CockroachDBStore
     from ai_ready.storage.models import RemediationRecord
-    from ai_ready.llm.bedrock import BedrockProvider
     from ai_ready.llm.gateway import LLMGateway
     from ai_ready.improvement.manager import ImprovementManager
     from ai_ready.improvement.history import ImprovementHistoryStore
@@ -304,13 +285,14 @@ def run_remediation(event: dict[str, Any]) -> dict[str, Any]:
     store = CockroachDBStore()
     store.initialize_schema()
 
-    # 2. Set up LLM (Bedrock by default for hackathon)
-    provider_name = os.environ.get("LLM_PROVIDER", "bedrock")
-    if provider_name == "bedrock":
-        provider = BedrockProvider()
-    else:
+    # 2. Set up LLM — standardized on Groq (Fix 0.5/2c)
+    provider_name = os.environ.get("LLM_PROVIDER", "groq")
+    if provider_name == "groq":
         from ai_ready.llm.groq import GroqProvider
         provider = GroqProvider()
+    else:
+        from ai_ready.llm.bedrock import BedrockProvider
+        provider = BedrockProvider()
 
     gateway = LLMGateway(provider=provider)
 
@@ -359,6 +341,8 @@ def run_remediation(event: dict[str, Any]) -> dict[str, Any]:
     # 6. Retrieve historical context from CockroachDB (closed-loop memory)
     # The agent reads past outcomes to inform its current decision — this is
     # what makes it an agentic memory, not just a data store.
+    # Fix 2a: Define artifact_uris from the problem record before use
+    artifact_uris = target_problem.artifact_uris if hasattr(target_problem, 'artifact_uris') else []
     remediation_context = store.get_remediation_context(target_problem.category)
     similar_problems = store.get_similar_problems(
         target_problem.category, artifact_uris
@@ -369,6 +353,7 @@ def run_remediation(event: dict[str, Any]) -> dict[str, Any]:
         llm_gateway=gateway,
         history_store=history_store,
         diagnosis_quality_tracker=diagnosis_tracker,
+        cockroach_store=store,  # P7: enables agent-state persistence
     )
 
     app_id = manager.start_improvement(
@@ -376,14 +361,8 @@ def run_remediation(event: dict[str, Any]) -> dict[str, Any]:
         artifact_uris=artifact_uris,
     )
 
-    # 8. Persist agent state to CockroachDB (survives across invocations)
-    store.save_agent_state(
-        app_id=app_id,
-        state_data={"stage": "started", "problem_id": target_problem.problem_id},
-        current_stage="diagnose",
-        assessment_id=assessment.assessment_id,
-        status="active",
-    )
+    # 8. Agent state is now persisted by ImprovementManager (P7)
+    # when cockroach_store is passed to the constructor above.
 
     # 9. Auto-approve and complete the workflow
     # In production this would be a human-in-the-loop checkpoint:
@@ -395,14 +374,7 @@ def run_remediation(event: dict[str, Any]) -> dict[str, Any]:
         reason="Auto-approved by Lambda remediation handler",
     )
 
-    # 10. Update agent state to completed
-    store.save_agent_state(
-        app_id=app_id,
-        state_data=final_state,
-        current_stage=final_state.get("current_stage", "completed"),
-        assessment_id=assessment.assessment_id,
-        status="completed",
-    )
+    # 10. Agent state at completion is also persisted by ImprovementManager (P7)
 
     # 11. Extract outcome from final state
     verification_outcome = final_state.get("verification_outcome", "unchanged")

@@ -210,8 +210,34 @@ class ImprovementManager:
         app_id = app.uid
         self._apps[app_id] = app
 
+        # P7: Persist agent state at start (active, diagnose stage)
+        if self.cockroach_store:
+            try:
+                self.cockroach_store.save_agent_state(
+                    app_id=app_id,
+                    state_data=dict(app.state),
+                    current_stage="diagnose",
+                    assessment_id=assessment_id,
+                    status="active",
+                )
+            except Exception as e:
+                logger.debug(f"Agent state save (start) skipped: {e}")
+
         # Run until the approval checkpoint
         run_until_approval(app)
+
+        # P7: Persist agent state at pause (paused, awaiting approval)
+        if self.cockroach_store:
+            try:
+                self.cockroach_store.save_agent_state(
+                    app_id=app_id,
+                    state_data=dict(app.state),
+                    current_stage=app.state.get("current_stage", "awaiting_approval"),
+                    assessment_id=assessment_id,
+                    status="paused",
+                )
+            except Exception as e:
+                logger.debug(f"Agent state save (paused) skipped: {e}")
 
         return app_id
 
@@ -252,6 +278,21 @@ class ImprovementManager:
             app.update_state(app.state.update(selected_proposal_idx=selected_proposal_idx))
 
         final_state = approve_and_run(app, approved=approved, reason=reason)
+
+        # P7: Persist agent state at completion
+        if self.cockroach_store:
+            try:
+                stage = final_state.get("current_stage", "completed")
+                status = "completed" if stage == RemediationStatus.COMPLETED.value else "failed"
+                self.cockroach_store.save_agent_state(
+                    app_id=app_id,
+                    state_data=final_state,
+                    current_stage=stage,
+                    assessment_id=final_state.get("assessment_id", ""),
+                    status=status,
+                )
+            except Exception as e:
+                logger.debug(f"Agent state save (completed) skipped: {e}")
 
         # Record outcome in history
         self._record_outcome(app_id, final_state)

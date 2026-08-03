@@ -162,7 +162,13 @@ class CockroachDBStore:
             conn.autocommit = True
 
     def initialize_schema(self) -> None:
-        """Create all tables if they don't exist."""
+        """Create all tables if they don't exist.
+
+        The schema.sql file contains all DDL including a vector index.
+        If the cluster version does not support CREATE VECTOR INDEX IF NOT EXISTS,
+        we fall back to a guarded CREATE VECTOR INDEX (which will no-op if the
+        index already exists, or fail gracefully if vector indexes are unsupported).
+        """
         if self._initialized:
             return
 
@@ -171,6 +177,19 @@ class CockroachDBStore:
 
         with self.conn.cursor() as cur:
             cur.execute(schema_sql)
+
+        # Ensure the vector index exists — some CockroachDB versions don't
+        # support IF NOT EXISTS on vector indexes.  Try the guarded form.
+        try:
+            cur.execute(
+                "CREATE VECTOR INDEX IF NOT EXISTS idx_artifacts_embedding "
+                "ON knowledge_artifacts (embedding)"
+            )
+        except Exception as e:
+            logger.info(
+                "Vector index creation skipped (may already exist or "
+                "unsupported on this cluster version): %s", e
+            )
 
         self._initialized = True
 

@@ -61,9 +61,21 @@ class CollectOperation:
     ) -> tuple[list[CollectorResult], list[KnowledgeSignal], ArtifactBundle]:
         """Run all enabled collectors and return results, signals, and the bundle.
 
+        Relationships referencing artifacts not in the ``artifacts`` list
+        are pruned before collection so they don't produce false
+        ``link_integrity`` breakage signals.
+
         Returns:
             A tuple of (collector_results, all_signals, artifact_bundle).
         """
+        # P2: Prune relationships to only reference retained artifacts
+        if relationships and artifacts:
+            retained_uris = {a.uri for a in artifacts}
+            relationships = [
+                r for r in relationships
+                if r.source_uri in retained_uris and r.target_uri in retained_uris
+            ]
+
         bundle = ArtifactBundle(
             artifacts=artifacts,
             relationships=relationships or [],

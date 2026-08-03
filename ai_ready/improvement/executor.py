@@ -95,14 +95,42 @@ class KnowledgeExecutor:
         self._dry_run = artifact_store is None and self.source_path is None
 
     def _resolve_path(self, artifact_uri: str) -> Path | None:
-        """Resolve an artifact URI to a full file path."""
+        """Resolve an artifact URI to a full file path safely.
+
+        Security: The LLM controls ``artifact_uri`` and the executor calls
+        ``write_text`` on the resolved path.  This method enforces three
+        layers of containment:
+
+        1. **Allowlist** — if ``known_artifact_uris`` is populated, reject
+           any URI not in the set.
+        2. **Path-escape prevention** — resolve the full path and verify it
+           is still inside ``source_path`` (blocks ``../../etc/passwd`` etc.).
+        3. **Existence check** — the file must already exist (we never create
+           new files through the executor).
+
+        Returns ``None`` on any failure — callers must treat ``None`` as
+        "do not write".
+        """
         if self.source_path is None:
             return None
-        # artifact_uri is relative (e.g., "docs/en/docs/advanced/events.md")
+
+        # Layer 1: allowlist enforcement
+        if self.known_artifact_uris and artifact_uri not in self.known_artifact_uris:
+            logger.warning("Rejected unknown artifact URI: %s", artifact_uri)
+            return None
+
+        # Layer 2: path-escape prevention
         full_path = self.source_path / artifact_uri
-        if full_path.exists():
-            return full_path
-        return None
+        try:
+            resolved = full_path.resolve()
+            if not resolved.is_relative_to(self.source_path.resolve()):
+                logger.error("Path escape blocked: %s -> %s", artifact_uri, resolved)
+                return None
+        except Exception:
+            return None
+
+        # Layer 3: existence
+        return full_path if full_path.exists() else None
 
     def _get_signals_for_artifact(self, artifact_uri: str) -> list[Any]:
         """Get all assessment signals for a specific artifact."""

@@ -903,8 +903,18 @@ class SkipEvent:
 def compute_edit_delta(
     modification_steps: list[dict[str, Any]],
     artifact_uri: str,
+    original_content: str | None = None,
 ) -> float:
     """Estimate the fraction of an artifact that a set of steps will change.
+
+    When ``original_content`` is provided and a step contains
+    ``new_content`` (or ``content``), the edit delta is computed from
+    the actual text diff using ``difflib.SequenceMatcher.ratio()``.
+    This prevents an LLM from labeling a full rewrite as a minor
+    ``update_document`` (weight 0.15) to bypass the edit budget.
+
+    When ``original_content`` is not available, falls back to the
+    static per-step-type weight table (conservative heuristic).
 
     This is a *conservative* heuristic: it estimates the proportion of
     the artifact touched by the proposed modifications.  When the
@@ -932,10 +942,16 @@ def compute_edit_delta(
         modification_steps: The proposal's modification_steps list.
         artifact_uri: The artifact being evaluated (steps targeting
             other artifacts are ignored).
+        original_content: Optional original text content of the artifact.
+            When provided and a step has ``new_content`` or ``content``,
+            the edit delta is computed from the actual text diff instead
+            of the static weight table.
 
     Returns:
         Float in [0.0, 1.0] representing the estimated fraction changed.
     """
+    import difflib
+
     _STEP_WEIGHTS: dict[str, float] = {
         "replace_document": 1.0,
         "rewrite_section": 0.3,
@@ -969,8 +985,20 @@ def compute_edit_delta(
         if step_uri and step_uri != artifact_uri:
             continue
         step_type = step.get("step_type", "unknown")
-        weight = _STEP_WEIGHTS.get(step_type, _DEFAULT_WEIGHT)
-        total += weight
+
+        # Fix 7: Use real diff when original_content and new_content are available
+        new_content = step.get("new_content") or step.get("content")
+        if original_content is not None and new_content is not None:
+            # Compute actual change fraction from text diff
+            similarity = difflib.SequenceMatcher(
+                None, original_content, new_content
+            ).ratio()
+            change_fraction = 1.0 - similarity
+            total += change_fraction
+        else:
+            # Fall back to static weight table
+            weight = _STEP_WEIGHTS.get(step_type, _DEFAULT_WEIGHT)
+            total += weight
 
     return min(total, 1.0)
 
@@ -979,6 +1007,7 @@ def check_edit_budget(
     modification_steps: list[dict[str, Any]],
     artifact_uri: str,
     max_pct: float = MAX_EDIT_BUDGET_PCT,
+    original_content: str | None = None,
 ) -> tuple[bool, float, str]:
     """Check whether a proposal stays within the edit budget.
 
@@ -986,12 +1015,14 @@ def check_edit_budget(
         modification_steps: The proposal's modification_steps list.
         artifact_uri: The artifact being modified.
         max_pct: Maximum allowed fraction (default 20%).
+        original_content: Optional original text content for real diff
+            computation (Fix 7).
 
     Returns:
         Tuple of (within_budget, edit_delta, reason).
         If within_budget is False, reason explains the rejection.
     """
-    delta = compute_edit_delta(modification_steps, artifact_uri)
+    delta = compute_edit_delta(modification_steps, artifact_uri, original_content)
     if delta > max_pct:
         return (
             False,

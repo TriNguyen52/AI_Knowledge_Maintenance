@@ -1,5 +1,17 @@
 # Lambda deployment requirements
+# Core
 boto3>=1.34.0
 psycopg2-binary>=2.9.0
 pyyaml>=6.0
 markdown-it-py>=3.0.0
+
+# LLM + workflow
+apache-burr>=0.42.0
+groq>=0.11.0
+
+# Embeddings
+numpy>=1.26.0
+requests>=2.31.0
+
+# Observability (optional but recommended)
+# opentelemetry-sdk>=1.24.0

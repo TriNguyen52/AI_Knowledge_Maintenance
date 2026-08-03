@@ -18,11 +18,17 @@ class Config:
         thresholds: dict[str, Any] | None = None,
         fail_on: list[str] | None = None,
         enabled_collectors: dict[str, bool] | None = None,
+        salience_threshold: float = 0.01,
     ) -> None:
         self.weights = weights or dict(DEFAULT_WEIGHTS)
         self.thresholds = thresholds or {"overall_score": 0}
         self.fail_on = fail_on or ["CRITICAL"]
         self.enabled_collectors = enabled_collectors or {}
+        # P8: Salience threshold for problem discovery — problems below
+        # this score are skipped (not actionable enough).  Default 0.01
+        # matches the demo's hardcoded value.  Configurable via YAML:
+        #   salience_threshold: 0.05
+        self.salience_threshold = salience_threshold
 
     @property
     def enabled_collector_ids(self) -> list[str]:
@@ -59,6 +65,7 @@ class Config:
             thresholds=data.get("thresholds", {"overall_score": 0}),
             fail_on=data.get("fail_on", ["CRITICAL"]),
             enabled_collectors=enabled_collectors,
+            salience_threshold=data.get("salience_threshold", 0.01),
         )
 
     @classmethod

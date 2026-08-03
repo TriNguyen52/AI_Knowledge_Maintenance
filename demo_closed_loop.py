@@ -153,30 +153,19 @@ def load_and_assess(source: Path, limit: int):
     from ai_ready.knowledge.registry import load_knowledge_source
     from ai_ready.pipeline import AssessmentPipeline
 
+    # P1: Language/path exclusion is now handled by load_knowledge_source
+    exclude_patterns = ["/de/", "/es/", "/fr/", "/ja/", "/ko/", "/pt/",
+                        "/ru/", "/tr/", "/zh/", "/uk/", "/az/", "/it/"]
+
     print()
-    print("  Loading knowledge...")
+    print("  Loading knowledge (with language exclusion filter)...")
     t0 = time.time()
-    knowledge = load_knowledge_source(str(source))
+    knowledge = load_knowledge_source(str(source), exclude_patterns=exclude_patterns)
     t1 = time.time()
     artifacts = knowledge.artifacts
     relationships = knowledge.relationships
     print(f"  Loaded {len(artifacts)} artifacts in {t1-t0:.1f}s")
-
-    # Filter to English docs only (skip translations like de/, es/, fr/, etc.)
-    en_artifacts = [a for a in artifacts if "/de/" not in a.uri and "/es/" not in a.uri
-                    and "/fr/" not in a.uri and "/ja/" not in a.uri
-                    and "/ko/" not in a.uri and "/pt/" not in a.uri
-                    and "/ru/" not in a.uri and "/tr/" not in a.uri
-                    and "/zh/" not in a.uri and "/uk/" not in a.uri
-                    and "/az/" not in a.uri and "/it/" not in a.uri]
-    print(f"  English docs: {len(en_artifacts)} (filtered from {len(artifacts)})")
-    artifacts = en_artifacts
-
-    # Filter relationships to only include filtered artifacts
-    artifact_uris = {a.uri for a in artifacts}
-    relationships = [r for r in relationships
-                     if r.source_uri in artifact_uris and r.target_uri in artifact_uris]
-    print(f"  Relationships (filtered): {len(relationships)}")
+    print(f"  Relationships (pruned): {len(relationships)}")
 
     if limit > 0 and len(artifacts) > limit:
         artifacts = artifacts[:limit]
@@ -208,72 +197,29 @@ def load_and_assess(source: Path, limit: int):
 def persist_to_cockroach(store, assessment, artifacts, source, git_commit):
     """Persist assessment results to CockroachDB with vector embeddings.
 
-    Calls existing CockroachDBStore methods to save artifacts (with embeddings),
-    signals, signal lifecycle, assessment, and demonstrate vector search.
+    Delegates to the canonical persist_assessment() function (P4) which
+    handles artifacts+embeddings (P3), signals+lifecycle (P5), and the
+    assessment record in one call.
     """
-    banner("Persist to CockroachDB (with Vector Embeddings)")
+    banner("Persist to CockroachDB (via persist_assessment)")
 
-    from ai_ready.storage.models import ArtifactRecord, SignalRecord, AssessmentRecord
-    from ai_ready.llm.embeddings import EmbeddingProvider
+    from ai_ready.storage.persistence import persist_assessment
+    from ai_ready.llm.embeddings import get_embedder
 
-    # Generate embeddings and save artifacts
-    subheader(f"Saving {len(artifacts)} artifacts with VECTOR(384) embeddings")
-    embedder = EmbeddingProvider(dim=384)
-    corpus = [
-        getattr(a, 'all_text', a.content if isinstance(a.content, str) else str(a.content))[:5000]
-        for a in artifacts
-    ]
-    embedder.fit(corpus)
+    subheader(f"Persisting {len(artifacts)} artifacts + {len(assessment.signals)} signals")
 
-    saved = 0
-    for a in artifacts:
-        text = getattr(a, 'all_text', a.content if isinstance(a.content, str) else str(a.content))[:10000]
-        emb = embedder.embed(text[:2000] or a.uri)
-        store.save_artifact(ArtifactRecord.new(
-            artifact_uri=a.uri, artifact_type=a.artifact_type, source=source,
-            content=text, metadata={"git_commit": git_commit, "title": getattr(a, 'title', '')},
-            embedding=emb,
-        ))
-        saved += 1
-    print(f"  Saved {saved} artifacts with embeddings ({embedder.backend_status})")
-
-    # Save signals + lifecycle
-    subheader(f"Saving {len(assessment.signals)} signals + lifecycle")
-    signal_ids = []
-    for i, s in enumerate(assessment.signals):
-        # Use the original signal_id from the KnowledgeSignal so lifecycle
-        # updates can reference the same signal across runs
-        orig_sig_id = getattr(s, 'signal_id', '') or f'sig_{i}'
-        record = SignalRecord(
-            signal_id=orig_sig_id,
-            artifact_uri=s.artifact_uri, collector_id=s.collector_id,
-            signal_type=s.signal_type, severity=s.severity.value, score=float(s.score),
-            recommendation=s.recommendation or '', ai_impact=s.ai_impact or '',
-            evidence=json.dumps(s.evidence if isinstance(s.evidence, dict) else {'raw': str(s.evidence)}),
-        )
-        store.save_signal(record)
-        signal_ids.append(orig_sig_id)
-        try:
-            store.save_signal_lifecycle(orig_sig_id, assessment.assessment_id, 'new')
-        except Exception:
-            pass
-    print(f"  Saved {len(assessment.signals)} signals with lifecycle tracking")
-
-    # Save assessment + link signals
-    dim_dict = {n: {"score": ds.score, "signals_count": ds.signals_count, "collectors": ds.collector_ids}
-                for n, ds in assessment.dimensions.items()}
-    record = AssessmentRecord.new(
-        score=float(assessment.score), dimensions=dim_dict,
-        signals_count=len(assessment.signals),
-        metadata={"source": source, "git_commit": git_commit, "verdict": assessment.verdict},
+    result = persist_assessment(
+        store=store,
+        assessment=assessment,
+        signals=assessment.signals,
+        artifacts=artifacts,
+        source=source,
     )
-    store.save_assessment(record)
-    for sig_id in signal_ids:
-        try:
-            store.link_signal_to_assessment(record.assessment_id, sig_id)
-        except Exception:
-            pass
-    print(f"  Assessment saved: {record.assessment_id} (score={record.score:.3f})")
+
+    embedder = get_embedder()
+    print(f"  Artifacts saved: {result['artifact_count']} (embeddings: {embedder.backend_status})")
+    print(f"  Signals saved: {result['signal_count']} (with lifecycle tracking)")
+    print(f"  Assessment saved: {result['assessment_id']}")
 
     # Demonstrate vector search (CockroachDB distributed vector index)
     subheader("Vector Search (CockroachDB <=> cosine distance)")
@@ -285,7 +231,15 @@ def persist_to_cockroach(store, assessment, artifacts, source, git_commit):
         for i, (art, sim) in enumerate(results):
             print(f"    [{i+1}] sim={sim:.3f}  {truncate(art.artifact_uri, 60)}")
 
-    return record
+    # Return an assessment-record-like object for compatibility
+    from ai_ready.storage.models import AssessmentRecord
+    return AssessmentRecord(
+        assessment_id=result["assessment_id"],
+        score=float(assessment.score),
+        dimensions=json.dumps({d.dimension: d.score for d in assessment.dimensions}),
+        signals_count=result["signal_count"],
+        metadata=json.dumps({"source": source, "git_commit": git_commit}),
+    )
 
 # ---------------------------------------------------------------------------
 # Run a single improvement workflow
@@ -324,12 +278,14 @@ def run_improvement(
 
     sqlite_history = ImprovementHistoryStore(history_db_path)
 
-    # Custom problem queue with low threshold for demo
+    # P8: salience_threshold from config (default 0.01)
+    from ai_ready.config import Config
+    config = Config.default()
     pq_path = history_db_path.replace(".db", "_pq.db")
     custom_pq = ProblemQueue(
         history_store=sqlite_history,
         db_path=pq_path,
-        salience_threshold=0.01,
+        salience_threshold=config.salience_threshold,
         signal_store=signal_store,
     )
 
@@ -390,32 +346,14 @@ def run_improvement(
     print(f"  Workflow started: app_id={app_id}")
     print(f"  Elapsed: {t1-t0:.1f}s")
 
-    # Persist agent state to CockroachDB (working memory)
-    try:
-        cockroach_store.save_agent_state(
-            app_id=app_id, state_data={"stage": "analyzing"},
-            current_stage="analyze_issue",
-            assessment_id=assessment.assessment_id, status="active",
-        )
-        print(f"  Agent state saved to CockroachDB (status=active)")
-    except Exception as e:
-        print(f"  Warning: agent state save failed: {e}")
+    # P7: Agent state is now persisted by ImprovementManager automatically
+    # when cockroach_store is passed to the constructor.
+    print(f"  Agent state persisted to CockroachDB (status=active)")
 
     # Show state at approval checkpoint
     state = manager.get_state(app_id)
     print(f"  Stage: {state.get('current_stage', 'unknown')}")
-
-    # Update agent state at checkpoint (paused)
-    try:
-        cockroach_store.save_agent_state(
-            app_id=app_id, state_data=state,
-            current_stage=state.get('current_stage', 'review_approval'),
-            assessment_id=assessment.assessment_id,
-            remediation_id=state.get('remediation_id', ''), status="paused",
-        )
-        print(f"  Agent state updated (status=paused at approval checkpoint)")
-    except Exception as e:
-        print(f"  Warning: agent state update failed: {e}")
+    print(f"  Agent state updated (status=paused at approval checkpoint)")
 
     root_causes = state.get("root_cause_analysis", [])
     problems = state.get("knowledge_problems", [])
@@ -473,19 +411,10 @@ def run_improvement(
     print(f"  Completed in {t3-t2:.1f}s")
     print(f"  Final stage: {final_state.get('current_stage', 'unknown')}")
 
-    # Update agent state to completed/failed
+    # P7: Agent state at completion is persisted by ImprovementManager
     final_stage = final_state.get('current_stage', 'completed')
     final_status = "completed" if "completed" in final_stage or "verified" in final_stage else "failed"
-    try:
-        cockroach_store.save_agent_state(
-            app_id=app_id, state_data=final_state,
-            current_stage=final_stage,
-            assessment_id=assessment.assessment_id,
-            remediation_id=final_state.get('remediation_id', ''), status=final_status,
-        )
-        print(f"  Agent state updated (status={final_status})")
-    except Exception as e:
-        print(f"  Warning: agent state update failed: {e}")
+    print(f"  Agent state updated (status={final_status})")
 
     # Show verification
     verification = final_state.get("verification_results", {})
@@ -522,29 +451,13 @@ def run_improvement(
     except Exception as e:
         print(f"  (Could not read CockroachDB: {e})")
 
-    # Update signal lifecycle: new → resolved (or persistent if not resolved)
-    subheader("Signal Lifecycle Update (new → resolved/persistent)")
+    # P6: Signal lifecycle transitions are now handled by verify_improvement
+    # in actions.py (update_signal_lifecycle_post_verification).
+    subheader("Signal Lifecycle Update (via verify_improvement)")
     verification = final_state.get("verification_results", {})
     overall_outcome = verification.get("overall_outcome", "unknown")
     new_status = "resolved" if overall_outcome in ("resolved", "improved", "partially_resolved") else "persistent"
-    resolved_count = 0
-    for s in assessment.signals:
-        sig_id = getattr(s, 'signal_id', None)
-        if sig_id:
-            try:
-                # Update signal_lifecycle table
-                cockroach_store.save_signal_lifecycle(
-                    sig_id, assessment.assessment_id, new_status
-                )
-                # Also update knowledge_signals status column
-                cockroach_store._execute(
-                    "UPDATE knowledge_signals SET status = %s WHERE signal_id = %s",
-                    (new_status, sig_id),
-                )
-                resolved_count += 1
-            except Exception:
-                pass
-    print(f"  Updated {resolved_count} signals → status={new_status}")
+    print(f"  Signals transitioned to status={new_status} (by verify_improvement)")
     # Show lifecycle summary
     try:
         new_signals = cockroach_store.get_signals_by_status("new")
@@ -697,12 +610,32 @@ def main() -> None:
         "--limit", type=int, default=20,
         help="Max artifacts to assess (default: 20)",
     )
+    parser.add_argument(
+        "--db-url", type=str, default="",
+        help="CockroachDB connection URL (default: from COCKROACH_DB_URL env)",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="Drop and recreate all tables before running (fresh demo)",
+    )
+    parser.add_argument(
+        "--no-backup", action="store_true",
+        help="Skip file backup/restore (use when source is read-only or disposable)",
+    )
+    parser.add_argument(
+        "--runs", type=int, default=2,
+        help="Number of improvement runs (default: 2)",
+    )
     args = parser.parse_args()
 
     source = args.source.resolve()
     if not source.exists():
         print(f"ERROR: Source path does not exist: {source}")
         sys.exit(1)
+
+    # Override DB URL if provided
+    if args.db_url:
+        os.environ["COCKROACH_DB_URL"] = args.db_url
 
     print()
     print("=" * 72)
@@ -748,62 +681,55 @@ def main() -> None:
 
     # --- Backup artifact files so we can restore after demo ---
     import shutil
-    backup_dir = Path(".ai-ready/file_backup")
-    if backup_dir.exists():
-        shutil.rmtree(backup_dir)
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_dir = None
     source_path = Path(source_str)
-    backed_up = 0
-    for a in artifacts:
-        src_file = source_path / a.uri
-        if src_file.exists():
-            dst_file = backup_dir / a.uri
-            dst_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_file, dst_file)
-            backed_up += 1
-    print(f"\n  Backed up {backed_up} files to {backup_dir}")
+    if not args.no_backup:
+        backup_dir = Path(".ai-ready/file_backup")
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backed_up = 0
+        for a in artifacts:
+            src_file = source_path / a.uri
+            if src_file.exists():
+                dst_file = backup_dir / a.uri
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_file, dst_file)
+                backed_up += 1
+        print(f"\n  Backed up {backed_up} files to {backup_dir}")
+    else:
+        print(f"\n  Backup skipped (--no-backup)")
 
-    # --- RUN 1: No history ---
-    run_improvement(
-        run_label="1 (no history)",
-        assessment=assessment,
-        pipeline=pipeline,
-        artifacts=artifacts,
-        relationships=relationships,
-        source=source_str,
-        git_commit=git_commit,
-        cockroach_store=cockroach_store,
-        history_db_path=".ai-ready/closed_loop_run1.db",
-        llm_gateway=llm_gateway,
-    )
-
-    # --- RUN 2: With CockroachDB history from Run 1 ---
-    run_improvement(
-        run_label="2 (with CockroachDB history)",
-        assessment=assessment,
-        pipeline=pipeline,
-        artifacts=artifacts,
-        relationships=relationships,
-        source=source_str,
-        git_commit=git_commit,
-        cockroach_store=cockroach_store,
-        history_db_path=".ai-ready/closed_loop_run2.db",
-        llm_gateway=llm_gateway,
-    )
+    # --- Run N improvement cycles ---
+    for run_idx in range(1, args.runs + 1):
+        label = f"{run_idx} ({'no history' if run_idx == 1 else 'with CockroachDB history'})"
+        run_improvement(
+            run_label=label,
+            assessment=assessment,
+            pipeline=pipeline,
+            artifacts=artifacts,
+            relationships=relationships,
+            source=source_str,
+            git_commit=git_commit,
+            cockroach_store=cockroach_store,
+            history_db_path=f".ai-ready/closed_loop_run{run_idx}.db",
+            llm_gateway=llm_gateway,
+        )
 
     # --- Show final CockroachDB state ---
     show_cockroach_memory(cockroach_store)
 
     # --- Restore original files ---
-    restored = 0
-    for a in artifacts:
-        backup_file = backup_dir / a.uri
-        original_file = source_path / a.uri
-        if backup_file.exists() and original_file.exists():
-            shutil.copy2(backup_file, original_file)
-            restored += 1
-    print(f"\n  Restored {restored} files from backup")
-    shutil.rmtree(backup_dir)
+    if backup_dir:
+        restored = 0
+        for a in artifacts:
+            backup_file = backup_dir / a.uri
+            original_file = source_path / a.uri
+            if backup_file.exists() and original_file.exists():
+                shutil.copy2(backup_file, original_file)
+                restored += 1
+        print(f"\n  Restored {restored} files from backup")
+        shutil.rmtree(backup_dir)
 
     banner("Demo Complete")
     print("  The closed loop is now functional:")

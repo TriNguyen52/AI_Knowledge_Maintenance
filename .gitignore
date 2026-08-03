@@ -55,6 +55,7 @@ verify_imports.py
 # Documents
 docs
 tests
+IMPLEMENTATION_PLAN.md
 
 # env
 .env

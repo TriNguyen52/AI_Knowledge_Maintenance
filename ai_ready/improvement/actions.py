@@ -1130,6 +1130,35 @@ def verify_improvement(state: State, assessment_store: Any = None,
         if assessment_store:
             assessment_store.save(after_assessment)
 
+        # P6: Transition signal lifecycle for resolved signals.
+        # Signals that were 'persistent' or 'new' are moved to 'resolved'
+        # (or 'recurring' if they still exist after remediation).
+        try:
+            from ai_ready.storage.persistence import update_signal_lifecycle_post_verification
+            # Determine which signals were resolved vs still remaining
+            resolved_signal_ids = list(before_signal_ids - after_signal_ids)
+            remaining_signal_ids = list(target_signal_ids & after_signal_ids)
+
+            if assessment_store and hasattr(assessment_store, '_store'):
+                # assessment_store is an AssessmentStore wrapper around CockroachDBStore
+                db_store = assessment_store._store
+                if resolved_signal_ids:
+                    update_signal_lifecycle_post_verification(
+                        store=db_store,
+                        signal_ids=resolved_signal_ids,
+                        assessment_id=after_assessment.assessment_id,
+                        status="resolved",
+                    )
+                if remaining_signal_ids:
+                    update_signal_lifecycle_post_verification(
+                        store=db_store,
+                        signal_ids=remaining_signal_ids,
+                        assessment_id=after_assessment.assessment_id,
+                        status="recurring",
+                    )
+        except Exception as e:
+            logger.debug(f"Signal lifecycle transition skipped: {e}")
+
         # Update DecisionTrace with verification reasoning
         decision_trace = DecisionTrace.from_dict(state.get("decision_trace", {}))
         decision_trace.execution_summary = (

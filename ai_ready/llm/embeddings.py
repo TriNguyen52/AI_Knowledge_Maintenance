@@ -202,10 +202,14 @@ class HuggingFaceEmbedder:
 
 
 class EmbeddingProvider:
-    """Unified embedding provider with automatic fallback.
+    """Unified embedding provider with backend stickiness.
 
-    Tries HuggingFace API first, falls back to TF-IDF on any failure.
-    This ensures embeddings always work, even offline or rate-limited.
+    Tries HuggingFace API first, falls back to TF-IDF on the *first*
+    failure.  Once a backend succeeds, it becomes the *sticky* backend
+    for the process lifetime — subsequent failures do NOT silently
+    switch backends.  Instead, they log loudly and raise, so operators
+    notice the degradation rather than getting silently inconsistent
+    embeddings.
 
     Usage:
         provider = EmbeddingProvider()
@@ -222,24 +226,66 @@ class EmbeddingProvider:
         self._hf = HuggingFaceEmbedder(dim=dim)
         self._hf_success_count = 0
         self._tfidf_fallback_count = 0
+        # Backend stickiness (Fix 6): once a backend succeeds, lock it.
+        self._sticky_backend: str | None = None  # "huggingface" or "tfidf"
 
     def fit(self, corpus: list[str]) -> "EmbeddingProvider":
         """Fit the TF-IDF fallback on a corpus."""
         self._tfidf.fit(corpus)
         return self
 
-    def embed(self, text: str) -> list[float]:
-        """Embed text, trying HuggingFace first, falling back to TF-IDF."""
-        result = self._hf.embed(text)
-        if result is not None:
-            self._hf_success_count += 1
-            return result
+    @property
+    def active_backend(self) -> str:
+        """Return the name of the currently sticky backend, or 'uninitialized'."""
+        return self._sticky_backend or "uninitialized"
 
-        self._tfidf_fallback_count += 1
-        return self._tfidf.embed(text)
+    def embed(self, text: str) -> list[float]:
+        """Embed text with backend stickiness.
+
+        If no backend has succeeded yet, try HuggingFace first, then
+        TF-IDF.  Once a backend succeeds, it becomes sticky — subsequent
+        calls use the same backend.  If the sticky backend fails, log
+        loudly and raise rather than silently switching.
+        """
+        # First embedding ever — try HF, fall back to TF-IDF
+        if self._sticky_backend is None:
+            result = self._hf.embed(text)
+            if result is not None:
+                self._sticky_backend = "huggingface"
+                self._hf_success_count += 1
+                return result
+            # HF failed on first try — use TF-IDF and stick with it
+            self._sticky_backend = "tfidf"
+            self._tfidf_fallback_count += 1
+            logger.warning(
+                "Embedding backend: HuggingFace unavailable on first call, "
+                "sticking with TF-IDF for process lifetime."
+            )
+            return self._tfidf.embed(text)
+
+        # Sticky backend is set — use it exclusively
+        if self._sticky_backend == "huggingface":
+            result = self._hf.embed(text)
+            if result is not None:
+                self._hf_success_count += 1
+                return result
+            # Sticky backend failed — do NOT silently switch
+            logger.error(
+                "Embedding backend STICKINESS VIOLATION: HuggingFace was "
+                "the sticky backend but failed. Raising to alert operators. "
+                "If you need to switch backends, restart the process."
+            )
+            raise RuntimeError(
+                "Sticky embedding backend 'huggingface' failed. "
+                "Restart the process to re-select a backend."
+            )
+        else:
+            # TF-IDF is sticky — it's local and should never fail
+            self._tfidf_fallback_count += 1
+            return self._tfidf.embed(text)
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Embed multiple texts with fallback."""
+        """Embed multiple texts with the sticky backend."""
         return [self.embed(t) for t in texts]
 
     @property
@@ -249,15 +295,18 @@ class EmbeddingProvider:
             "huggingface_calls": self._hf_success_count,
             "tfidf_fallbacks": self._tfidf_fallback_count,
             "total_embeddings": self._hf_success_count + self._tfidf_fallback_count,
+            "sticky_backend": self._sticky_backend or "none",
         }
 
     @property
     def backend_status(self) -> str:
         """Human-readable status of the embedding backend."""
-        if self._hf._available and self._hf_success_count > 0:
-            return "huggingface (with tfidf fallback)"
+        if self._sticky_backend == "huggingface":
+            return "huggingface (sticky)"
+        elif self._sticky_backend == "tfidf":
+            return "tfidf (sticky — HF unavailable or failed)"
         elif self._hf._available:
-            return "huggingface available, tfidf used (check HF token/rate limits)"
+            return "huggingface available, not yet used (will try HF first)"
         else:
             return "tfidf only (set HF_TOKEN for neural embeddings)"
 
@@ -290,3 +339,54 @@ def embed_text(text: str, corpus: list[str] | None = None) -> list[float]:
     if corpus and not _default_provider._tfidf._fitted:
         _default_provider.fit(corpus)
     return _default_provider.embed(text)
+
+
+def embed_artifacts(
+    artifacts: list[Any],
+    corpus_texts: list[str] | None = None,
+) -> list[list[float]]:
+    """Embed a batch of artifacts using a shared, fit-once embedder.
+
+    Promotes demo behavior P3: the embedder is fitted once on the full
+    corpus (all artifact texts), then reused for every artifact embedding.
+    This ensures IDF weights are consistent across the corpus and avoids
+    re-fitting per artifact.
+
+    Args:
+        artifacts: List of objects with a ``content`` attribute or a
+            ``_artifact_to_text``-compatible structure.  Each is converted
+            to text and embedded.
+        corpus_texts: Optional pre-extracted corpus texts.  If not
+            provided, texts are extracted from ``artifacts``.
+
+    Returns:
+        List of 384-dim embedding vectors, one per artifact (same order).
+    """
+    provider = get_embedder()
+
+    # Extract texts from artifacts
+    texts: list[str] = []
+    for art in artifacts:
+        if isinstance(art, str):
+            texts.append(art)
+        elif hasattr(art, "content") and hasattr(art.content, "headings"):
+            # KnowledgeArtifact-like object
+            parts: list[str] = []
+            if hasattr(art, "title") and art.title:
+                parts.append(f"# {art.title}")
+            for h in art.content.headings:
+                parts.append(f"{'#' * h.level} {h.text}")
+            for p in getattr(art.content, "paragraphs", []):
+                parts.append(p.text)
+            texts.append("\n\n".join(parts))
+        elif hasattr(art, "content") and isinstance(art.content, str):
+            texts.append(art.content)
+        else:
+            texts.append(str(art))
+
+    # Fit-once on the full corpus
+    if not provider._tfidf._fitted:
+        provider.fit(corpus_texts or texts)
+
+    # Batch embed
+    return provider.embed_batch(texts)
