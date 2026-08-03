@@ -26,9 +26,9 @@ AI-Ready is a deterministic knowledge observability platform that evaluates know
 - **Issue Prioritization** — ranks problems by their expected impact on AI reasoning, so the most consequential issues are addressed first.
 - **Continuous Improvement Loop** — generates proposals via LLM, applies changes after human approval, and verifies whether the knowledge actually improved.
 - **Feedback Loop Memory** — tracks which proposals worked and which failed (EMA-scored), so the agent gets progressively better at resolving recurring problem types.
-- **Workflow Orchestration** — Apache Burr state machine with resumable approval checkpoints, workflow forking after failed attempts, and automatic regression test generation.
+- **Workflow Orchestration** — Apache Burr state machine with approval checkpoints, workflow forking after failed attempts, and automatic regression test generation. Workflow state is snapshotted to CockroachDB at each transition and can be resumed via `ImprovementManager.resume_workflow()` after a process restart (requires the same dependencies to be re-injected).
 - **Persistent Agent Memory** — CockroachDB stores artifacts with vector embeddings, signals, assessments, agent workflow state, and remediation history. The agent reads its own past outcomes before making new decisions.
-- **MCP Server** — 11 tools that let external AI agents (Claude Code, Cursor, VS Code Copilot) query the knowledge maintenance agent's memory.
+- **MCP Server** — 11 read-only SQL queries designed for the [CockroachDB managed MCP server](https://www.cockroachlabs.com/blog/cockroachdb-ai-agents-managed-mcp-server/). External AI agents (Claude Code, Cursor, VS Code Copilot) connect to the CockroachDB managed MCP server and run the queries in [`docs/mcp_queries.md`](docs/mcp_queries.md) to query the knowledge maintenance agent's memory.
 - **Incremental Assessment** — only re-runs collectors affected by changes, with git-based change detection.
 
 ## Quick Start
@@ -202,7 +202,7 @@ AI-Ready supports multiple LLM providers for the improvement workflow:
 | Provider | Models | Use Case |
 |----------|--------|----------|
 | **Groq** | llama-3.3-70b-versatile | Free-tier demos, fast inference |
-| **AWS Bedrock** | Claude 3.5 Sonnet, Titan Embeddings | Production deployment |
+| **AWS Bedrock** | Claude 3.5 Sonnet, Titan Embeddings | Production deployment on AWS |
 | **OpenAI** | GPT-4o | Alternative provider |
 | **Anthropic** | Claude 3.5 Sonnet | Direct API access |
 | **Ollama** | Local models | Fully offline |

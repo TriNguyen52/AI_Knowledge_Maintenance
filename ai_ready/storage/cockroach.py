@@ -194,28 +194,43 @@ class CockroachDBStore:
         self._initialized = True
 
     def _execute(self, query: str, params: tuple = ()) -> Any:
-        """Execute a query and return the cursor."""
+        """Execute a write query and return None (cursor is closed).
+
+        For write operations (INSERT/UPDATE/DELETE), the cursor is closed
+        immediately after execute.  For read operations, use
+        ``_execute_fetchone`` or ``_execute_fetchall`` which also close
+        the cursor after fetching.
+        """
         cur = self.conn.cursor()
-        cur.execute(query, params)
-        return cur
+        try:
+            cur.execute(query, params)
+        finally:
+            cur.close()
+        return None
 
     def _execute_fetchone(self, query: str, params: tuple = ()) -> dict[str, Any] | None:
         """Execute a query and return the first row as a dict."""
-        cur = self._execute(query, params)
-        row = cur.fetchone()
-        cur.close()
-        if row is None:
-            return None
-        cols = [desc[0] for desc in cur.description]
-        return dict(zip(cols, row))
+        cur = self.conn.cursor()
+        try:
+            cur.execute(query, params)
+            row = cur.fetchone()
+            if row is None:
+                return None
+            cols = [desc[0] for desc in cur.description]
+            return dict(zip(cols, row))
+        finally:
+            cur.close()
 
     def _execute_fetchall(self, query: str, params: tuple = ()) -> list[dict[str, Any]]:
         """Execute a query and return all rows as dicts."""
-        cur = self._execute(query, params)
-        rows = cur.fetchall()
-        cols = [desc[0] for desc in cur.description]
-        cur.close()
-        return [dict(zip(cols, row)) for row in rows]
+        cur = self.conn.cursor()
+        try:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+            return [dict(zip(cols, row)) for row in rows]
+        finally:
+            cur.close()
 
     # ------------------------------------------------------------------
     # Knowledge Artifacts (with vector embeddings)

@@ -62,7 +62,7 @@ EXPECTED_VALUES: list[tuple[str, str, Any]] = [
     ("ai_ready.improvement.salience", "W_ENCODING", 0.40),
     ("ai_ready.improvement.salience", "W_OUTCOME", 0.25),
     ("ai_ready.improvement.salience", "W_RETRIEVAL", 0.35),
-    ("ai_ready.improvement.salience", "DEFAULT_SALIENCE_THRESHOLD", 0.15),
+    ("ai_ready.improvement.salience", "DEFAULT_SALIENCE_THRESHOLD", 0.01),
     # --- salience.py: decay parameters ---
     ("ai_ready.improvement.salience", "FAST_HALF_LIFE_DAYS", 21.0),
     ("ai_ready.improvement.salience", "SLOW_HALF_LIFE_DAYS", 180.0),

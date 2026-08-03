@@ -819,8 +819,20 @@ def execute_change(state: State, executor: Any = None) -> State:
     from ai_ready.improvement.salience import check_edit_budget
     budget_violations: list[dict[str, Any]] = []
     for uri in artifact_uris:
+        # Read the original content so check_edit_budget can compute a
+        # real text diff instead of falling back to static weights.
+        original_content = None
+        if hasattr(executor, "_resolve_path"):
+            file_path = executor._resolve_path(uri)
+            if file_path is not None:
+                try:
+                    original_content = file_path.read_text(encoding="utf-8")
+                except Exception:
+                    original_content = None
+
         within_budget, edit_delta, reason = check_edit_budget(
-            modification_steps, uri
+            modification_steps, uri,
+            original_content=original_content,
         )
         if not within_budget:
             budget_violations.append({

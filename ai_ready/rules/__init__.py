@@ -120,3 +120,9 @@ from ai_ready.rules.topic_purity import TopicPurityCollector  # noqa: E402, F401
 from ai_ready.rules.heading_quality import HeadingQualityCollector  # noqa: E402, F401
 from ai_ready.rules.context_independence import ContextIndependenceCollector  # noqa: E402, F401
 from ai_ready.rules.link_integrity import LinkIntegrityCollector  # noqa: E402, F401
+from ai_ready.rules.terminology_consistency import TerminologyConsistencyCollector  # noqa: E402, F401
+from ai_ready.rules.contradiction_detection import ContradictionDetectionCollector  # noqa: E402, F401
+from ai_ready.rules.canonical_source import CanonicalSourceCollector  # noqa: E402, F401
+from ai_ready.rules.freshness import FreshnessCollector  # noqa: E402, F401
+from ai_ready.rules.knowledge_connectivity import KnowledgeConnectivityCollector  # noqa: E402, F401
+from ai_ready.rules.workflow_completeness import WorkflowCompletenessCollector  # noqa: E402, F401

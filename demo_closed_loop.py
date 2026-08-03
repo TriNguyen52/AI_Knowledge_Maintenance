@@ -56,7 +56,7 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-DEFAULT_SOURCE = Path("C:/Users/jacks/Documents/khe-validation/fastapi")
+DEFAULT_SOURCE = Path("./fastapi/docs/en/docs")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -217,9 +217,21 @@ def persist_to_cockroach(store, assessment, artifacts, source, git_commit):
     )
 
     embedder = get_embedder()
-    print(f"  Artifacts saved: {result['artifact_count']} (embeddings: {embedder.backend_status})")
-    print(f"  Signals saved: {result['signal_count']} (with lifecycle tracking)")
-    print(f"  Assessment saved: {result['assessment_id']}")
+
+    # Read-back: verify artifacts, signals, and assessment were actually persisted
+    artifact_count_db = store._execute_fetchone(
+        "SELECT COUNT(*) as cnt FROM knowledge_artifacts WHERE source = %s", (source,)
+    )
+    signal_count_db = store._execute_fetchone(
+        "SELECT COUNT(*) as cnt FROM knowledge_signals"
+    )
+    assessment_db = store._execute_fetchone(
+        "SELECT assessment_id FROM knowledge_assessments WHERE assessment_id = %s",
+        (result["assessment_id"],),
+    )
+    print(f"  Artifacts in DB: {artifact_count_db['cnt'] if artifact_count_db else 0} (embeddings: {embedder.backend_status})")
+    print(f"  Signals in DB: {signal_count_db['cnt'] if signal_count_db else 0} (with lifecycle tracking)")
+    print(f"  Assessment in DB: {assessment_db['assessment_id'] if assessment_db else 'NOT FOUND'}")
 
     # Demonstrate vector search (CockroachDB distributed vector index)
     subheader("Vector Search (CockroachDB <=> cosine distance)")
@@ -236,7 +248,7 @@ def persist_to_cockroach(store, assessment, artifacts, source, git_commit):
     return AssessmentRecord(
         assessment_id=result["assessment_id"],
         score=float(assessment.score),
-        dimensions=json.dumps({d.dimension: d.score for d in assessment.dimensions}),
+        dimensions=json.dumps({name: d.score for name, d in assessment.dimensions.items()}),
         signals_count=result["signal_count"],
         metadata=json.dumps({"source": source, "git_commit": git_commit}),
     )
@@ -346,14 +358,21 @@ def run_improvement(
     print(f"  Workflow started: app_id={app_id}")
     print(f"  Elapsed: {t1-t0:.1f}s")
 
-    # P7: Agent state is now persisted by ImprovementManager automatically
-    # when cockroach_store is passed to the constructor.
-    print(f"  Agent state persisted to CockroachDB (status=active)")
+    # P7: Agent state is persisted by ImprovementManager automatically
+    # when cockroach_store is passed to the constructor. Read back to verify.
+    agent_state_db = cockroach_store.get_agent_state(app_id)
+    if agent_state_db:
+        print(f"  Agent state in DB: status={agent_state_db.get('status', 'unknown')}, stage={agent_state_db.get('current_stage', 'unknown')}")
+    else:
+        print(f"  Agent state NOT FOUND in CockroachDB")
 
     # Show state at approval checkpoint
     state = manager.get_state(app_id)
     print(f"  Stage: {state.get('current_stage', 'unknown')}")
-    print(f"  Agent state updated (status=paused at approval checkpoint)")
+    # Read back the paused state
+    agent_state_paused = cockroach_store.get_agent_state(app_id)
+    if agent_state_paused:
+        print(f"  Agent state in DB: status={agent_state_paused.get('status', 'unknown')}")
 
     root_causes = state.get("root_cause_analysis", [])
     problems = state.get("knowledge_problems", [])
@@ -457,15 +476,18 @@ def run_improvement(
     verification = final_state.get("verification_results", {})
     overall_outcome = verification.get("overall_outcome", "unknown")
     new_status = "resolved" if overall_outcome in ("resolved", "improved", "partially_resolved") else "persistent"
-    print(f"  Signals transitioned to status={new_status} (by verify_improvement)")
-    # Show lifecycle summary
+    # Read back signal lifecycle state from CockroachDB
     try:
         new_signals = cockroach_store.get_signals_by_status("new")
         resolved_signals = cockroach_store.get_signals_by_status("resolved")
         persistent_signals = cockroach_store.get_signals_by_status("persistent")
-        print(f"  Signal lifecycle: new={len(new_signals)}, "
+        print(f"  Signal lifecycle (read from DB): new={len(new_signals)}, "
               f"persistent={len(persistent_signals)}, "
               f"resolved={len(resolved_signals)}")
+        if resolved_signals and new_status == "resolved":
+            print(f"  Confirmed: {len(resolved_signals)} signal(s) now in resolved status")
+        elif persistent_signals and new_status == "persistent":
+            print(f"  Confirmed: {len(persistent_signals)} signal(s) in persistent status")
     except Exception as e:
         print(f"  (Lifecycle summary unavailable: {e})")
 
@@ -654,101 +676,104 @@ def main() -> None:
     # Connect to CockroachDB
     cockroach_store = connect_cockroach()
 
-    # Load knowledge and assess (shared across both runs)
-    pipeline, assessment, artifacts, relationships, source_str, git_commit = (
-        load_and_assess(source, args.limit)
-    )
+    try:
+      # Load knowledge and assess (shared across both runs)
+      pipeline, assessment, artifacts, relationships, source_str, git_commit = (
+          load_and_assess(source, args.limit)
+      )
 
-    # Persist to CockroachDB with vector embeddings (demonstrates distributed vector index)
-    persist_to_cockroach(cockroach_store, assessment, artifacts, source_str, git_commit)
+      # Persist to CockroachDB with vector embeddings (demonstrates distributed vector index)
+      persist_to_cockroach(cockroach_store, assessment, artifacts, source_str, git_commit)
 
-    # Set up LLM gateway (optional — falls back to heuristics if not available)
-    llm_gateway = None
-    groq_key = os.environ.get("GROQ_API_KEY", "")
-    if groq_key:
-        try:
-            from ai_ready.llm.gateway import LLMGateway
-            llm_gateway = LLMGateway(
-                provider="groq",
-                api_key=groq_key,
-                default_model="llama-3.3-70b-versatile",
-            )
-            print(f"\n  LLM: Groq (llama-3.3-70b-versatile)")
-        except Exception as e:
-            print(f"\n  LLM: unavailable ({e}), using heuristics")
-    else:
-        print(f"\n  LLM: no GROQ_API_KEY, using heuristics")
+      # Set up LLM gateway (optional — falls back to heuristics if not available)
+      llm_gateway = None
+      groq_key = os.environ.get("GROQ_API_KEY", "")
+      if groq_key:
+          try:
+              from ai_ready.llm.gateway import LLMGateway
+              llm_gateway = LLMGateway(
+                  provider="groq",
+                  api_key=groq_key,
+                  default_model="llama-3.3-70b-versatile",
+              )
+              print(f"\n  LLM: Groq (llama-3.3-70b-versatile)")
+          except Exception as e:
+              print(f"\n  LLM: unavailable ({e}), using heuristics")
+      else:
+          print(f"\n  LLM: no GROQ_API_KEY, using heuristics")
 
-    # --- Backup artifact files so we can restore after demo ---
-    import shutil
-    backup_dir = None
-    source_path = Path(source_str)
-    if not args.no_backup:
-        backup_dir = Path(".ai-ready/file_backup")
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir)
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        backed_up = 0
-        for a in artifacts:
-            src_file = source_path / a.uri
-            if src_file.exists():
-                dst_file = backup_dir / a.uri
-                dst_file.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src_file, dst_file)
-                backed_up += 1
-        print(f"\n  Backed up {backed_up} files to {backup_dir}")
-    else:
-        print(f"\n  Backup skipped (--no-backup)")
+      # --- Backup artifact files so we can restore after demo ---
+      import shutil
+      backup_dir = None
+      source_path = Path(source_str)
+      if not args.no_backup:
+          backup_dir = Path(".ai-ready/file_backup")
+          if backup_dir.exists():
+              shutil.rmtree(backup_dir)
+          backup_dir.mkdir(parents=True, exist_ok=True)
+          backed_up = 0
+          for a in artifacts:
+              src_file = source_path / a.uri
+              if src_file.exists():
+                  dst_file = backup_dir / a.uri
+                  dst_file.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src_file, dst_file)
+                  backed_up += 1
+          print(f"\n  Backed up {backed_up} files to {backup_dir}")
+      else:
+          print(f"\n  Backup skipped (--no-backup)")
 
-    # --- Run N improvement cycles ---
-    for run_idx in range(1, args.runs + 1):
-        label = f"{run_idx} ({'no history' if run_idx == 1 else 'with CockroachDB history'})"
-        run_improvement(
-            run_label=label,
-            assessment=assessment,
-            pipeline=pipeline,
-            artifacts=artifacts,
-            relationships=relationships,
-            source=source_str,
-            git_commit=git_commit,
-            cockroach_store=cockroach_store,
-            history_db_path=f".ai-ready/closed_loop_run{run_idx}.db",
-            llm_gateway=llm_gateway,
-        )
+      # --- Run N improvement cycles ---
+      for run_idx in range(1, args.runs + 1):
+          label = f"{run_idx} ({'no history' if run_idx == 1 else 'with CockroachDB history'})"
+          run_improvement(
+              run_label=label,
+              assessment=assessment,
+              pipeline=pipeline,
+              artifacts=artifacts,
+              relationships=relationships,
+              source=source_str,
+              git_commit=git_commit,
+              cockroach_store=cockroach_store,
+              history_db_path=f".ai-ready/closed_loop_run{run_idx}.db",
+              llm_gateway=llm_gateway,
+          )
 
-    # --- Show final CockroachDB state ---
-    show_cockroach_memory(cockroach_store)
+      # --- Show final CockroachDB state ---
+      show_cockroach_memory(cockroach_store)
 
-    # --- Restore original files ---
-    if backup_dir:
-        restored = 0
-        for a in artifacts:
-            backup_file = backup_dir / a.uri
-            original_file = source_path / a.uri
-            if backup_file.exists() and original_file.exists():
-                shutil.copy2(backup_file, original_file)
-                restored += 1
-        print(f"\n  Restored {restored} files from backup")
-        shutil.rmtree(backup_dir)
+      # --- Restore original files ---
+      if backup_dir:
+          restored = 0
+          for a in artifacts:
+              backup_file = backup_dir / a.uri
+              original_file = source_path / a.uri
+              if backup_file.exists() and original_file.exists():
+                  shutil.copy2(backup_file, original_file)
+                  restored += 1
+          print(f"\n  Restored {restored} files from backup")
+          shutil.rmtree(backup_dir)
 
-    banner("Demo Complete")
-    print("  The closed loop is now functional:")
-    print()
-    print("    1. Artifacts saved with VECTOR(384) embeddings → semantic search")
-    print("    2. Signals + lifecycle tracked in CockroachDB (new → persistent → resolved)")
-    print("    3. Agent workflow state persisted (active → paused → completed)")
-    print("    4. Run 1 had no history → outcome saved to CockroachDB")
-    print("    5. Run 2 read CockroachDB context → LLM saw Run 1's outcome")
-    print("    6. Run 2's outcome also saved to CockroachDB")
-    print("    7. Run 3 would see BOTH outcomes + decision traces + vector search")
-    print()
-    print("  CockroachDB tools demonstrated:")
-    print("    • Distributed Vector Indexing (VECTOR(384) + <=> cosine distance)")
-    print("    • ACID Transactions (retry on serialization conflicts)")
-    print("    • Agent State Persistence (Burr workflow survives restarts)")
-    print("    • Signal Lifecycle Tracking (NEW → PERSISTENT → RESOLVED)")
-    print("    • Decision Traces (full reasoning chain observability)")
-    print("=" * 72)
+      banner("Demo Complete")
+      print("  The closed loop is now functional:")
+      print()
+      print("    1. Artifacts saved with VECTOR(384) embeddings → semantic search")
+      print("    2. Signals + lifecycle tracked in CockroachDB (new → persistent → resolved)")
+      print("    3. Agent workflow state persisted (active → paused → completed)")
+      print("    4. Run 1 had no history → outcome saved to CockroachDB")
+      print("    5. Run 2 read CockroachDB context → LLM saw Run 1's outcome")
+      print("    6. Run 2's outcome also saved to CockroachDB")
+      print("    7. Run 3 would see BOTH outcomes + decision traces + vector search")
+      print()
+      print("  CockroachDB tools demonstrated:")
+      print("    • Distributed Vector Indexing (VECTOR(384) + <=> cosine distance)")
+      print("    • ACID Transactions (retry on serialization conflicts)")
+      print("    • Agent State Persistence (Burr workflow survives restarts)")
+      print("    • Signal Lifecycle Tracking (NEW → PERSISTENT → RESOLVED)")
+      print("    • Decision Traces (full reasoning chain observability)")
+      print("=" * 72)
+    finally:
+      cockroach_store.close()
 
 
 if __name__ == "__main__":

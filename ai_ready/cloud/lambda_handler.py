@@ -169,91 +169,94 @@ def run_assessment(event: dict[str, Any]) -> dict[str, Any]:
     else:
         store.initialize_schema()
 
-    # 3. Run collectors — CollectOperation.run takes a list of artifacts
-    collect_op = CollectOperation()
-    results, all_signals, artifact_bundle = collect_op.run(
-        artifacts=bundle.artifacts,
-        relationships=bundle.relationships,
-        source=s3_uri,
-    )
+    try:
+      # 3. Run collectors — CollectOperation.run takes a list of artifacts
+      collect_op = CollectOperation()
+      results, all_signals, artifact_bundle = collect_op.run(
+          artifacts=bundle.artifacts,
+          relationships=bundle.relationships,
+          source=s3_uri,
+      )
 
-    # 4. Assess — AssessOperation.run takes results, signals, artifacts, bundle
-    assess_op = AssessOperation()
-    assessment = assess_op.run(
-        results=results,
-        signals=all_signals,
-        artifacts=bundle.artifacts,
-        bundle=artifact_bundle,
-        source=s3_uri,
-    )
+      # 4. Assess — AssessOperation.run takes results, signals, artifacts, bundle
+      assess_op = AssessOperation()
+      assessment = assess_op.run(
+          results=results,
+          signals=all_signals,
+          artifacts=bundle.artifacts,
+          bundle=artifact_bundle,
+          source=s3_uri,
+      )
 
-    # 5. Persist assessment (P4): artifacts+embeddings, signals+lifecycle,
-    #    assessment record — all via canonical persist_assessment()
-    persist_result = persist_assessment(
-        store=store,
-        assessment=assessment,
-        signals=all_signals,
-        artifacts=bundle.artifacts,
-        source=s3_uri,
-        dedup_key=dedup_key,
-    )
-    assessment_record_id = persist_result["assessment_id"]
-    signal_count = persist_result["signal_count"]
-    signal_id_map = persist_result["signal_id_map"]
+      # 5. Persist assessment (P4): artifacts+embeddings, signals+lifecycle,
+      #    assessment record — all via canonical persist_assessment()
+      persist_result = persist_assessment(
+          store=store,
+          assessment=assessment,
+          signals=all_signals,
+          artifacts=bundle.artifacts,
+          source=s3_uri,
+          dedup_key=dedup_key,
+      )
+      assessment_record_id = persist_result["assessment_id"]
+      signal_count = persist_result["signal_count"]
+      signal_id_map = persist_result["signal_id_map"]
 
-    # 8. Discover and rank problems
-    # P8: Use configurable salience threshold (default 0.01)
-    salience_threshold = float(os.environ.get("SALIENCE_THRESHOLD", "0.01"))
-    signal_ids = list(signal_id_map.keys())
-    problems, hypotheses = discover_problems_heuristic(signal_ids, assessment)
-    ranked, saliences, skipped = rank_problems_by_salience(
-        problems, assessment, history_store=None,
-        threshold=salience_threshold,
-    )
+      # 8. Discover and rank problems
+      # P8: Use configurable salience threshold (default 0.01)
+      salience_threshold = float(os.environ.get("SALIENCE_THRESHOLD", "0.01"))
+      signal_ids = list(signal_id_map.keys())
+      problems, hypotheses = discover_problems_heuristic(signal_ids, assessment)
+      ranked, saliences, skipped = rank_problems_by_salience(
+          problems, assessment, history_store=None,
+          threshold=salience_threshold,
+      )
 
-    # Store top problems in queue
-    for problem in ranked[:25]:
-        # Find matching salience decomposition
-        salience_info = next(
-            (s for s in saliences if s.problem_id == problem.problem_id), None
-        )
-        problem_record = ProblemRecord.new(
-            category=problem.category,
-            artifact_uris=problem.artifact_uris,
-            salience=salience_info.total if salience_info else 0.0,
-            encoding_score=salience_info.encoding if salience_info else 0.0,
-            outcome_score=salience_info.outcome if salience_info else 0.0,
-            retrieval_score=salience_info.retrieval if salience_info else 0.0,
-            staleness_factor=salience_info.staleness_factor if salience_info else 1.0,
-            description=problem.description,
-        )
-        store.save_problem(problem_record)
+      # Store top problems in queue
+      for problem in ranked[:25]:
+          # Find matching salience decomposition
+          salience_info = next(
+              (s for s in saliences if s.problem_id == problem.problem_id), None
+          )
+          problem_record = ProblemRecord.new(
+              category=problem.category,
+              artifact_uris=problem.artifact_uris,
+              salience=salience_info.total if salience_info else 0.0,
+              encoding_score=salience_info.encoding if salience_info else 0.0,
+              outcome_score=salience_info.outcome if salience_info else 0.0,
+              retrieval_score=salience_info.retrieval if salience_info else 0.0,
+              staleness_factor=salience_info.staleness_factor if salience_info else 1.0,
+              description=problem.description,
+          )
+          store.save_problem(problem_record)
 
-    elapsed = time.monotonic() - start_time
+      elapsed = time.monotonic() - start_time
 
-    return {
-        "action": "assess",
-        "assessment_id": assessment_record_id,
-        "score": assessment.score,
-        "dimensions": {d.dimension: d.score for d in assessment.dimensions},
-        "artifact_count": len(bundle.artifacts),
-        "signal_count": signal_count,
-        "problems_discovered": len(ranked),
-        "problems_skipped": len(skipped),
-        "top_problems": [
-            {
-                "category": p.category,
-                "description": p.description,
-                "artifact_uris": p.artifact_uris[:3],
-                "salience": next(
-                    (s.total for s in saliences if s.problem_id == p.problem_id), 0.0
-                ),
-            }
-            for p in ranked[:5]
-        ],
-        "elapsed_seconds": round(elapsed, 2),
-        "source": s3_uri,
-    }
+      return {
+          "action": "assess",
+          "assessment_id": assessment_record_id,
+          "score": assessment.score,
+          "dimensions": {name: d.score for name, d in assessment.dimensions.items()},
+          "artifact_count": len(bundle.artifacts),
+          "signal_count": signal_count,
+          "problems_discovered": len(ranked),
+          "problems_skipped": len(skipped),
+          "top_problems": [
+              {
+                  "category": p.category,
+                  "description": p.description,
+                  "artifact_uris": p.artifact_uris[:3],
+                  "salience": next(
+                      (s.total for s in saliences if s.problem_id == p.problem_id), 0.0
+                  ),
+              }
+              for p in ranked[:5]
+          ],
+          "elapsed_seconds": round(elapsed, 2),
+          "source": s3_uri,
+      }
+    finally:
+      store.close()
 
 
 def run_remediation(event: dict[str, Any]) -> dict[str, Any]:
@@ -285,169 +288,165 @@ def run_remediation(event: dict[str, Any]) -> dict[str, Any]:
     store = CockroachDBStore()
     store.initialize_schema()
 
-    # 2. Set up LLM — standardized on Groq (Fix 0.5/2c)
-    provider_name = os.environ.get("LLM_PROVIDER", "groq")
-    if provider_name == "groq":
-        from ai_ready.llm.groq import GroqProvider
-        provider = GroqProvider()
-    else:
-        from ai_ready.llm.bedrock import BedrockProvider
-        provider = BedrockProvider()
+    try:
+      # 2. Set up LLM — standardized on Groq (Fix 2c)
+      provider_name = os.environ.get("LLM_PROVIDER", "groq")
+      gateway = LLMGateway(provider=provider_name)
 
-    gateway = LLMGateway(provider=provider)
+      # 3. Set up history store
+      history_db_path = os.environ.get("HISTORY_DB_PATH", "/tmp/improvement_history.db")
+      history_store = ImprovementHistoryStore(history_db_path)
+      diagnosis_tracker = DiagnosisQualityTracker()
 
-    # 3. Set up history store
-    history_db_path = os.environ.get("HISTORY_DB_PATH", "/tmp/improvement_history.db")
-    history_store = ImprovementHistoryStore(history_db_path)
-    diagnosis_tracker = DiagnosisQualityTracker()
+      # 4. Get the problem to remediate from the CockroachDB queue
+      problem_id = event.get("problem_id")
+      if problem_id:
+          problems = store.get_problems(status="open", limit=50)
+          target_problem = next(
+              (p for p in problems if p.problem_id == problem_id), None
+          )
+          if target_problem is None:
+              return {"error": f"Problem {problem_id} not found or not open"}
+      else:
+          problems = store.get_problems(status="open", limit=1)
+          if not problems:
+              return {"message": "No open problems in the queue"}
+          target_problem = problems[0]
 
-    # 4. Get the problem to remediate from the CockroachDB queue
-    problem_id = event.get("problem_id")
-    if problem_id:
-        problems = store.get_problems(status="open", limit=50)
-        target_problem = next(
-            (p for p in problems if p.problem_id == problem_id), None
-        )
-        if target_problem is None:
-            return {"error": f"Problem {problem_id} not found or not open"}
-    else:
-        problems = store.get_problems(status="open", limit=1)
-        if not problems:
-            return {"message": "No open problems in the queue"}
-        target_problem = problems[0]
+      # 5. Build a minimal assessment object for the manager
+      # ImprovementManager.start_improvement takes a KnowledgeAssessment
+      latest_assessment = store.get_latest_assessment()
+      if latest_assessment is None:
+          return {"error": "No assessment found — run assessment first"}
 
-    # 5. Build a minimal assessment object for the manager
-    # ImprovementManager.start_improvement takes a KnowledgeAssessment
-    latest_assessment = store.get_latest_assessment()
-    if latest_assessment is None:
-        return {"error": "No assessment found — run assessment first"}
+      # Reconstruct a lightweight assessment-like object
+      from ai_ready.models import KnowledgeAssessment, DimensionScore
+      import uuid as uuid_mod
 
-    # Reconstruct a lightweight assessment-like object
-    from ai_ready.models import KnowledgeAssessment, DimensionScore
-    import uuid as uuid_mod
+      dimensions_json = json.loads(latest_assessment.dimensions) if isinstance(latest_assessment.dimensions, str) else latest_assessment.dimensions
+      assessment = KnowledgeAssessment(
+          assessment_id=latest_assessment.assessment_id,
+          score=latest_assessment.score,
+          dimensions={
+              k: DimensionScore(name=k, score=float(v["score"]) if isinstance(v, dict) else float(v))
+              for k, v in dimensions_json.items()
+          },
+          signals=[],
+          artifact_count=0,
+      )
 
-    dimensions_json = json.loads(latest_assessment.dimensions) if isinstance(latest_assessment.dimensions, str) else latest_assessment.dimensions
-    assessment = KnowledgeAssessment(
-        assessment_id=latest_assessment.assessment_id,
-        score=latest_assessment.score,
-        dimensions=[
-            DimensionScore(dimension=k, score=v)
-            for k, v in dimensions_json.items()
-        ],
-        signals=[],
-        artifact_count=0,
-    )
+      # 6. Retrieve historical context from CockroachDB (closed-loop memory)
+      # The agent reads past outcomes to inform its current decision — this is
+      # what makes it an agentic memory, not just a data store.
+      # Fix 2a: Define artifact_uris from the problem record before use
+      artifact_uris = target_problem.artifact_uris if hasattr(target_problem, 'artifact_uris') else []
+      remediation_context = store.get_remediation_context(target_problem.category)
+      similar_problems = store.get_similar_problems(
+          target_problem.category, artifact_uris
+      )
 
-    # 6. Retrieve historical context from CockroachDB (closed-loop memory)
-    # The agent reads past outcomes to inform its current decision — this is
-    # what makes it an agentic memory, not just a data store.
-    # Fix 2a: Define artifact_uris from the problem record before use
-    artifact_uris = target_problem.artifact_uris if hasattr(target_problem, 'artifact_uris') else []
-    remediation_context = store.get_remediation_context(target_problem.category)
-    similar_problems = store.get_similar_problems(
-        target_problem.category, artifact_uris
-    )
+      # 7. Set up the manager and start the improvement workflow
+      manager = ImprovementManager(
+          llm_gateway=gateway,
+          history_store=history_store,
+          diagnosis_quality_tracker=diagnosis_tracker,
+          cockroach_store=store,  # P7: enables agent-state persistence
+      )
 
-    # 7. Set up the manager and start the improvement workflow
-    manager = ImprovementManager(
-        llm_gateway=gateway,
-        history_store=history_store,
-        diagnosis_quality_tracker=diagnosis_tracker,
-        cockroach_store=store,  # P7: enables agent-state persistence
-    )
+      app_id = manager.start_improvement(
+          assessment=assessment,
+          artifact_uris=artifact_uris,
+      )
 
-    app_id = manager.start_improvement(
-        assessment=assessment,
-        artifact_uris=artifact_uris,
-    )
+      # 8. Agent state is now persisted by ImprovementManager (P7)
+      # when cockroach_store is passed to the constructor above.
 
-    # 8. Agent state is now persisted by ImprovementManager (P7)
-    # when cockroach_store is passed to the constructor above.
+      # 9. Auto-approve and complete the workflow
+      # In production this would be a human-in-the-loop checkpoint:
+      #   store.update_agent_status(app_id, "paused")
+      #   return {"app_id": app_id, "status": "awaiting_approval"}
+      final_state = manager.approve_and_complete(
+          app_id=app_id,
+          approved=True,
+          reason="Auto-approved by Lambda remediation handler",
+      )
 
-    # 9. Auto-approve and complete the workflow
-    # In production this would be a human-in-the-loop checkpoint:
-    #   store.update_agent_status(app_id, "paused")
-    #   return {"app_id": app_id, "status": "awaiting_approval"}
-    final_state = manager.approve_and_complete(
-        app_id=app_id,
-        approved=True,
-        reason="Auto-approved by Lambda remediation handler",
-    )
+      # 10. Agent state at completion is also persisted by ImprovementManager (P7)
 
-    # 10. Agent state at completion is also persisted by ImprovementManager (P7)
+      # 11. Extract outcome from final state
+      verification_outcome = final_state.get("verification_outcome", "unchanged")
+      score_before = final_state.get("score_before", 0.0)
+      score_after = final_state.get("score_after", 0.0)
+      strategy = final_state.get("strategy", "unknown")
+      proposal_reasoning = final_state.get("proposal_reasoning", "")
+      tokens_used = final_state.get("total_tokens", 0)
+      forked = final_state.get("forked", False)
 
-    # 11. Extract outcome from final state
-    verification_outcome = final_state.get("verification_outcome", "unchanged")
-    score_before = final_state.get("score_before", 0.0)
-    score_after = final_state.get("score_after", 0.0)
-    strategy = final_state.get("strategy", "unknown")
-    proposal_reasoning = final_state.get("proposal_reasoning", "")
-    tokens_used = final_state.get("total_tokens", 0)
-    forked = final_state.get("forked", False)
+      # 12. Store outcome in CockroachDB (institutional memory)
+      record = RemediationRecord.new(
+          issue_type=target_problem.category,
+          strategy=strategy,
+          strategy_description=final_state.get("strategy_description", ""),
+          verification_outcome=verification_outcome,
+          score_before=score_before,
+          score_after=score_after,
+          proposal_reasoning=proposal_reasoning,
+          tokens_used=tokens_used,
+          latency_ms=(time.monotonic() - start_time) * 1000,
+          forked=forked,
+      )
+      store.save_remediation_outcome(record)
 
-    # 12. Store outcome in CockroachDB (institutional memory)
-    record = RemediationRecord.new(
-        issue_type=target_problem.category,
-        strategy=strategy,
-        strategy_description=final_state.get("strategy_description", ""),
-        verification_outcome=verification_outcome,
-        score_before=score_before,
-        score_after=score_after,
-        proposal_reasoning=proposal_reasoning,
-        tokens_used=tokens_used,
-        latency_ms=(time.monotonic() - start_time) * 1000,
-        forked=forked,
-    )
-    store.save_remediation_outcome(record)
+      # 13. Update problem status based on verification outcome
+      if verification_outcome == "resolved":
+          store.update_problem_status(target_problem.problem_id, "resolved")
+      elif verification_outcome == "partially_resolved":
+          store.update_problem_status(target_problem.problem_id, "in_progress")
 
-    # 13. Update problem status based on verification outcome
-    if verification_outcome == "resolved":
-        store.update_problem_status(target_problem.problem_id, "resolved")
-    elif verification_outcome == "partially_resolved":
-        store.update_problem_status(target_problem.problem_id, "in_progress")
+      # 14. Store decision traces from the workflow
+      proposals = final_state.get("proposals", [])
+      if proposals:
+          store.save_decision_trace(
+              outcome_id=record.outcome_id,
+              stage="proposal_generation",
+              reasoning=json.dumps(proposals, default=str),
+              llm_metadata={"proposal_count": len(proposals)},
+          )
 
-    # 14. Store decision traces from the workflow
-    proposals = final_state.get("proposals", [])
-    if proposals:
-        store.save_decision_trace(
-            outcome_id=record.outcome_id,
-            stage="proposal_generation",
-            reasoning=json.dumps(proposals, default=str),
-            llm_metadata={"proposal_count": len(proposals)},
-        )
+      diagnosis = final_state.get("diagnosis", {})
+      if diagnosis:
+          store.save_decision_trace(
+              outcome_id=record.outcome_id,
+              stage="root_cause_analysis",
+              reasoning=json.dumps(diagnosis, default=str),
+              llm_metadata={},
+          )
 
-    diagnosis = final_state.get("diagnosis", {})
-    if diagnosis:
-        store.save_decision_trace(
-            outcome_id=record.outcome_id,
-            stage="root_cause_analysis",
-            reasoning=json.dumps(diagnosis, default=str),
-            llm_metadata={},
-        )
+      elapsed = time.monotonic() - start_time
 
-    elapsed = time.monotonic() - start_time
-
-    return {
-        "action": "remediate",
-        "problem_id": target_problem.problem_id,
-        "problem_category": target_problem.category,
-        "outcome_id": record.outcome_id,
-        "app_id": app_id,
-        "verification_outcome": verification_outcome,
-        "score_before": score_before,
-        "score_after": score_after,
-        "score_delta": score_after - score_before,
-        "strategy": strategy,
-        "tokens_used": tokens_used,
-        "forked": forked,
-        "context_used": {
-            "past_attempts": remediation_context.get("total_attempts", 0),
-            "successful_strategies": len(remediation_context.get("successful_strategies", [])),
-            "failed_strategies": len(remediation_context.get("failed_strategies", [])),
-            "similar_problems": len(similar_problems),
-        },
-        "elapsed_seconds": round(elapsed, 2),
-    }
+      return {
+          "action": "remediate",
+          "problem_id": target_problem.problem_id,
+          "problem_category": target_problem.category,
+          "outcome_id": record.outcome_id,
+          "app_id": app_id,
+          "verification_outcome": verification_outcome,
+          "score_before": score_before,
+          "score_after": score_after,
+          "score_delta": score_after - score_before,
+          "strategy": strategy,
+          "tokens_used": tokens_used,
+          "forked": forked,
+          "context_used": {
+              "past_attempts": remediation_context.get("total_attempts", 0),
+              "successful_strategies": len(remediation_context.get("successful_strategies", [])),
+              "failed_strategies": len(remediation_context.get("failed_strategies", [])),
+              "similar_problems": len(similar_problems),
+          },
+          "elapsed_seconds": round(elapsed, 2),
+      }
+    finally:
+      store.close()
 
 
 def run_status(event: dict[str, Any]) -> dict[str, Any]:
@@ -457,22 +456,25 @@ def run_status(event: dict[str, Any]) -> dict[str, Any]:
     store = CockroachDBStore()
     store.initialize_schema()
 
-    queue_summary = store.get_queue_summary()
-    metrics = store.get_remediation_metrics()
-    latest_assessment = store.get_latest_assessment()
-    skip_events = store.get_skip_events(limit=10)
-    health_trend = store.get_knowledge_health_trend(days=30)
-    active_workflows = store.get_active_workflows()
+    try:
+      queue_summary = store.get_queue_summary()
+      metrics = store.get_remediation_metrics()
+      latest_assessment = store.get_latest_assessment()
+      skip_events = store.get_skip_events(limit=10)
+      health_trend = store.get_knowledge_health_trend(days=30)
+      active_workflows = store.get_active_workflows()
 
-    return {
-        "action": "status",
-        "latest_assessment": latest_assessment.to_dict() if latest_assessment else None,
-        "problem_queue": queue_summary,
-        "remediation_metrics": metrics,
-        "health_trend": health_trend,
-        "active_workflows": active_workflows,
-        "recent_skip_events": skip_events,
-    }
+      return {
+          "action": "status",
+          "latest_assessment": latest_assessment.to_dict() if latest_assessment else None,
+          "problem_queue": queue_summary,
+          "remediation_metrics": metrics,
+          "health_trend": health_trend,
+          "active_workflows": active_workflows,
+          "recent_skip_events": skip_events,
+      }
+    finally:
+      store.close()
 
 
 def _artifact_to_text(artifact: Any) -> str:

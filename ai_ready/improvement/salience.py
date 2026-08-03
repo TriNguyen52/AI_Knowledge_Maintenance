@@ -54,8 +54,11 @@ W_ENCODING = 0.40
 W_OUTCOME = 0.25
 W_RETRIEVAL = 0.35
 
-# Default salience threshold — problems below this are skipped
-DEFAULT_SALIENCE_THRESHOLD = 0.05
+# Default salience threshold — problems below this are skipped.
+# Single source of truth is Config.salience_threshold (config.py).
+# This constant re-exports the config default for backward compatibility.
+from ai_ready.config import Config as _Config
+DEFAULT_SALIENCE_THRESHOLD = _Config.default().salience_threshold
 
 # ---------------------------------------------------------------------------
 # Recency decay parameters (deterministic, no LLM)

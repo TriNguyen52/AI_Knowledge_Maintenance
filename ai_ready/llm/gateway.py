@@ -81,6 +81,12 @@ class LLMGateway:
                 default_model=self._default_model or "llama3",
                 **self._provider_kwargs,
             )
+        elif self._provider_name == "bedrock":
+            from ai_ready.llm.bedrock import BedrockProvider
+            self._provider = BedrockProvider(
+                default_model=self._default_model or "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                **self._provider_kwargs,
+            )
         else:
             raise ValueError(f"Unknown LLM provider: {self._provider_name}")
 

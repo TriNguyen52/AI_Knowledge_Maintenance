@@ -94,6 +94,7 @@ class ImprovementManager:
         diagnosis_quality_tracker: Any = None,
         problem_queue: Any = None,
         cockroach_store: Any = None,
+        config: Any = None,
     ) -> None:
         self.llm_gateway = llm_gateway
         self.assessment_store = assessment_store
@@ -108,6 +109,7 @@ class ImprovementManager:
         self.enable_otel = enable_otel
         self.max_fork_attempts = max_fork_attempts
         self.cockroach_store = cockroach_store
+        self.config = config
 
         # Initialize history store if not provided
         if history_store:
@@ -144,10 +146,14 @@ class ImprovementManager:
             self.problem_queue = problem_queue
         elif history_db_path:
             pq_path = history_db_path.replace(".db", "_problem_queue.db")
+            salience_threshold = (
+                config.salience_threshold if config else None
+            )
             self.problem_queue = ProblemQueue(
                 history_store=self.history_store,
                 db_path=pq_path,
                 signal_store=assessment_store.signal_store if assessment_store else None,
+                salience_threshold=salience_threshold,
             )
         else:
             self.problem_queue = None
@@ -212,32 +218,132 @@ class ImprovementManager:
 
         # P7: Persist agent state at start (active, diagnose stage)
         if self.cockroach_store:
-            try:
-                self.cockroach_store.save_agent_state(
-                    app_id=app_id,
-                    state_data=dict(app.state),
-                    current_stage="diagnose",
-                    assessment_id=assessment_id,
-                    status="active",
-                )
-            except Exception as e:
-                logger.debug(f"Agent state save (start) skipped: {e}")
+            self.cockroach_store.save_agent_state(
+                app_id=app_id,
+                state_data=dict(app.state),
+                current_stage="diagnose",
+                assessment_id=assessment_id,
+                status="active",
+            )
 
         # Run until the approval checkpoint
         run_until_approval(app)
 
         # P7: Persist agent state at pause (paused, awaiting approval)
         if self.cockroach_store:
-            try:
-                self.cockroach_store.save_agent_state(
-                    app_id=app_id,
-                    state_data=dict(app.state),
-                    current_stage=app.state.get("current_stage", "awaiting_approval"),
-                    assessment_id=assessment_id,
-                    status="paused",
-                )
-            except Exception as e:
-                logger.debug(f"Agent state save (paused) skipped: {e}")
+            self.cockroach_store.save_agent_state(
+                app_id=app_id,
+                state_data=dict(app.state),
+                current_stage=app.state.get("current_stage", "awaiting_approval"),
+                assessment_id=assessment_id,
+                status="paused",
+            )
+
+        return app_id
+
+    def resume_workflow(
+        self,
+        app_id: str,
+        assessment: Any,
+        signal_ids: list[str] | None = None,
+        artifact_uris: list[str] | None = None,
+    ) -> str:
+        """Resume a paused workflow from persisted CockroachDB state.
+
+        After a process restart, in-memory Burr apps are lost. This method
+        reconstructs the Burr application graph and restores its state from
+        the snapshot persisted by ``start_improvement`` (status=paused).
+
+        Requirements:
+            - ``cockroach_store`` must be set on this manager instance.
+            - The workflow must have been persisted with status "paused".
+            - The same ``assessment`` object (or an equivalent reconstruction)
+              must be passed so the Burr graph can be rebuilt with correct
+              dependencies.
+
+        Args:
+            app_id: The app_id of the paused workflow.
+            assessment: The KnowledgeAssessment that triggered the workflow.
+            signal_ids: Same signal_ids used in start_improvement.
+            artifact_uris: Same artifact_uris used in start_improvement.
+
+        Returns:
+            The same app_id, now registered in-memory and ready for
+            ``approve_and_complete``.
+
+        Raises:
+            RuntimeError: If cockroach_store is not set or the persisted
+                state is not found.
+        """
+        if not self.cockroach_store:
+            raise RuntimeError(
+                "resume_workflow requires cockroach_store to be set on "
+                "the ImprovementManager instance."
+            )
+
+        # Read persisted state snapshot from CockroachDB
+        persisted = self.cockroach_store.get_agent_state(app_id)
+        if persisted is None:
+            raise RuntimeError(
+                f"No persisted state found for app_id={app_id}. "
+                "The workflow may not have been started or may have "
+                "already completed."
+            )
+
+        if persisted.get("status") != "paused":
+            raise RuntimeError(
+                f"Cannot resume workflow {app_id}: persisted status is "
+                f"'{persisted.get('status')}', expected 'paused'."
+            )
+
+        # Reconstruct signal_ids and artifact_uris if not provided
+        state_data = persisted.get("state_data", {})
+        if signal_ids is None:
+            signal_ids = state_data.get("signal_ids", [])
+        if artifact_uris is None:
+            artifact_uris = state_data.get("affected_artifact_uris", [])
+
+        # Rebuild the Burr application with the same graph
+        assessment_id = state_data.get("assessment_id", assessment.assessment_id)
+        remediation_id = state_data.get("remediation_id", str(uuid.uuid4()))
+
+        initial_state_dict = initial_state(
+            remediation_id=remediation_id,
+            assessment_id=assessment_id,
+            signal_ids=signal_ids,
+            affected_artifact_uris=artifact_uris,
+        )
+
+        app = create_improvement_app(
+            initial_state_dict=initial_state_dict,
+            llm_gateway=self.llm_gateway,
+            assessment_store=self.assessment_store,
+            assessment_pipeline=self.assessment_pipeline,
+            history_store=self.history_store,
+            executor=self.executor,
+            artifacts=self.artifacts,
+            relationships=self.relationships,
+            source=self.source,
+            git_commit=self.git_commit,
+            enable_tracking=self.enable_tracking,
+            enable_otel=self.enable_otel,
+            diagnosis_quality_tracker=self.diagnosis_quality_tracker,
+        )
+
+        # Restore the persisted state into the rebuilt app
+        # The persisted state_data contains the full workflow state at pause
+        restored_state = state_data
+        if restored_state:
+            app.update_state(app.state.update(**restored_state))
+
+        # Register the rebuilt app under the original app_id
+        # Note: Burr generates a new uid on creation, so we override
+        self._apps[app_id] = app
+
+        logger.info(
+            f"Resumed workflow {app_id} from persisted state "
+            f"(stage={persisted.get('current_stage', 'unknown')})"
+        )
 
         return app_id
 
@@ -281,18 +387,15 @@ class ImprovementManager:
 
         # P7: Persist agent state at completion
         if self.cockroach_store:
-            try:
-                stage = final_state.get("current_stage", "completed")
-                status = "completed" if stage == RemediationStatus.COMPLETED.value else "failed"
-                self.cockroach_store.save_agent_state(
-                    app_id=app_id,
-                    state_data=final_state,
-                    current_stage=stage,
-                    assessment_id=final_state.get("assessment_id", ""),
-                    status=status,
-                )
-            except Exception as e:
-                logger.debug(f"Agent state save (completed) skipped: {e}")
+            stage = final_state.get("current_stage", "completed")
+            status = "completed" if stage == RemediationStatus.COMPLETED.value else "failed"
+            self.cockroach_store.save_agent_state(
+                app_id=app_id,
+                state_data=final_state,
+                current_stage=stage,
+                assessment_id=final_state.get("assessment_id", ""),
+                status=status,
+            )
 
         # Record outcome in history
         self._record_outcome(app_id, final_state)

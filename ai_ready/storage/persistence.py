@@ -74,6 +74,10 @@ def persist_assessment(
     4. Storing the assessment record
     5. Returning a summary dict with IDs for downstream use
 
+    All DB writes (artifacts, signals, assessment record, lifecycle) are
+    executed in a single CockroachDB transaction via ``run_transaction``.
+    If any write fails, the entire batch rolls back — no partial state.
+
     Args:
         store: Connected CockroachDBStore instance.
         assessment: The KnowledgeAssessment from the pipeline.
@@ -88,7 +92,11 @@ def persist_assessment(
         Dict with keys: assessment_id, signal_count, artifact_count,
         signal_id_map (internal_id → db_signal_id).
     """
-    # 1. Embed and store artifacts
+    import json as _json
+    from datetime import datetime, timezone
+
+    # 0. Pre-compute embeddings (outside the transaction — no DB needed)
+    artifact_records: list[tuple[ArtifactRecord, list[float] | None]] = []
     if embed and artifacts:
         embeddings = embed_artifacts(artifacts)
         for artifact, emb in zip(artifacts, embeddings):
@@ -101,15 +109,25 @@ def persist_assessment(
                 metadata=artifact.metadata if hasattr(artifact, "metadata") else {},
                 embedding=emb,
             )
-            store.save_artifact(record)
+            artifact_records.append((record, emb))
+    elif artifacts:
+        for artifact in artifacts:
+            content_text = _artifact_to_text(artifact)
+            record = ArtifactRecord.new(
+                artifact_uri=artifact.uri,
+                artifact_type="document",
+                source=source,
+                content=content_text,
+                metadata=artifact.metadata if hasattr(artifact, "metadata") else {},
+            )
+            artifact_records.append((record, None))
 
-    # 2. Store signals with stable signal_ids (P5)
+    # 1. Pre-build signal records with stable IDs (P5)
     signal_count = 0
     signal_id_map: dict[str, str] = {}
+    signal_records: list[SignalRecord] = []
     for signal in signals:
-        # Use the signal's own stable signal_id (P5) — don't regenerate
         sig_id = signal.signal_id if hasattr(signal, "signal_id") and signal.signal_id else f"sig_{signal_count}"
-
         signal_record = SignalRecord.new(
             artifact_uri=signal.artifact_uri,
             collector_id=signal.collector_id,
@@ -120,16 +138,15 @@ def persist_assessment(
             ai_impact=signal.ai_impact or "",
             evidence=signal.evidence if isinstance(signal.evidence, dict) else {},
         )
-        # Override the random UUID with the stable signal_id (P5)
         signal_record.signal_id = sig_id
-        store.save_signal(signal_record)
+        signal_records.append(signal_record)
         signal_id_map[sig_id] = sig_id
         signal_count += 1
 
-    # 3. Store assessment record
+    # 2. Pre-build assessment record
     assessment_record = AssessmentRecord.new(
         score=assessment.score,
-        dimensions={d.dimension: d.score for d in assessment.dimensions},
+        dimensions={name: d.score for name, d in assessment.dimensions.items()},
         signals_count=signal_count,
         metadata={
             "source": source,
@@ -137,18 +154,85 @@ def persist_assessment(
             **({"dedup_key": dedup_key} if dedup_key else {}),
         },
     )
-    store.save_assessment(assessment_record)
 
-    # 4. Record signal lifecycle (new → persistent)
-    for sig_id in signal_id_map:
-        try:
-            store.save_signal_lifecycle(
-                signal_id=sig_id,
-                assessment_id=assessment_record.assessment_id,
-                status="persistent",
+    # 3. Execute all writes in a single transaction (atomic — all or nothing)
+    def _do_writes(cur: Any) -> None:
+        # Artifacts
+        for record, emb in artifact_records:
+            embedding_str = None
+            if emb is not None:
+                embedding_str = f"[{','.join(str(x) for x in emb)}]"
+            cur.execute(
+                """
+                INSERT INTO knowledge_artifacts
+                    (artifact_id, artifact_uri, artifact_type, source, content,
+                     metadata, embedding, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (artifact_uri) DO UPDATE SET
+                    artifact_type = EXCLUDED.artifact_type,
+                    source = EXCLUDED.source,
+                    content = EXCLUDED.content,
+                    metadata = EXCLUDED.metadata,
+                    embedding = EXCLUDED.embedding,
+                    updated_at = now()
+                """,
+                (
+                    record.artifact_id, record.artifact_uri, record.artifact_type,
+                    record.source, record.content, record.metadata,
+                    embedding_str, record.created_at, record.updated_at,
+                ),
             )
-        except Exception as e:
-            logger.debug("Signal lifecycle save skipped for %s: %s", sig_id, e)
+
+        # Signals
+        for sr in signal_records:
+            cur.execute(
+                """
+                INSERT INTO knowledge_signals
+                    (signal_id, artifact_uri, collector_id, signal_type,
+                     severity, score, recommendation, ai_impact, evidence,
+                     status, last_seen, access_count, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    sr.signal_id, sr.artifact_uri, sr.collector_id,
+                    sr.signal_type, sr.severity, sr.score,
+                    sr.recommendation, sr.ai_impact, sr.evidence,
+                    sr.status, sr.last_seen, sr.access_count, sr.created_at,
+                ),
+            )
+
+        # Assessment record
+        cur.execute(
+            """
+            INSERT INTO knowledge_assessments
+                (assessment_id, score, dimensions, signals_count, metadata, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                assessment_record.assessment_id, assessment_record.score,
+                assessment_record.dimensions, assessment_record.signals_count,
+                assessment_record.metadata, assessment_record.created_at,
+            ),
+        )
+
+        # Signal lifecycle (new → persistent)
+        for sig_id in signal_id_map:
+            cur.execute(
+                """
+                INSERT INTO signal_lifecycle (signal_id, last_seen, last_assessment_id, status)
+                VALUES (%s, now(), %s, %s)
+                ON CONFLICT (signal_id) DO UPDATE SET
+                    last_seen = now(),
+                    last_assessment_id = EXCLUDED.last_assessment_id,
+                    status = EXCLUDED.status,
+                    assessment_ids = array_append(signal_lifecycle.assessment_ids, %s),
+                    access_count = signal_lifecycle.access_count + 1
+                """,
+                (sig_id, assessment_record.assessment_id, "persistent",
+                 assessment_record.assessment_id),
+            )
+
+    store.run_transaction(_do_writes)
 
     return {
         "assessment_id": assessment_record.assessment_id,
@@ -178,11 +262,8 @@ def update_signal_lifecycle_post_verification(
         status: New lifecycle status — 'resolved', 'recurring', etc.
     """
     for sig_id in signal_ids:
-        try:
-            store.save_signal_lifecycle(
-                signal_id=sig_id,
-                assessment_id=assessment_id,
-                status=status,
-            )
-        except Exception as e:
-            logger.debug("Signal lifecycle update skipped for %s: %s", sig_id, e)
+        store.save_signal_lifecycle(
+            signal_id=sig_id,
+            assessment_id=assessment_id,
+            status=status,
+        )

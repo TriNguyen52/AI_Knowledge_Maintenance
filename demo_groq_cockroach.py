@@ -41,7 +41,7 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-DEFAULT_SOURCE = Path("C:/Users/jacks/Documents/khe-validation/fastapi")
+DEFAULT_SOURCE = Path("./fastapi/docs/en/docs")
 
 # ---------------------------------------------------------------------------
 # Helpers
