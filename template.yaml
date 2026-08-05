@@ -43,9 +43,6 @@ Globals:
         S3_KNOWLEDGE_PREFIX: !Ref KnowledgePrefix
         LLM_PROVIDER: bedrock
         BEDROCK_MODEL: anthropic.claude-3-5-sonnet-20241022-v2:0
-    DeadLetterQueue:
-      Type: SQS
-      LogicalResourceId: RemediationDLQ
 
 Resources:
   # --------------------------------------------------------
@@ -87,6 +84,9 @@ Resources:
       FunctionName: ai-knowledge-assess
       Handler: ai_ready.cloud.lambda_handler.lambda_handler
       CodeUri: .
+      DeadLetterQueue:
+        Type: SQS
+        LogicalResourceId: AssessmentDLQ
       Policies:
         - S3ReadPolicy:
             Bucket: !Ref KnowledgeBaseBucket
@@ -121,6 +121,9 @@ Resources:
       FunctionName: ai-knowledge-remediate
       Handler: ai_ready.cloud.lambda_handler.lambda_handler
       CodeUri: .
+      DeadLetterQueue:
+        Type: SQS
+        LogicalResourceId: RemediationDLQ
       Policies:
         - S3ReadPolicy:
             Bucket: !Ref KnowledgeBaseBucket
@@ -156,6 +159,9 @@ Resources:
       FunctionName: ai-knowledge-s3-trigger
       Handler: ai_ready.cloud.lambda_handler.lambda_handler
       CodeUri: .
+      DeadLetterQueue:
+        Type: SQS
+        LogicalResourceId: AssessmentDLQ
       Policies:
         - S3ReadPolicy:
             Bucket: !Ref KnowledgeBaseBucket
@@ -165,6 +171,8 @@ Resources:
                 - bedrock:InvokeModel
                 - bedrock:Converse
               Resource: "*"
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt AssessmentDLQ.QueueName
       Events:
         S3Upload:
           Type: S3
@@ -199,6 +207,15 @@ Resources:
       RetentionInDays: 30
 
   # --------------------------------------------------------
+  # SNS Topic for alarm notifications
+  # --------------------------------------------------------
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ai-knowledge-alarms
+      DisplayName: AI Knowledge Maintenance Alarms
+
+  # --------------------------------------------------------
   # CloudWatch Alarms for observability
   # --------------------------------------------------------
   AssessmentErrorAlarm:
@@ -216,6 +233,8 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: ai-knowledge-assess
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
 
 Outputs:
   ApiEndpoint:
@@ -233,3 +252,6 @@ Outputs:
   RemediationDLQ:
     Description: Dead letter queue for failed remediations
     Value: !GetAtt RemediationDLQ.QueueUrl
+  AlarmNotificationTopic:
+    Description: SNS topic for alarm notifications
+    Value: !Ref AlarmNotificationTopic

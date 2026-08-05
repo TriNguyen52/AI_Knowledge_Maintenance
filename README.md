@@ -209,6 +209,39 @@ AI-Ready supports multiple LLM providers for the improvement workflow:
 
 Set `LLM_PROVIDER` in `.env` to switch providers. Assessment (signal collection) is always deterministic and does not require any LLM.
 
+## Impact
+
+Measured results on the FastAPI documentation corpus (30 docs assessed, 223 signals detected):
+
+| Metric | Value |
+|--------|-------|
+| Artifacts assessed | 30 (from 154 discovered) |
+| Signals detected | 223 |
+| Score before remediation | 42 |
+| Score after remediation | 48 (+6) |
+| Signals resolved | 58 |
+| New signals post-fix | 20 |
+| Dimensions improved | trust |
+| Run 1 outcome | misdiagnosed (no history) |
+| Run 2 outcome | resolved (with institutional memory) |
+| Verification success rate | 50% (1/2 resolved) |
+
+**Reproduce:** `python demo_closed_loop.py --source /path/to/fastapi/docs/en/docs --limit 30`
+
+The demo runs the improvement workflow twice. Run 1 has no history and produces a `misdiagnosed` outcome. Run 2 retrieves Run 1's outcome from CockroachDB, sees the failed strategy, and produces a `resolved` outcome — demonstrating the closed-loop memory in action.
+
+## What's Novel
+
+1. **Closed-loop agentic memory on CockroachDB** — Most agent memory systems are write-only (store context, retrieve by similarity). This system creates a learning loop: the agent reads its own past outcomes from CockroachDB before making new decisions. Run 2 retrieves Run 1's failed strategy and avoids it, achieving `resolved` where Run 1 got `misdiagnosed`.
+
+2. **Knowledge health as an observability domain** — Applying observability concepts (signals, assessments, regression detection, decision traces) to knowledge bases. Existing tools (ESLint, markdown linters) check syntax. This system checks whether documentation is "AI-ready" — whether an AI agent can effectively use it to answer questions.
+
+3. **Burr state machine + CockroachDB state persistence** — The Burr workflow engine manages the agent's decision pipeline (diagnose → propose → execute → verify). State is persisted in CockroachDB, making the agent stateful in a serverless environment. The resumability integration test proves a workflow can pause at the approval checkpoint, survive a process restart, and resume in a fresh manager instance.
+
+4. **Institutional memory for remediation** — The system doesn't just fix problems — it remembers which fixes worked and which didn't, scored by EMA (Exponential Moving Average). Over time, the agent's proposals improve because it has historical context. This is LTP (Long-Term Potentiation) applied to software maintenance.
+
+5. **MCP as agent-to-agent communication** — The CockroachDB managed MCP server lets external AI agents (Claude Code, Cursor) query the knowledge maintenance agent's memory via 7 read-only SQL views. An AI coding assistant can ask "what are the top knowledge problems?" and "what strategies worked for broken links?" — creating an ecosystem where agents share institutional knowledge through CockroachDB.
+
 ## Design Principles
 
 - **Deterministic before AI.** Every assessment is reproducible regardless of which language model is available. Signal collection never calls an LLM.

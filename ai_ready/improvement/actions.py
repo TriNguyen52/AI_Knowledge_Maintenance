@@ -553,6 +553,12 @@ Do NOT propose the same modification steps again, even under a different strateg
     # Get structured historical context from history store
     remediation_context_str = "No historical context available."
     ema_context_str = ""
+    memory_influence = {
+        "retrieved": [],
+        "avoided_strategies": [],
+        "reused_strategy": None,
+        "rationale": "No prior outcomes available — first run for this issue type.",
+    }
     if history_store and root_causes:
         issue_type = root_causes[0].get("category", "")
         if issue_type:
@@ -565,6 +571,54 @@ Do NOT propose the same modification steps again, even under a different strateg
                     remediation_context_str = json.dumps(remediation_context, indent=2, default=str)[:1500]
                 else:
                     remediation_context_str = "No prior outcomes for this issue type."
+
+                # Build memory_influence object (Item 1.3 — store→retrieve→act legibility)
+                prior_outcomes = remediation_context.get("similar_problems", [])
+                # Also check CockroachDB-specific outcomes when SQLite is empty
+                if not prior_outcomes:
+                    prior_outcomes = remediation_context.get("cockroach_recent_outcomes", [])
+                    if not prior_outcomes:
+                        # Fall back to successful+failed lists as the source of truth
+                        prior_outcomes = (
+                            remediation_context.get("successful_strategies", [])
+                            + remediation_context.get("failed_strategies", [])
+                        )
+                successful = remediation_context.get("successful_strategies", [])
+                failed = remediation_context.get("failed_strategies", [])
+                ema_strategies = remediation_context.get("strategy_ema", {}).get("strategies", [])
+
+                retrieved_summaries = [
+                    {
+                        "strategy": o.get("strategy", ""),
+                        "result": o.get("result", ""),
+                        "verification_outcome": o.get("verification_outcome", ""),
+                        "score_change": o.get("score_change", 0),
+                        "issue_type": o.get("issue_type", ""),
+                    }
+                    for o in prior_outcomes
+                ]
+                avoided = [
+                    {"strategy": f.get("strategy", ""), "failure_reason": f.get("failure_reason", "")}
+                    for f in failed
+                ]
+                reused = None
+                rationale = "No prior outcomes matched."
+                if successful:
+                    best = max(successful, key=lambda o: o.get("score_change", 0))
+                    reused = best.get("strategy", "")
+                    rationale = f"Reusing strategy '{reused}' which succeeded before (score_change={best.get('score_change', 0)})."
+                elif avoided:
+                    rationale = f"Avoiding {len(avoided)} failed strategy/strategies from prior runs."
+                elif ema_strategies:
+                    best_ema = max(ema_strategies, key=lambda s: s.get("adjusted_ema", 0))
+                    rationale = f"No prior success. EMA suggests '{best_ema.get('strategy', '')}' (EMA={best_ema.get('adjusted_ema', 0):.2f})."
+
+                memory_influence = {
+                    "retrieved": retrieved_summaries,
+                    "avoided_strategies": avoided,
+                    "reused_strategy": reused,
+                    "rationale": rationale,
+                }
 
                 # EMA-based strategy scoring (deterministic, no LLM)
                 ema_data = remediation_context.get("strategy_ema", {})
@@ -762,6 +816,7 @@ Propose 1-3 improvement strategies as JSON. Focus on improving the knowledge sys
             "decision_trace": decision_trace.to_dict(),
             "cumulative_tokens": cumulative_tokens,
             "systemic_clusters": systemic_cluster_dicts,
+            "memory_influence": memory_influence,
         }
 
         if not proposals:

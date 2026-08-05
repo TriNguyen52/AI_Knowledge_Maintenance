@@ -296,23 +296,21 @@ class DualHistoryStore:
         issue_type: str,
         artifact_uris: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Build merged historical context from SQLite and CockroachDB.
+        """Build merged historical context — CockroachDB primary, SQLite fallback.
 
-        SQLite provides:
-          - similar_problems (artifact-filtered)
-          - successful/failed strategies
-          - strategy_stats (success/failure rates)
-          - strategy_ema (EMA-based predicted success probability)
+        CockroachDB is the primary read source (distributed, persistent,
+        cross-run institutional memory).  SQLite is only used as a fallback
+        when CockroachDB is unavailable or has no data for this issue type.
 
-        CockroachDB adds:
-          - cockroach_successful_strategies (distributed history)
-          - cockroach_failed_strategies (distributed history)
-          - cockroach_decision_traces (reasoning from past attempts)
-          - cockroach_total_attempts (count from distributed store)
+        CockroachDB provides:
+          - successful/failed strategies (from distributed history)
+          - recent_outcomes (cross-run)
+          - decision traces (reasoning from past attempts)
+          - EMA computed from CockroachDB outcomes
 
-        The merged context is passed to the LLM in analyze_issue and
-        generate_proposal actions, giving it both local (EMA, stats)
-        and distributed (traces, cross-instance) institutional memory.
+        SQLite adds (when available):
+          - artifact-filtered similar_problems
+          - strategy_stats (local success/failure rates)
 
         Args:
             issue_type: The root cause category.
@@ -321,15 +319,7 @@ class DualHistoryStore:
         Returns:
             Merged context dict for LLM prompt construction.
         """
-        # Primary: SQLite (has EMA, strategy stats, artifact filtering)
-        sqlite_context = self.sqlite_store.get_remediation_context(
-            issue_type=issue_type,
-            artifact_uris=artifact_uris,
-        )
-
-        sqlite_attempts = sqlite_context.get("total_prior_attempts", 0)
-
-        # Merge: CockroachDB (has decision traces, distributed/cross-run history)
+        # ── Primary: CockroachDB ──
         crdb_context: dict[str, Any] | None = None
         if self.cockroach_store and issue_type:
             try:
@@ -339,29 +329,91 @@ class DualHistoryStore:
             except Exception as e:
                 logger.warning(
                     f"Failed to read CockroachDB remediation context: {e}. "
-                    f"Using SQLite-only context."
+                    f"Falling back to SQLite-only context."
                 )
 
         crdb_attempts = (
             crdb_context.get("total_attempts", 0) if crdb_context else 0
         )
 
-        # ── Decision: which store's data populates the *main* context keys ──
-        #
-        # SQLite is the primary store when it has data (it has EMA, artifact
-        # filtering, strategy stats).  But in the demo, SQLite is recreated
-        # fresh each run, so on Run 2+ it's empty while CockroachDB has the
-        # cross-run history from Run 1.
-        #
-        # When SQLite is empty and CockroachDB has data, we promote
-        # CockroachDB's data into the main context keys so that actions.py
-        # (which reads successful_strategies, failed_strategies,
-        # strategy_ema, total_prior_attempts) sees the real history.
-        if sqlite_attempts > 0:
-            # SQLite has data — use it as the primary context
-            context = sqlite_context
+        # ── Fallback: SQLite (only when CockroachDB is unavailable/empty) ──
+        sqlite_context: dict[str, Any] | None = None
+        if crdb_attempts == 0:
+            sqlite_context = self.sqlite_store.get_remediation_context(
+                issue_type=issue_type,
+                artifact_uris=artifact_uris,
+            )
+            sqlite_attempts = sqlite_context.get("total_prior_attempts", 0)
         else:
-            # SQLite is empty — start from its structure but with empty data
+            sqlite_attempts = 0
+
+        # ── Build the merged context ──
+        if crdb_attempts > 0 and crdb_context:
+            # CockroachDB is the primary source
+            context = {
+                "similar_problems": [],  # will be filled from SQLite if available
+                "successful_strategies": (
+                    crdb_context.get("successful_strategies", [])
+                ),
+                "failed_strategies": (
+                    crdb_context.get("failed_strategies", [])
+                ),
+                "strategy_stats": {},
+                "strategy_ema": {"strategies": [], "total_observations": 0},
+                "total_prior_attempts": crdb_attempts,
+                "recent_outcomes": crdb_context.get("recent_outcomes", []),
+                # CockroachDB-specific observability fields
+                "cockroach_successful_strategies": (
+                    crdb_context.get("successful_strategies", [])
+                ),
+                "cockroach_failed_strategies": (
+                    crdb_context.get("failed_strategies", [])
+                ),
+                "cockroach_decision_traces": (
+                    crdb_context.get("last_decision_traces", [])
+                ),
+                "cockroach_total_attempts": crdb_attempts,
+                "cockroach_fallback_used": (
+                    crdb_context.get("fallback_used", False)
+                ),
+                "cockroach_recent_outcomes": (
+                    crdb_context.get("recent_outcomes", [])
+                ),
+            }
+
+            # Compute EMA from CockroachDB outcomes
+            crdb_ema = _compute_ema_from_outcomes(
+                crdb_context.get("recent_outcomes", [])
+            )
+            if crdb_ema.get("strategies"):
+                context["strategy_ema"] = crdb_ema
+
+            # Merge SQLite's artifact-filtered similar_problems if available
+            if sqlite_context and sqlite_attempts > 0:
+                context["similar_problems"] = (
+                    sqlite_context.get("similar_problems", [])
+                )
+                context["strategy_stats"] = (
+                    sqlite_context.get("strategy_stats", {})
+                )
+
+            logger.info(
+                f"Read context from CockroachDB (primary): {crdb_attempts} "
+                f"prior attempts, "
+                f"{len(context['cockroach_decision_traces'])} "
+                f"decision traces"
+                f"{' (fallback: broad match)' if crdb_context.get('fallback_used') else ''}"
+            )
+        elif sqlite_context and sqlite_attempts > 0:
+            # CockroachDB empty/unavailable — use SQLite as fallback
+            context = sqlite_context
+            context["cockroach_fallback_used"] = (crdb_context is None)
+            logger.info(
+                f"CockroachDB empty — using SQLite fallback: "
+                f"{sqlite_attempts} prior attempts"
+            )
+        else:
+            # Both stores empty — first run for this issue type
             context = {
                 "similar_problems": [],
                 "successful_strategies": [],
@@ -370,61 +422,6 @@ class DualHistoryStore:
                 "strategy_ema": {"strategies": [], "total_observations": 0},
                 "total_prior_attempts": 0,
             }
-
-        if crdb_attempts > 0 and crdb_context:
-            # Always add CockroachDB-specific fields for observability
-            context["cockroach_successful_strategies"] = (
-                crdb_context.get("successful_strategies", [])
-            )
-            context["cockroach_failed_strategies"] = (
-                crdb_context.get("failed_strategies", [])
-            )
-            context["cockroach_decision_traces"] = (
-                crdb_context.get("last_decision_traces", [])
-            )
-            context["cockroach_total_attempts"] = crdb_attempts
-            context["cockroach_fallback_used"] = (
-                crdb_context.get("fallback_used", False)
-            )
-            context["cockroach_recent_outcomes"] = (
-                crdb_context.get("recent_outcomes", [])
-            )
-
-            # When SQLite is empty, promote CockroachDB data into the main
-            # context keys that actions.py reads
-            if sqlite_attempts == 0:
-                context["successful_strategies"] = (
-                    crdb_context.get("successful_strategies", [])
-                )
-                context["failed_strategies"] = (
-                    crdb_context.get("failed_strategies", [])
-                )
-                context["recent_outcomes"] = (
-                    crdb_context.get("recent_outcomes", [])
-                )
-
-                # Compute EMA from CockroachDB outcomes (SQLite's EMA
-                # tracker can't see CockroachDB data, so we compute a
-                # simple EMA here from the recent_outcomes)
-                crdb_ema = _compute_ema_from_outcomes(
-                    crdb_context.get("recent_outcomes", [])
-                )
-                if crdb_ema.get("strategies"):
-                    context["strategy_ema"] = crdb_ema
-
-            # Update total to reflect the larger of the two stores
-            context["total_prior_attempts"] = max(
-                context.get("total_prior_attempts", 0),
-                crdb_attempts,
-            )
-
-            logger.info(
-                f"Merged CockroachDB context: {crdb_attempts} "
-                f"prior attempts, "
-                f"{len(context['cockroach_decision_traces'])} "
-                f"decision traces"
-                f"{' (fallback: broad match)' if crdb_context.get('fallback_used') else ''}"
-            )
 
         return context
 

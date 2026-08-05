@@ -211,12 +211,15 @@ class CockroachDBStore:
             mcp_sql = f.read()
         with self.conn.cursor() as cur:
             # Execute only the CREATE OR REPLACE VIEW statements (skip
-            # the commented-out CREATE ROLE / GRANT block)
+            # the commented-out CREATE ROLE / GRANT block).  Each statement
+            # may have preceding comment lines (e.g. "-- View 1: ..."), so
+            # we check whether the statement *contains* a CREATE OR REPLACE
+            # VIEW rather than requiring it to start with one.
             statements = [
                 stmt.strip()
                 for stmt in mcp_sql.split(";")
                 if stmt.strip()
-                and stmt.strip().upper().startswith("CREATE OR REPLACE VIEW")
+                and "CREATE OR REPLACE VIEW" in stmt.upper()
             ]
             for stmt in statements:
                 cur.execute(stmt)
@@ -374,13 +377,18 @@ class CockroachDBStore:
 
         Returns list of (artifact, similarity_score) tuples sorted by similarity.
         Uses CockroachDB's built-in vector distance operators.
+
+        Note: The ``WHERE embedding IS NOT NULL`` clause is intentionally
+        omitted.  CockroachDB's cspann vector index only indexes rows with
+        non-NULL embeddings, so the vector search operator naturally
+        excludes them.  Adding the WHERE clause prevents the optimizer
+        from choosing the vector index, forcing a full scan instead.
         """
         embedding_str = f"[{','.join(str(x) for x in query_embedding)}]"
         rows = self._execute_fetchall(
             """
             SELECT *, embedding <=> %s::vector AS distance
             FROM knowledge_artifacts
-            WHERE embedding IS NOT NULL
             ORDER BY embedding <=> %s::vector
             LIMIT %s
             """,
@@ -417,7 +425,6 @@ class CockroachDBStore:
             EXPLAIN (VERBOSE)
             SELECT *, embedding <=> %s::vector AS distance
             FROM knowledge_artifacts
-            WHERE embedding IS NOT NULL
             ORDER BY embedding <=> %s::vector
             LIMIT %s
             """,

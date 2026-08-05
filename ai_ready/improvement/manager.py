@@ -808,3 +808,22 @@ class ImprovementManager:
         except Exception as e:
             logger.warning(f"Failed to read CockroachDB traces: {e}")
             return []
+
+    def explain_memory_influence(self, app_id: str) -> dict[str, Any]:
+        """Explain how institutional memory influenced a workflow's proposal.
+
+        Returns the ``memory_influence`` object captured during
+        ``generate_proposal``, showing:
+        - ``retrieved``: prior outcomes from CockroachDB used as context
+        - ``avoided_strategies``: strategies that failed before
+        - ``reused_strategy``: a successful strategy reused (or None)
+        - ``rationale``: why the proposal was shaped this way
+
+        Args:
+            app_id: The workflow application ID.
+
+        Returns:
+            memory_influence dict, or empty dict if unavailable.
+        """
+        state = self.get_state(app_id)
+        return state.get("memory_influence", {})

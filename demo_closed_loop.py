@@ -1,13 +1,14 @@
 #!/usr/bin/env python
-"""Closed-loop institutional memory demo — SQLite + CockroachDB dual-write.
+"""Closed-loop institutional memory demo — CockroachDB-only.
 
-Demonstrates the full remediation memory loop across two workflow runs:
+Demonstrates the full remediation memory loop across two workflow runs,
+with all reads and writes going to CockroachDB (no SQLite dependency):
 
   Run 1 (no history):
     1. Assess knowledge base → signals → problems
     2. Generate remediation proposal (no prior outcomes to learn from)
     3. Execute + verify
-    4. Outcome saved to SQLite AND CockroachDB (dual-write)
+    4. Outcome saved to CockroachDB
     5. Decision traces saved to CockroachDB
 
   Run 2 (with history from Run 1):
@@ -266,40 +267,22 @@ def run_improvement(
     source,
     git_commit,
     cockroach_store,
-    history_db_path: str,
     llm_gateway=None,
 ):
     """Run a single improvement workflow and return the final state."""
     banner(f"RUN {run_label}: Improvement Workflow")
 
     from ai_ready.improvement.manager import ImprovementManager
-    from ai_ready.improvement.history import ImprovementHistoryStore
     from ai_ready.improvement.executor import KnowledgeExecutor
-    from ai_ready.stores import AssessmentStore, SignalStore
-    from ai_ready.improvement.problem_queue import ProblemQueue
+    from ai_ready.storage.adapters import CockroachAssessmentStore, CockroachHistoryStore
 
-    # Fresh SQLite for each run (to isolate SQLite history per run)
-    # But CockroachDB persists across runs — that's the institutional memory
-    if Path(history_db_path).exists():
-        Path(history_db_path).unlink()
-
-    signal_store = SignalStore(history_db_path)
-    assessment_store = AssessmentStore(history_db_path)
-    assessment_store.save(assessment)
-    signal_store.save_signals(assessment.assessment_id, assessment.signals)
-
-    sqlite_history = ImprovementHistoryStore(history_db_path)
+    # Use CockroachDB-backed adapters — no SQLite dependency
+    assessment_store = CockroachAssessmentStore(cockroach_store)
+    history_store = CockroachHistoryStore(cockroach_store)
 
     # P8: salience_threshold from config (default 0.01)
     from ai_ready.config import Config
     config = Config.default()
-    pq_path = history_db_path.replace(".db", "_pq.db")
-    custom_pq = ProblemQueue(
-        history_store=sqlite_history,
-        db_path=pq_path,
-        salience_threshold=config.salience_threshold,
-        signal_store=signal_store,
-    )
 
     # Create executor with real file modification support
     known_uris = {a.uri for a in artifacts}
@@ -310,27 +293,25 @@ def run_improvement(
         known_artifact_uris=known_uris,
     )
 
-    # Create manager with cockroach_store — this triggers DualHistoryStore
-    print(f"  Creating ImprovementManager with CockroachDB sync...")
-    print(f"  SQLite: {history_db_path}")
+    # Create manager with CockroachDB as the sole store
+    print(f"  Creating ImprovementManager (CockroachDB-only)...")
     print(f"  CockroachDB: connected")
 
     manager = ImprovementManager(
         llm_gateway=llm_gateway,
         assessment_store=assessment_store,
         assessment_pipeline=pipeline,
-        history_store=sqlite_history,
+        history_store=history_store,
         executor=executor,
         artifacts=artifacts,
         relationships=relationships,
         source=source,
         git_commit=git_commit,
-        history_db_path=history_db_path,
         enable_tracking=False,
         enable_otel=False,
         max_fork_attempts=2,
-        problem_queue=custom_pq,
-        cockroach_store=cockroach_store,  # <-- THIS ENABLES DUAL-WRITE
+        cockroach_store=cockroach_store,
+        config=config,
     )
 
     # Check what CockroachDB already has (institutional memory)
@@ -444,6 +425,53 @@ def run_improvement(
         print(f"    Score: {verification.get('before_score', '?')} → "
               f"{verification.get('after_score', '?')} "
               f"(diff={verification.get('score_difference', '?')})")
+
+    # Item 1.3: Memory in Action — show how institutional memory influenced this run
+    memory_influence = final_state.get("memory_influence", {})
+    if memory_influence:
+        subheader("Memory in Action (store → retrieve → act)")
+        retrieved = memory_influence.get("retrieved", [])
+        avoided = memory_influence.get("avoided_strategies", [])
+        reused = memory_influence.get("reused_strategy")
+        rationale = memory_influence.get("rationale", "")
+        if retrieved:
+            print(f"  Retrieved {len(retrieved)} prior outcome(s) from CockroachDB:")
+            for r in retrieved[:5]:
+                result_tag = "✓" if r.get("result") == "success" else "✗"
+                print(f"    {result_tag} {r.get('strategy', '?')} "
+                      f"→ {r.get('verification_outcome', '?')} "
+                      f"(score_change={r.get('score_change', '?')})")
+        else:
+            print("  No prior outcomes retrieved (first run for this issue type).")
+        if avoided:
+            print(f"  Avoided {len(avoided)} failed strategy/strategies:")
+            for a in avoided[:3]:
+                print(f"    ✗ {a.get('strategy', '?')}: {truncate(a.get('failure_reason', ''), 80)}")
+        if reused:
+            print(f"  Reused successful strategy: {reused}")
+        print(f"  Rationale: {rationale}")
+
+    # Item 3.1: Knowledge Health: Before → After
+    if verification:
+        subheader("Knowledge Health: Before → After")
+        before_score = verification.get("before_score", "?")
+        after_score = verification.get("after_score", "?")
+        score_delta = verification.get("score_difference", 0)
+        resolved_ids = verification.get("resolved_signal_ids", [])
+        new_ids = verification.get("new_signal_ids", [])
+        remaining_ids = verification.get("remaining_signal_ids", [])
+        dim_deltas = verification.get("dimension_deltas", {})
+        print(f"  Score: {before_score} → {after_score} (Δ={score_delta:+d})")
+        print(f"  Signals resolved: {len(resolved_ids)}")
+        print(f"  New signals: {len(new_ids)}")
+        print(f"  Remaining: {len(remaining_ids)}")
+        if dim_deltas:
+            improved = [d for d, v in dim_deltas.items() if isinstance(v, (int, float)) and v > 0.001]
+            regressed = [d for d, v in dim_deltas.items() if isinstance(v, (int, float)) and v < -0.001]
+            if improved:
+                print(f"  Dimensions improved: {', '.join(improved)}")
+            if regressed:
+                print(f"  Dimensions regressed: {', '.join(regressed)}")
 
     # Confirm CockroachDB sync
     subheader("CockroachDB Sync Confirmation")
@@ -622,7 +650,7 @@ def show_cockroach_memory(store):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Closed-loop institutional memory demo (SQLite + CockroachDB)",
+        description="Closed-loop institutional memory demo (CockroachDB-only, no SQLite)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -663,11 +691,11 @@ def main() -> None:
     print()
     print("=" * 72)
     print("  Closed-Loop Institutional Memory Demo")
-    print("  SQLite (local) + CockroachDB (distributed) Dual-Write")
+    print("  CockroachDB (distributed, ACID, vector-indexed)")
     print("=" * 72)
     print()
     print("  This demo runs the improvement workflow TWICE:")
-    print("    Run 1: No history → outcome saved to SQLite + CockroachDB")
+    print("    Run 1: No history → outcome saved to CockroachDB")
     print("    Run 2: Reads CockroachDB history → LLM sees past outcomes")
     print("  After both runs, shows CockroachDB institutional memory.")
     print()
@@ -736,7 +764,6 @@ def main() -> None:
               source=source_str,
               git_commit=git_commit,
               cockroach_store=cockroach_store,
-              history_db_path=f".ai-ready/closed_loop_run{run_idx}.db",
               llm_gateway=llm_gateway,
           )
 
@@ -756,7 +783,7 @@ def main() -> None:
           shutil.rmtree(backup_dir)
 
       banner("Demo Complete")
-      print("  The closed loop is now functional:")
+      print("  The closed loop is now functional (CockroachDB-only, no SQLite):")
       print()
       print("    1. Artifacts saved with VECTOR(384) embeddings → semantic search")
       print("    2. Signals + lifecycle tracked in CockroachDB (new → persistent → resolved)")
