@@ -442,6 +442,8 @@ class RemediationOutcome:
     strategy: str  # e.g. "merge_documents", "add_redirects"
     result: str  # "success" or "failure"
     score_change: int = 0
+    score_before: int = 0  # absolute assessment score before remediation
+    score_after: int = 0  # absolute assessment score after remediation
     root_cause: str = ""
     artifact_uris: list[str] = field(default_factory=list)
     failure_reason: str = ""
@@ -456,6 +458,8 @@ class RemediationOutcome:
             "strategy": self.strategy,
             "result": self.result,
             "score_change": self.score_change,
+            "score_before": self.score_before,
+            "score_after": self.score_after,
             "root_cause": self.root_cause,
             "artifact_uris": self.artifact_uris,
             "failure_reason": self.failure_reason,
@@ -472,6 +476,7 @@ def initial_state(
     signal_ids: list[str],
     affected_artifact_uris: list[str],
     prior_failures: list[dict[str, Any]] | None = None,
+    assessment_signals: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create the initial Burr state dict for a new improvement workflow.
 
@@ -481,6 +486,7 @@ def initial_state(
         signal_ids: Signal IDs that need improvement.
         affected_artifact_uris: Artifact URIs (for executor lookups).
         prior_failures: Optional list of prior failure summaries for learning.
+        assessment_signals: Optional list of signal dicts (for remediation map).
 
     Returns:
         A dict suitable for ApplicationBuilder.with_state().
@@ -514,4 +520,5 @@ def initial_state(
         "skip_events": [],
         "problem_saliences": [],
         "systemic_clusters": [],
+        "assessment_signals": assessment_signals or [],
     }

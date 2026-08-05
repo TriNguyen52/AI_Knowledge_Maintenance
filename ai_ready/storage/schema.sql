@@ -55,13 +55,14 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_source
     ON knowledge_artifacts (source);
 
 -- Vector index for semantic similarity search.
--- The <=> operator is cosine distance; the index metric must match
--- so the optimizer uses it instead of full-scanning.  CockroachDB
--- v25.2+ supports vector indexes (GA).  If IF NOT EXISTS is not
--- supported for vector indexes on your cluster version, this DDL
--- is also executed defensively inside initialize_schema().
+-- The <=> operator is cosine distance; the index op-class must match
+-- so the optimizer uses the index instead of full-scanning.  CockroachDB
+-- v25.2+ supports vector indexes (GA).  The vector_cosine_ops op-class
+-- binds the index to the cosine distance metric used by <=>.
+-- If IF NOT EXISTS is not supported for vector indexes on your cluster
+-- version, this DDL is also executed defensively inside initialize_schema().
 CREATE VECTOR INDEX IF NOT EXISTS idx_artifacts_embedding
-    ON knowledge_artifacts (embedding);
+    ON knowledge_artifacts (embedding vector_cosine_ops);
 
 -- --------------------------------------------------------
 -- knowledge_signals: Individual knowledge signals (findings)

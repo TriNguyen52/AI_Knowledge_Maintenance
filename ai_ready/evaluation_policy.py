@@ -188,6 +188,127 @@ class InterpretationPolicy:
             ),
         )
 
+        # --- canonical_source ---
+        self._registry[("canonical_source", "missing_canonical_source")] = InterpretationEntry(
+            severity=Severity.MEDIUM,
+            score_penalty=10,
+            ai_impact=(
+                "This artifact references content without identifying the canonical "
+                "source. An AI agent cannot verify the information or trace it to "
+                "its origin, reducing trustworthiness of retrieved chunks."
+            ),
+            recommendation_template=(
+                "Add canonical source attribution to this artifact. "
+                "Reference the authoritative document or URL for the claims made."
+            ),
+        )
+        self._registry[("canonical_source", "duplicate_content")] = InterpretationEntry(
+            severity=Severity.HIGH,
+            score_penalty=15,
+            ai_impact=(
+                "Duplicate content across artifacts means an AI agent may retrieve "
+                "multiple chunks with the same information, wasting context window "
+                "tokens and increasing the risk of inconsistent answers if one "
+                "copy is updated and the other is not."
+            ),
+            recommendation_template=(
+                "Consolidate duplicate content into a single canonical artifact. "
+                "Replace other copies with cross-references to the canonical source."
+            ),
+        )
+
+        # --- contradiction_detection ---
+        self._registry[("contradiction_detection", "version_conflict")] = InterpretationEntry(
+            severity=Severity.HIGH,
+            score_penalty=15,
+            ai_impact=(
+                "Version conflicts mean different artifacts claim different versions "
+                "of the same subject. An AI agent retrieving one version will give "
+                "outdated or incorrect answers, with no way to detect the conflict."
+            ),
+            recommendation_template=(
+                "Resolve version conflict for {subject}: artifacts claim versions "
+                "{conflicting_versions}. Update all artifacts to the current version "
+                "and mark older versions as deprecated."
+            ),
+        )
+
+        # --- freshness ---
+        self._registry[("freshness", "stale_content")] = InterpretationEntry(
+            severity=Severity.MEDIUM,
+            score_penalty=10,
+            ai_impact=(
+                "This content has not been updated in a long time. An AI agent may "
+                "retrieve outdated information and present it as current, leading "
+                "to incorrect recommendations."
+            ),
+            recommendation_template=(
+                "Review this content for accuracy. Update or mark it with a "
+                "stale date warning if the information is still valid but may "
+                "change. Last updated: {last_updated}"
+            ),
+        )
+        self._registry[("freshness", "no_date_signal")] = InterpretationEntry(
+            severity=Severity.LOW,
+            score_penalty=5,
+            ai_impact=(
+                "This artifact has no date metadata. An AI agent cannot determine "
+                "whether the content is current or stale, reducing confidence in "
+                "the information."
+            ),
+            recommendation_template=(
+                "Add a date or last-updated metadata field to this artifact so "
+                "freshness can be assessed."
+            ),
+        )
+
+        # --- knowledge_connectivity ---
+        self._registry[("knowledge_connectivity", "orphan_artifact")] = InterpretationEntry(
+            severity=Severity.MEDIUM,
+            score_penalty=10,
+            ai_impact=(
+                "This artifact is not connected to the knowledge graph. An AI agent "
+                "traversing relationships between documents will never reach it, "
+                "making it effectively invisible to graph-based retrieval."
+            ),
+            recommendation_template=(
+                "Add relationships from this artifact to related documents, "
+                "and ensure at least one other artifact links to it."
+            ),
+        )
+
+        # --- terminology_consistency ---
+        self._registry[("terminology_consistency", "terminology_variant")] = InterpretationEntry(
+            severity=Severity.MEDIUM,
+            score_penalty=10,
+            ai_impact=(
+                "Inconsistent terminology means the same concept is referred to "
+                "by different names. An AI agent embedding queries for one term "
+                "will miss content using the variant term, reducing recall."
+            ),
+            recommendation_template=(
+                "Standardize terminology: use {canonical_term} instead of "
+                "{variant_terms} throughout the knowledge base."
+            ),
+        )
+
+        # --- workflow_completeness ---
+        self._registry[("workflow_completeness", "incomplete_workflow")] = InterpretationEntry(
+            severity=Severity.MEDIUM,
+            score_penalty=10,
+            ai_impact=(
+                "This workflow documentation is incomplete — it references steps, "
+                "prerequisites, or outcomes that are not documented elsewhere. An "
+                "AI agent following this workflow will get stuck or hallucinate "
+                "the missing steps."
+            ),
+            recommendation_template=(
+                "Complete this workflow documentation. Add the missing steps, "
+                "link to prerequisite documents, and verify all referenced "
+                "procedures exist."
+            ),
+        )
+
     def validate(self) -> list[str]:
         """Validate that all entries are well-formed. Return list of errors (empty if valid)."""
         errors: list[str] = []

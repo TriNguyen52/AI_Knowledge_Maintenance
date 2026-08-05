@@ -237,14 +237,13 @@ def build_assessment_summary(
     """Build a compact, reusable assessment summary for LLM prompts.
 
     This summary is built once in analyze_issue and persisted in Burr
-    state as `assessment_summary`. Later actions (generate_proposal)
+    state as ``assessment_summary``. Later actions (generate_proposal)
     reuse it instead of rebuilding context from scratch, saving both
     compute and tokens.
 
-    The summary includes:
-      - Signal cluster representatives (not every signal)
-      - Artifact references with signal counts
-      - Overall severity distribution
+    The summary groups signals by (collector_id, signal_type) and shows
+    aggregate counts, affected artifacts, and a brief evidence sample.
+    This keeps the prompt small even with hundreds of signals.
 
     Returns:
         A compact text summary suitable for LLM prompts.
@@ -256,12 +255,9 @@ def build_assessment_summary(
     if not assessment:
         return "No assessment available."
 
-    if clusters is None:
-        clusters = cluster_signals(signal_ids, assessment_store)
-
     lines: list[str] = []
     lines.append(f"Assessment: {assessment.assessment_id}")
-    lines.append(f"Total signals: {len(signal_ids)} (in {len(clusters)} cluster(s))")
+    lines.append(f"Total signals: {len(signal_ids)}")
     lines.append(f"Affected artifacts: {len(artifact_uris)}")
     lines.append("")
 
@@ -277,14 +273,46 @@ def build_assessment_summary(
         ))
         lines.append("")
 
-    # Signal cluster representatives
-    lines.append("Signal clusters (representative shown, count indicates cluster size):")
-    for cluster in clusters:
-        rep = cluster["representative"]
-        count = cluster["count"]
-        if count > 1:
-            lines.append(f"  [{count}x] {rep}")
-        else:
-            lines.append(f"  {rep}")
+    # Group signals by (collector_id, signal_type) for compact display
+    type_groups: dict[str, dict[str, Any]] = {}
+    for signal in assessment.signals:
+        if signal.signal_id not in signal_ids:
+            continue
+        group_key = f"{signal.collector_id}|{signal.signal_type}"
+        if group_key not in type_groups:
+            # Extract key evidence values only (skip long values)
+            ev = signal.evidence if isinstance(signal.evidence, dict) else {}
+            ev_items = []
+            for k, v in list(ev.items())[:3]:
+                v_str = str(v)
+                if len(v_str) <= 60:
+                    ev_items.append(f"{k}={v_str}")
+                else:
+                    ev_items.append(f"{k}={v_str[:57]}...")
+            ev_str = ", ".join(ev_items) if ev_items else "none"
+
+            type_groups[group_key] = {
+                "collector_id": signal.collector_id,
+                "signal_type": signal.signal_type,
+                "severity": signal.severity.value,
+                "count": 0,
+                "artifacts": [],
+                "evidence_sample": ev_str,
+            }
+        type_groups[group_key]["count"] += 1
+        if signal.artifact_uri not in type_groups[group_key]["artifacts"]:
+            type_groups[group_key]["artifacts"].append(signal.artifact_uri)
+
+    # Display type-level groups (compact)
+    lines.append(f"Signal types ({len(type_groups)}):")
+    for group in sorted(type_groups.values(), key=lambda g: -g["count"]):
+        arts = group["artifacts"]
+        shown = arts[:5]
+        suffix = f" (+{len(arts) - 5} more)" if len(arts) > 5 else ""
+        lines.append(
+            f"  [{group['count']}x] {group['collector_id']}/{group['signal_type']} "
+            f"(sev={group['severity']}, ev: {group['evidence_sample']})"
+        )
+        lines.append(f"        artifacts: {', '.join(shown)}{suffix}")
 
     return "\n".join(lines)

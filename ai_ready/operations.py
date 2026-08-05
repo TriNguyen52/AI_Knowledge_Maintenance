@@ -181,6 +181,14 @@ class AssessOperation:
         if git_commit:
             metadata["git_commit"] = git_commit
 
+        # Record which embedding backend was used (observability)
+        try:
+            from ai_ready.llm.embeddings import get_embedder
+            embedder = get_embedder()
+            metadata["embedding_backend"] = embedder.active_backend
+        except Exception:
+            metadata["embedding_backend"] = "unknown"
+
         return KnowledgeAssessment(
             assessment_id=assessment_id,
             score=overall_score,
@@ -247,9 +255,12 @@ class AssessOperation:
                 signal.severity = entry.severity
                 signal.score = 100 - entry.score_penalty
                 signal.ai_impact = entry.ai_impact
-                signal.recommendation = entry.recommendation_template.format(
-                    **signal.evidence
-                )
+                try:
+                    signal.recommendation = entry.recommendation_template.format(
+                        **signal.evidence
+                    )
+                except (KeyError, IndexError):
+                    signal.recommendation = entry.recommendation_template
             else:
                 signal.ai_impact = "No AI impact description available."
                 signal.recommendation = f"Issue: {signal.signal_type}"

@@ -441,8 +441,8 @@ def run_improvement(
         print()
         print(f"  Verification:")
         print(f"    Outcome: {verification.get('overall_outcome', 'unknown')}")
-        print(f"    Score: {verification.get('score_before', '?')} → "
-              f"{verification.get('score_after', '?')} "
+        print(f"    Score: {verification.get('before_score', '?')} → "
+              f"{verification.get('after_score', '?')} "
               f"(diff={verification.get('score_difference', '?')})")
 
     # Confirm CockroachDB sync
@@ -502,7 +502,8 @@ def show_cockroach_memory(store):
 
     # Use MCP interface to query CockroachDB — demonstrates that external
     # AI agents (Claude Code, Cursor, VS Code) can access the same data
-    from ai_ready.cloud.mcp_server import handle_tool_call, MCP_TOOLS
+    from ai_ready.cloud.mcp_server import handle_tool_call, MCP_TOOLS, set_store
+    set_store(store)  # Wire the store for handle_tool_call
 
     subheader(f"MCP Server Interface ({len(MCP_TOOLS)} tools)")
     print("  External AI agents query CockroachDB via MCP tools:")

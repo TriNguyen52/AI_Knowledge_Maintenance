@@ -1,349 +1,288 @@
 """
-MCP (Model Context Protocol) server interface for AI Knowledge Maintenance.
+MCP query catalog for AI Knowledge Maintenance.
 
-Exposes the knowledge assessment and remediation system to external AI agents
-via the CockroachDB Cloud MCP Server. External agents (Claude Code, Cursor,
-VS Code) can query the knowledge health status, retrieve signals, and
-trigger assessments through MCP.
+This module is NOT an MCP server. It maps each external-agent capability
+to a ``select_query`` on a dedicated ``mcp_*`` view (see
+``ai_ready/storage/mcp_views.sql``). The CockroachDB Cloud managed MCP
+server (https://cockroachlabs.cloud/mcp) exposes ``select_query`` as a
+named tool; external agents call it with the view name and optional
+WHERE/LIMIT clauses.
 
-This module provides:
-1. A lightweight MCP server that wraps CockroachDB queries
-2. Tool definitions for agent-callable operations
-3. Read-only access by default (safe for external agents)
-4. Full audit logging via CockroachDB's built-in audit
-
-The MCP server connects to CockroachDB Cloud's managed MCP endpoint:
-    https://cockroachlabs.cloud/mcp
+All access is read-only. A dedicated ``mcp_reader`` role is granted
+SELECT only on the ``mcp_*`` views — not on base tables.
 
 Usage:
-    # As a standalone server
+    # Print the tool catalog (for documentation or display)
     python -m ai_ready.cloud.mcp_server
 
-    # Or register with CockroachDB Cloud MCP
-    # Add this config snippet to your MCP client:
-    # {
-    #   "mcpServers": {
-    #     "ai-knowledge-maintenance": {
-    #       "url": "https://cockroachlabs.cloud/mcp",
-    #       "headers": {
-    #         "Authorization": "Bearer <your-crdb-token>"
-    #       }
-    #     }
-    #   }
-    # }
+    # In code — look up the view for a capability
+    from ai_ready.cloud.mcp_server import MCP_QUERY_CATALOG
+    entry = MCP_QUERY_CATALOG["get_knowledge_health"]
+    # entry["view"] == "mcp_knowledge_health"
 """
 
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
+# ---------------------------------------------------------------------------
+# Query catalog: maps capability name → MCP view + description + example
+# ---------------------------------------------------------------------------
+# External agents call the managed MCP's select_query tool with:
+#   select_query(sql="SELECT * FROM mcp_problem_queue LIMIT 10")
+# The mcp_reader role can only SELECT from mcp_* views.
 
-# Tool definitions for MCP exposure
-MCP_TOOLS = [
+MCP_QUERY_CATALOG: list[dict[str, Any]] = [
     {
         "name": "get_knowledge_health",
-        "description": "Get the latest knowledge health assessment score, dimensions, and signal summary.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-        },
+        "description": (
+            "Get the latest knowledge health assessment score, "
+            "dimensions, and signal summary."
+        ),
+        "view": "mcp_knowledge_health",
+        "example_query": "SELECT * FROM mcp_knowledge_health",
     },
     {
         "name": "get_signals",
-        "description": "Retrieve knowledge signals (findings) filtered by severity, collector, or artifact.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "severity": {
-                    "type": "string",
-                    "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
-                    "description": "Filter by severity level",
-                },
-                "collector_id": {
-                    "type": "string",
-                    "description": "Filter by collector (topic_purity, heading_quality, context_independence, link_integrity)",
-                },
-                "artifact_uri": {
-                    "type": "string",
-                    "description": "Filter by artifact URI",
-                },
-                "status": {
-                    "type": "string",
-                    "enum": ["new", "persistent", "resolved", "recurring"],
-                    "description": "Filter by lifecycle status",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 50)",
-                    "default": 50,
-                },
-            },
-        },
+        "description": (
+            "Retrieve knowledge signals (findings) filtered by "
+            "severity, collector, artifact, or lifecycle status."
+        ),
+        "view": "mcp_signals",
+        "example_query": (
+            "SELECT * FROM mcp_signals WHERE severity = 'HIGH' "
+            "ORDER BY created_at DESC LIMIT 50"
+        ),
     },
     {
         "name": "get_problem_queue",
-        "description": "Get the current knowledge problem queue ranked by salience. Problems are clusters of related signals that need remediation.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "enum": ["open", "in_progress", "resolved", "wont_fix"],
-                    "description": "Filter by status (default: open)",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 10)",
-                    "default": 10,
-                },
-            },
-        },
+        "description": (
+            "Get the current knowledge problem queue ranked by salience. "
+            "Problems are clusters of related signals that need remediation."
+        ),
+        "view": "mcp_problem_queue",
+        "example_query": (
+            "SELECT * FROM mcp_problem_queue WHERE status = 'open' LIMIT 10"
+        ),
     },
     {
         "name": "get_remediation_history",
-        "description": "Get past remediation outcomes for institutional memory. Shows which strategies worked and which failed.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "issue_type": {
-                    "type": "string",
-                    "description": "Filter by issue type/category",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 20)",
-                    "default": 20,
-                },
-            },
-        },
+        "description": (
+            "Get past remediation outcomes for institutional memory. "
+            "Shows which strategies worked and which failed."
+        ),
+        "view": "mcp_remediation_history",
+        "example_query": (
+            "SELECT * FROM mcp_remediation_history "
+            "WHERE issue_type = 'broken_link' LIMIT 20"
+        ),
     },
     {
         "name": "get_remediation_metrics",
-        "description": "Get aggregate metrics for all remediation workflows: success rate, avg improvement, token usage, fork count.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-        },
-    },
-    {
-        "name": "search_artifacts_semantic",
-        "description": "Semantic similarity search across knowledge artifacts using CockroachDB distributed vector indexing. Find artifacts related to a query concept.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Natural language query to find related artifacts",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 10)",
-                    "default": 10,
-                },
-            },
-            "required": ["query"],
-        },
+        "description": (
+            "Get aggregate metrics: success rate, avg improvement, "
+            "token usage, fork count."
+        ),
+        "view": "mcp_remediation_history",
+        "example_query": (
+            "SELECT count(*) AS total_workflows, "
+            "count(*) FILTER (WHERE verification_outcome = 'resolved') "
+            "AS problems_resolved, "
+            "avg(score_after - score_before) AS avg_score_improvement "
+            "FROM mcp_remediation_history"
+        ),
     },
     {
         "name": "get_assessment_history",
-        "description": "Get historical assessment snapshots to track knowledge health over time.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 10)",
-                    "default": 10,
-                },
-            },
-        },
+        "description": "Get historical assessment snapshots over time.",
+        "view": "mcp_knowledge_health",
+        "example_query": (
+            "SELECT * FROM knowledge_assessments ORDER BY created_at DESC "
+            "LIMIT 10"
+        ),
     },
     {
         "name": "get_decision_trace",
-        "description": "Get the full reasoning chain for a remediation outcome. Shows why the agent made each decision.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "outcome_id": {
-                    "type": "string",
-                    "description": "Remediation outcome ID",
-                },
-            },
-            "required": ["outcome_id"],
-        },
+        "description": (
+            "Get the full reasoning chain for a remediation outcome. "
+            "Shows why the agent made each decision."
+        ),
+        "view": "mcp_decision_traces",
+        "example_query": (
+            "SELECT * FROM mcp_decision_traces "
+            "WHERE outcome_id = '<outcome_id>' ORDER BY created_at"
+        ),
     },
     {
         "name": "get_health_trend",
-        "description": "Get knowledge health score trend over time (daily aggregates). Shows whether knowledge quality is improving, degrading, or stable.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "days": {
-                    "type": "integer",
-                    "description": "Lookback period in days (default 30)",
-                    "default": 30,
-                },
-            },
-        },
+        "description": (
+            "Get daily score aggregates for monitoring knowledge health "
+            "over time."
+        ),
+        "view": "mcp_health_trend",
+        "example_query": "SELECT * FROM mcp_health_trend",
     },
     {
         "name": "get_active_workflows",
-        "description": "Get all active or paused agent workflows. Shows in-progress remediation work that can be resumed.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-        },
+        "description": (
+            "Get all active or paused agent workflows. Shows in-progress "
+            "remediation work that can be resumed."
+        ),
+        "view": "mcp_active_workflows",
+        "example_query": "SELECT * FROM mcp_active_workflows",
     },
     {
         "name": "get_remediation_context",
-        "description": "Get historical context for a problem type: which strategies worked, which failed, and past decision traces. Used by the agent to inform future remediation decisions.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "issue_type": {
-                    "type": "string",
-                    "description": "Problem category/type to get context for",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max recent outcomes (default 5)",
-                    "default": 5,
-                },
-            },
-            "required": ["issue_type"],
-        },
+        "description": (
+            "Get historical context for a problem type: which strategies "
+            "worked, which failed, and past decision traces."
+        ),
+        "view": "mcp_remediation_history",
+        "example_query": (
+            "SELECT * FROM mcp_remediation_history "
+            "WHERE issue_type = '<issue_type>' ORDER BY created_at DESC LIMIT 5"
+        ),
     },
 ]
 
+# Backward-compatible alias (old code may reference MCP_TOOLS)
+MCP_TOOLS = MCP_QUERY_CATALOG
 
-def handle_tool_call(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Handle an MCP tool call by routing to the appropriate CockroachDB query.
+# Module-level store reference for handle_tool_call
+_store: Any = None
 
-    This function is called by the MCP server when an external agent
-    invokes a tool. All queries are read-only (safe by default).
+
+def set_store(store: Any) -> None:
+    """Set the CockroachDBStore instance for handle_tool_call queries."""
+    global _store
+    _store = store
+
+
+def handle_tool_call(tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Handle an MCP tool call by querying the CockroachDB store directly.
+
+    This provides a programmatic interface mirroring what external agents
+    would do via the CockroachDB Cloud managed MCP server's select_query tool.
     """
-    from ai_ready.storage.cockroach import CockroachDBStore
-    from ai_ready.llm.embeddings import EmbeddingProvider
+    if _store is None:
+        return {"message": "No store connected. Call set_store() first."}
 
-    db_url = os.environ.get("COCKROACH_DB_URL", "")
-    store = CockroachDBStore(connection_string=db_url)
-    store.connect()
+    limit = params.get("limit", 10)
 
     if tool_name == "get_knowledge_health":
-        latest = store.get_latest_assessment()
-        if latest is None:
-            return {"message": "No assessments found. Run an assessment first."}
-        return latest.to_dict()
+        try:
+            row = _store._execute_fetchone(
+                "SELECT score, signals_count FROM knowledge_assessments ORDER BY created_at DESC LIMIT 1"
+            )
+            if row:
+                return {"score": row.get("score", 0), "signals_count": row.get("signals_count", 0)}
+            return {"message": "No assessments found."}
+        except Exception as e:
+            return {"message": f"Error: {e}"}
 
     elif tool_name == "get_signals":
-        severity = arguments.get("severity")
-        collector_id = arguments.get("collector_id")
-        artifact_uri = arguments.get("artifact_uri")
-        status = arguments.get("status")
-        limit = arguments.get("limit", 50)
-
-        if artifact_uri:
-            signals = store.get_signals_for_artifact(artifact_uri)
-        elif status:
-            signals = store.get_signals_by_status(status)
-        else:
-            signals = store.get_all_signals()
-
-        # Apply filters
-        if severity:
-            signals = [s for s in signals if s.severity == severity]
-        if collector_id:
-            signals = [s for s in signals if s.collector_id == collector_id]
-
-        return {"signals": [s.to_dict() for s in signals[:limit]], "count": len(signals)}
-
-    elif tool_name == "get_problem_queue":
-        status = arguments.get("status", "open")
-        limit = arguments.get("limit", 10)
-        problems = store.get_problems(status=status, limit=limit)
-        return {"problems": [p.to_dict() for p in problems], "count": len(problems)}
-
-    elif tool_name == "get_remediation_history":
-        issue_type = arguments.get("issue_type")
-        limit = arguments.get("limit", 20)
-        history = store.get_remediation_history(issue_type=issue_type, limit=limit)
-        return {"outcomes": [r.to_dict() for r in history], "count": len(history)}
-
-    elif tool_name == "get_remediation_metrics":
-        return store.get_remediation_metrics()
+        try:
+            rows = _store._execute_fetchall(
+                "SELECT signal_id, collector_id, signal_type, severity, artifact_uri, recommendation "
+                "FROM knowledge_signals ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            )
+            return {"count": len(rows), "signals": rows}
+        except Exception as e:
+            return {"count": 0, "signals": [], "error": str(e)}
 
     elif tool_name == "search_artifacts_semantic":
-        query = arguments.get("query", "")
-        limit = arguments.get("limit", 10)
-
-        # Generate embedding via EmbeddingProvider (HuggingFace/TF-IDF)
-        embedder = EmbeddingProvider(dim=384)
-        query_embedding = embedder.embed(query)
-
-        results = store.search_artifacts_semantic(query_embedding, limit=limit)
-        return {
-            "results": [
-                {
-                    "artifact_uri": artifact.artifact_uri,
-                    "artifact_type": artifact.artifact_type,
-                    "similarity": round(similarity, 4),
-                    "title": json.loads(artifact.metadata).get("title", "") if artifact.metadata else "",
-                }
-                for artifact, similarity in results
-            ],
-            "query": query,
-        }
-
-    elif tool_name == "get_assessment_history":
-        limit = arguments.get("limit", 10)
-        history = store.get_assessment_history(limit=limit)
-        return {"assessments": [a.to_dict() for a in history], "count": len(history)}
-
-    elif tool_name == "get_decision_trace":
-        outcome_id = arguments.get("outcome_id", "")
-        traces = store.get_decision_traces(outcome_id)
-        return {"traces": traces, "count": len(traces)}
-
-    elif tool_name == "get_health_trend":
-        days = arguments.get("days", 30)
-        trend = store.get_knowledge_health_trend(days=days)
-        return {"trend": trend, "days": days}
+        try:
+            from ai_ready.llm.embeddings import get_embedder
+            embedder = get_embedder()
+            q_emb = embedder.embed(params.get("query", ""))
+            results = _store.search_artifacts_semantic(q_emb, limit=limit)
+            return {"results": [{"artifact_uri": r[0].artifact_uri, "similarity": r[1]} for r in results]}
+        except Exception as e:
+            return {"results": [], "error": str(e)}
 
     elif tool_name == "get_active_workflows":
-        workflows = store.get_active_workflows()
-        return {"workflows": workflows, "count": len(workflows)}
+        try:
+            workflows = _store.get_all_workflows(limit=limit)
+            return {"count": len(workflows), "workflows": workflows}
+        except Exception as e:
+            return {"count": 0, "workflows": [], "error": str(e)}
+
+    elif tool_name == "get_remediation_history":
+        try:
+            history = _store.get_remediation_history(limit=limit)
+            return {"count": len(history), "outcomes": [h.__dict__ if hasattr(h, '__dict__') else h for h in history]}
+        except Exception as e:
+            return {"count": 0, "outcomes": [], "error": str(e)}
+
+    elif tool_name == "get_decision_trace":
+        try:
+            outcome_id = params.get("outcome_id", "")
+            traces = _store.get_decision_traces(outcome_id)
+            return {"count": len(traces), "traces": traces}
+        except Exception as e:
+            return {"count": 0, "traces": [], "error": str(e)}
 
     elif tool_name == "get_remediation_context":
-        issue_type = arguments.get("issue_type", "")
-        limit = arguments.get("limit", 5)
-        context = store.get_remediation_context(issue_type, limit=limit)
-        return context
+        try:
+            issue_type = params.get("issue_type", "")
+            context = _store.get_remediation_context(issue_type=issue_type, limit=limit)
+            return context
+        except Exception as e:
+            return {"error": str(e)}
 
-    else:
-        return {"error": f"Unknown tool: {tool_name}"}
+    elif tool_name == "get_remediation_metrics":
+        try:
+            history = _store.get_remediation_history(limit=100)
+            total = len(history)
+            resolved = sum(1 for h in history if getattr(h, 'verification_outcome', '') == 'resolved')
+            partially = sum(1 for h in history if getattr(h, 'verification_outcome', '') == 'partially_resolved')
+            improvements = [getattr(h, 'score_after', 0) - getattr(h, 'score_before', 0) for h in history]
+            avg_improvement = sum(improvements) / len(improvements) if improvements else 0
+            return {
+                "total_workflows": total,
+                "resolved": resolved,
+                "partially_resolved": partially,
+                "verification_success_rate": (resolved + partially) / total if total else 0,
+                "avg_score_improvement": avg_improvement,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    return {"message": f"Unknown tool: {tool_name}"}
 
 
 def get_mcp_manifest() -> dict[str, Any]:
-    """Return the MCP server manifest with tool definitions.
+    """Return the MCP tool catalog for documentation/display.
 
-    This manifest is registered with the CockroachDB Cloud MCP Server
-    so external agents can discover and call these tools.
+    This is NOT a server manifest — it documents which select_query
+    calls an external agent should make against the mcp_* views via
+    the CockroachDB Cloud managed MCP server.
     """
     return {
-        "server_name": "ai-knowledge-maintenance",
-        "description": "Agentic knowledge maintenance system — assesses knowledge base health, discovers problems, and tracks remediation outcomes using CockroachDB as persistent memory.",
-        "version": "0.1.0",
-        "tools": MCP_TOOLS,
-        "default_mode": "read-only",
-        "audit_logging": True,
+        "system": "ai-knowledge-maintenance",
+        "description": (
+            "Agentic knowledge maintenance system — assesses knowledge "
+            "base health, discovers problems, and tracks remediation "
+            "outcomes using CockroachDB as persistent memory."
+        ),
+        "access_model": "read-only via mcp_* views",
+        "managed_mcp_endpoint": "https://cockroachlabs.cloud/mcp",
+        "tools": [
+            {
+                "name": entry["name"],
+                "description": entry["description"],
+                "view": entry["view"],
+                "example_select_query": entry["example_query"],
+            }
+            for entry in MCP_QUERY_CATALOG
+        ],
     }
 
 
 if __name__ == "__main__":
-    # Print the MCP manifest for registration
     manifest = get_mcp_manifest()
     print(json.dumps(manifest, indent=2))
-    print("\n--- Tool Count ---")
-    print(f"{len(MCP_TOOLS)} tools available for external agents")
+    print(f"\n--- Tool Count ---")
+    print(f"{len(MCP_QUERY_CATALOG)} tools in the query catalog")

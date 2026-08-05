@@ -38,7 +38,9 @@ class ExecutionStep:
     step_type: str  # "update_document", "add_metadata", etc.
     artifact_uri: str
     description: str
-    success: bool = True
+    success: bool = True       # handler ran without exception
+    applied: bool = True       # the modification was actually written to disk
+    skipped_reason: str = ""    # why it was skipped (e.g. "blocked by allowlist")
     error: str = ""
     timestamp: str = ""
     details: dict[str, Any] = field(default_factory=dict)
@@ -49,6 +51,8 @@ class ExecutionStep:
             "artifact_uri": self.artifact_uri,
             "description": self.description,
             "success": self.success,
+            "applied": self.applied,
+            "skipped_reason": self.skipped_reason,
             "error": self.error,
             "timestamp": self.timestamp,
             "details": self.details,
@@ -94,19 +98,27 @@ class KnowledgeExecutor:
         self.known_artifact_uris = known_artifact_uris or set()
         self._dry_run = artifact_store is None and self.source_path is None
 
-    def _resolve_path(self, artifact_uri: str) -> Path | None:
+    def _resolve_path(self, artifact_uri: str, is_create: bool = False) -> Path | None:
         """Resolve an artifact URI to a full file path safely.
 
         Security: The LLM controls ``artifact_uri`` and the executor calls
-        ``write_text`` on the resolved path.  This method enforces three
-        layers of containment:
+        ``write_text`` on the resolved path.  This method enforces
+        containment layers depending on the operation type:
 
+        **Modify operations** (is_create=False):
         1. **Allowlist** — if ``known_artifact_uris`` is populated, reject
            any URI not in the set.
         2. **Path-escape prevention** — resolve the full path and verify it
            is still inside ``source_path`` (blocks ``../../etc/passwd`` etc.).
-        3. **Existence check** — the file must already exist (we never create
-           new files through the executor).
+        3. **Existence check** — the file must already exist (we never
+           modify non-existent files).
+
+        **Create operations** (is_create=True):
+        1. **No allowlist** — new files are allowed even if the URI isn't
+           in ``known_artifact_uris`` (the file doesn't exist yet).
+        2. **Path-escape prevention** — same as modify: resolve and verify
+           the path is inside ``source_path``.
+        3. **No existence check** — the file is expected NOT to exist yet.
 
         Returns ``None`` on any failure — callers must treat ``None`` as
         "do not write".
@@ -114,12 +126,12 @@ class KnowledgeExecutor:
         if self.source_path is None:
             return None
 
-        # Layer 1: allowlist enforcement
-        if self.known_artifact_uris and artifact_uri not in self.known_artifact_uris:
+        # Layer 1: allowlist enforcement (modify only; create skips this)
+        if not is_create and self.known_artifact_uris and artifact_uri not in self.known_artifact_uris:
             logger.warning("Rejected unknown artifact URI: %s", artifact_uri)
             return None
 
-        # Layer 2: path-escape prevention
+        # Layer 2: path-escape prevention (always enforced)
         full_path = self.source_path / artifact_uri
         try:
             resolved = full_path.resolve()
@@ -129,7 +141,9 @@ class KnowledgeExecutor:
         except Exception:
             return None
 
-        # Layer 3: existence
+        # Layer 3: existence check (modify only; create skips this)
+        if is_create:
+            return full_path
         return full_path if full_path.exists() else None
 
     def _get_signals_for_artifact(self, artifact_uri: str) -> list[Any]:
@@ -163,11 +177,16 @@ class KnowledgeExecutor:
             try:
                 handler = self._get_handler(step_type)
                 details = handler(step)
+                # Check if the handler reported the step was skipped/blocked
+                is_skipped = details.get("skipped", False) if isinstance(details, dict) else False
+                skipped_reason = details.get("skipped_reason", "") if isinstance(details, dict) else ""
                 results.append(ExecutionStep(
                     step_type=step_type,
                     artifact_uri=artifact_uri,
                     description=description,
                     success=True,
+                    applied=not is_skipped,
+                    skipped_reason=skipped_reason,
                     timestamp=timestamp,
                     details=details,
                 ))
@@ -178,6 +197,8 @@ class KnowledgeExecutor:
                     artifact_uri=artifact_uri,
                     description=description,
                     success=False,
+                    applied=False,
+                    skipped_reason=f"Exception: {e}",
                     error=str(e),
                     timestamp=timestamp,
                 ))
@@ -191,6 +212,7 @@ class KnowledgeExecutor:
             "update_document": self._handle_update_document,
             "add_metadata": self._handle_add_metadata,
             "create_relationship": self._handle_create_relationship,
+            "create_document": self._handle_create_document,
             "remove_relationship": self._handle_remove_relationship,
             "archive_artifact": self._handle_archive_artifact,
             "merge_artifacts": self._handle_merge_artifacts,
@@ -232,7 +254,8 @@ class KnowledgeExecutor:
     # -----------------------------------------------------------------------
 
     def _handle_update_document(self, step: dict[str, Any]) -> dict[str, Any]:
-        """Handle document content update — fix broken links and dangling refs.
+        """Handle document content update — fix broken links, dangling refs,
+        and add canonical source links.
 
         Solves the ROOT CAUSE by applying the fix to ALL artifacts that have
         the relevant signal type, not just the one file mentioned in the step.
@@ -247,13 +270,23 @@ class KnowledgeExecutor:
            signals. Conservative: only replaces clearly ambiguous phrases
            that would be meaningless to an LLM reading a single chunk without
            surrounding context.
-        3. Writes each modified file back to disk
+        3. Adds canonical source links for missing_canonical_source signals —
+           adds a markdown link to the canonical domain so the
+           CanonicalSourceCollector finds it on re-assessment.
+        4. Writes each modified file back to disk
         """
         artifact_uri = step.get("artifact_uri", "")
         description = step.get("description", "")
+        params = step.get("parameters", {})
+        action = params.get("action", "")
 
         if self._dry_run:
             return {"mode": "dry_run", "message": "Document update simulated"}
+
+        # If the step has an explicit action parameter, use it directly
+        # (this comes from the remediation map — no keyword guessing needed)
+        if action == "add_canonical_link":
+            return self._fix_canonical_links(step, params)
 
         # Determine which signal types to fix based on the step description
         desc_lower = description.lower()
@@ -375,9 +408,126 @@ class KnowledgeExecutor:
             "sample_fixes": all_fix_details[:5],
         }
 
-    def _handle_add_metadata(self, step: dict[str, Any]) -> dict[str, Any]:
-        """Handle metadata addition — add YAML frontmatter to document."""
+    def _fix_canonical_links(
+        self, step: dict[str, Any], params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Add canonical source links to resolve missing_canonical_source signals.
+
+        CanonicalSourceCollector checks artifact.links for links to
+        canonical domains.  This handler adds a markdown link to the
+        canonical domain at the top of the document (after the title)
+        so the collector finds it on re-assessment.
+
+        Applies to ALL artifacts with missing_canonical_source signals
+        that match the same canonical domain, not just the one in the step.
+        """
         artifact_uri = step.get("artifact_uri", "")
+        canonical_domain = params.get("canonical_domain", "")
+        topic_keyword = params.get("topic_keyword", "")
+        signal_type = params.get("signal_type", "missing_canonical_source")
+
+        if self._dry_run:
+            return {"mode": "dry_run", "message": "Canonical link addition simulated"}
+
+        # Find ALL artifacts with missing_canonical_source signals for
+        # this canonical domain (root-cause fix, not just the one file)
+        artifacts_to_fix: set[str] = set()
+        for signal in self.assessment_signals:
+            if signal.signal_type == "missing_canonical_source":
+                evidence = signal.evidence or {}
+                sig_domain = evidence.get("canonical_domain", "")
+                if sig_domain == canonical_domain or not canonical_domain:
+                    artifacts_to_fix.add(signal.artifact_uri)
+
+        if artifact_uri:
+            artifacts_to_fix.add(artifact_uri)
+
+        if not artifacts_to_fix:
+            return {"mode": "production", "files_fixed": 0,
+                    "message": "No artifacts with missing canonical source"}
+
+        total_files_fixed = 0
+        total_fixes = 0
+        all_fix_details: list[str] = []
+
+        for uri in sorted(artifacts_to_fix):
+            file_path = self._resolve_path(uri)
+            if file_path is None:
+                continue
+
+            content = file_path.read_text(encoding="utf-8")
+            original_content = content
+
+            # Determine the canonical domain for this specific artifact
+            sig_domain = canonical_domain
+            if not sig_domain:
+                for signal in self.assessment_signals:
+                    if (signal.signal_type == "missing_canonical_source"
+                            and signal.artifact_uri == uri):
+                        sig_domain = (signal.evidence or {}).get(
+                            "canonical_domain", "")
+                        break
+
+            if not sig_domain:
+                continue
+
+            canonical_url = f"https://{sig_domain}/"
+            link_text = f"Official {topic_keyword or sig_domain.split('.')[0]} documentation"
+
+            # Check if the link already exists
+            if canonical_url in content:
+                continue
+
+            # Add the canonical link after the first H1 heading
+            # (or at the top if no H1)
+            h1_match = re.search(r"^(# .+)$", content, re.MULTILINE)
+            if h1_match:
+                insert_pos = h1_match.end()
+                # Skip the newline after H1
+                if insert_pos < len(content) and content[insert_pos] == "\n":
+                    insert_pos += 1
+                canonical_line = f"\n> See the [{link_text}]({canonical_url})\n"
+                content = content[:insert_pos] + canonical_line + content[insert_pos:]
+            else:
+                canonical_line = f"> See the [{link_text}]({canonical_url})\n\n"
+                content = canonical_line + content
+
+            if content != original_content:
+                file_path.write_text(content, encoding="utf-8")
+                total_files_fixed += 1
+                total_fixes += 1
+                all_fix_details.append(
+                    f"Added canonical link to {sig_domain} in {uri}"
+                )
+
+        return {
+            "mode": "production",
+            "files_checked": len(artifacts_to_fix),
+            "files_fixed": total_files_fixed,
+            "total_fixes": total_fixes,
+            "sample_fixes": all_fix_details[:5],
+            "signal_type": signal_type,
+            "applied": total_files_fixed > 0,
+        }
+
+    def _handle_add_metadata(self, step: dict[str, Any]) -> dict[str, Any]:
+        """Handle metadata addition — add or update YAML frontmatter.
+
+        Writes the EXACT front-matter key the collector reads so the
+        signal clears on re-assessment (Item 1.1 constraint).
+
+        For no_date_signal / stale_content (FreshnessCollector):
+          Writes ``date`` key — FreshnessCollector reads metadata keys
+          "last_modified", "date", "updated", "created", "last_updated".
+
+        If frontmatter already exists, the key is updated in-place
+        rather than skipping (so stale dates get refreshed).
+        """
+        artifact_uri = step.get("artifact_uri", "")
+        params = step.get("parameters", {})
+        meta_key = params.get("metadata_key", "date")
+        meta_value = params.get("metadata_value", "")
+        signal_type = params.get("signal_type", "")
 
         if self._dry_run:
             return {"mode": "dry_run", "message": "Metadata update simulated"}
@@ -387,29 +537,59 @@ class KnowledgeExecutor:
             return {"mode": "dry_run", "message": f"File not found: {artifact_uri}"}
 
         content = file_path.read_text(encoding="utf-8")
+        original_content = content
 
         # Check if frontmatter already exists
         if content.startswith("---"):
+            # Update existing frontmatter — replace or add the key
+            fm_end = content.index("---", 3)  # find closing ---
+            fm_block = content[3:fm_end]
+            rest = content[fm_end + 3:]
+
+            # Check if the key already exists in frontmatter
+            key_pattern = re.compile(
+                rf"^(\s*{re.escape(meta_key)}\s*:\s*)(.*)$",
+                re.MULTILINE,
+            )
+            if key_pattern.search(fm_block):
+                # Update existing key
+                fm_block = key_pattern.sub(
+                    rf"\g<1>{meta_value}", fm_block
+                )
+            else:
+                # Add new key to frontmatter
+                fm_block = fm_block.rstrip() + f"\n{meta_key}: {meta_value}\n"
+
+            content = "---" + fm_block + "---" + rest
+        else:
+            # Create new frontmatter with the metadata key
+            # Also add title from first H1 if available
+            title_match = re.search(r"^#\s+(.+)$", content, re.MULTILINE)
+            title = title_match.group(1).strip() if title_match else \
+                artifact_uri.rsplit("/", 1)[-1].rsplit(".", 1)[0].replace("_", " ").title()
+
+            if meta_key == "date":
+                frontmatter = f"---\ntitle: {title}\n{meta_key}: {meta_value}\n---\n\n"
+            else:
+                frontmatter = f"---\n{meta_key}: {meta_value}\n---\n\n"
+            content = frontmatter + content
+
+        if content != original_content:
+            file_path.write_text(content, encoding="utf-8")
             return {
                 "mode": "production",
                 "file": str(file_path),
-                "message": "Frontmatter already exists, skipping",
+                "metadata_added": [meta_key],
+                "signal_type": signal_type,
+                "applied": True,
             }
-
-        # Add minimal frontmatter — extract title from first H1 heading
-        # to avoid adding generic "title: Documentation" which doesn't
-        # improve knowledge quality and could introduce new signals.
-        title_match = re.search(r"^#\s+(.+)$", content, re.MULTILINE)
-        title = title_match.group(1).strip() if title_match else \
-            artifact_uri.rsplit("/", 1)[-1].rsplit(".", 1)[0].replace("_", " ").title()
-        frontmatter = f"---\ntitle: {title}\n---\n\n"
-        file_path.write_text(frontmatter + content, encoding="utf-8")
-
-        return {
-            "mode": "production",
-            "file": str(file_path),
-            "metadata_added": ["title"],
-        }
+        else:
+            return {
+                "mode": "production",
+                "file": str(file_path),
+                "message": "No changes needed — metadata already correct",
+                "applied": False,
+            }
 
     def _handle_create_relationship(self, step: dict[str, Any]) -> dict[str, Any]:
         """Handle relationship creation — fix root cause of orphaned documents.
@@ -430,10 +610,10 @@ class KnowledgeExecutor:
         if self._dry_run:
             return {"mode": "dry_run", "message": "Relationship creation simulated"}
 
-        # Find ALL artifacts with orphaned_documents signals
+        # Find ALL artifacts with orphan signals (all signal type variants)
         orphaned_uris: set[str] = set()
         for signal in self.assessment_signals:
-            if signal.signal_type in ("orphan", "orphaned_documents"):
+            if signal.signal_type in ("orphan", "orphaned_documents", "orphan_artifact"):
                 orphaned_uris.add(signal.artifact_uri)
 
         if not orphaned_uris:
@@ -531,26 +711,97 @@ class KnowledgeExecutor:
             "message": f"Added {len(links_added)} cross-reference links to index page",
         }
 
-    def _handle_remove_relationship(self, step: dict[str, Any]) -> dict[str, Any]:
-        """Handle relationship removal."""
+    def _handle_create_document(self, step: dict[str, Any]) -> dict[str, Any]:
+        """Handle creating a new document inside source_path.
+
+        This is a CREATE operation — the allowlist is skipped (the file
+        doesn't exist yet), but path-escape prevention is still enforced.
+        The file must be inside source_path.
+        """
+        artifact_uri = step.get("artifact_uri", "")
+        content = step.get("content", "")
+        description = step.get("description", "")
+
         if self._dry_run:
-            return {"mode": "dry_run", "message": "Relationship removal simulated"}
-        raise NotImplementedError("Production relationship removal requires artifact_store")
+            return {"mode": "dry_run", "message": "Document creation simulated"}
+
+        if not artifact_uri:
+            return {"mode": "production", "skipped": True,
+                    "skipped_reason": "No artifact_uri provided for create_document"}
+
+        # Use is_create=True to skip allowlist and existence check
+        file_path = self._resolve_path(artifact_uri, is_create=True)
+        if file_path is None:
+            return {"mode": "production", "skipped": True,
+                    "skipped_reason": f"Path resolution failed for new file: {artifact_uri}"}
+
+        # If the file already exists, don't overwrite — skip
+        if file_path.exists():
+            return {"mode": "production", "skipped": True,
+                    "skipped_reason": f"File already exists: {artifact_uri}"}
+
+        # Create parent directories if needed
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write the new file
+        file_path.write_text(content, encoding="utf-8")
+
+        return {
+            "mode": "production",
+            "file": str(file_path),
+            "created": True,
+            "message": f"Created new document: {artifact_uri}",
+        }
+
+    def _handle_remove_relationship(self, step: dict[str, Any]) -> dict[str, Any]:
+        """Handle relationship removal — explicitly disabled.
+
+        Relationship removal requires graph mutation via artifact_store,
+        which is not implemented.  Returns a clear skip result rather
+        than raising NotImplementedError (Item 1.1 — no silent no-ops).
+        """
+        return {
+            "mode": "production",
+            "skipped": True,
+            "skipped_reason": "Relationship removal not implemented — requires artifact_store graph mutation",
+            "applied": False,
+        }
 
     def _handle_archive_artifact(self, step: dict[str, Any]) -> dict[str, Any]:
-        """Handle artifact archiving."""
-        if self._dry_run:
-            return {"mode": "dry_run", "message": "Artifact archival simulated"}
-        raise NotImplementedError("Production archival requires artifact_store")
+        """Handle artifact archiving — explicitly disabled.
+
+        Archival requires artifact_store lifecycle management, which
+        is not implemented.  Returns a clear skip result.
+        """
+        return {
+            "mode": "production",
+            "skipped": True,
+            "skipped_reason": "Artifact archival not implemented — requires artifact_store lifecycle management",
+            "applied": False,
+        }
 
     def _handle_merge_artifacts(self, step: dict[str, Any]) -> dict[str, Any]:
-        """Handle artifact merging."""
-        if self._dry_run:
-            return {"mode": "dry_run", "message": "Artifact merge simulated"}
-        raise NotImplementedError("Production merge requires artifact_store")
+        """Handle artifact merging — explicitly disabled.
+
+        Merging requires content deduplication logic, which is not
+        implemented.  Returns a clear skip result.
+        """
+        return {
+            "mode": "production",
+            "skipped": True,
+            "skipped_reason": "Artifact merging not implemented — requires content deduplication logic",
+            "applied": False,
+        }
 
     def _handle_split_artifact(self, step: dict[str, Any]) -> dict[str, Any]:
-        """Handle artifact splitting."""
-        if self._dry_run:
-            return {"mode": "dry_run", "message": "Artifact split simulated"}
-        raise NotImplementedError("Production split requires artifact_store")
+        """Handle artifact splitting — explicitly disabled.
+
+        Splitting requires content partitioning logic, which is not
+        implemented.  Returns a clear skip result.
+        """
+        return {
+            "mode": "production",
+            "skipped": True,
+            "skipped_reason": "Artifact splitting not implemented — requires content partitioning logic",
+            "applied": False,
+        }

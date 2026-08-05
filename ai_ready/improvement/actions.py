@@ -60,6 +60,10 @@ from ai_ready.improvement.heuristics import (
     parse_hypotheses_and_problems,
     parse_proposals,
 )
+from ai_ready.improvement.remediation_map import (
+    constrain_proposal_steps,
+    build_remediation_steps_from_signals,
+)
 from ai_ready.llm.base import LLMMessage
 
 logger = logging.getLogger(__name__)
@@ -77,7 +81,8 @@ logger = logging.getLogger(__name__)
                 "last_analysis_signal_ids", "skip_events", "problem_saliences"])
 def analyze_issue(state: State, llm_gateway: Any = None, assessment_store: Any = None,
                   history_store: Any = None,
-                  diagnosis_quality_tracker: Any = None) -> State:
+                  diagnosis_quality_tracker: Any = None,
+                  config: Any = None) -> State:
     """Analyze assessment signals and determine root causes.
 
     Uses the LLM to reason about why the knowledge quality issues exist.
@@ -117,6 +122,9 @@ def analyze_issue(state: State, llm_gateway: Any = None, assessment_store: Any =
     # last analysis. This prevents wasted LLM calls on unchanged state.
     eligibility = check_signal_delta(signal_ids, last_analysis_signal_ids if last_analysis_signal_ids else None)
 
+    # Salience threshold — set once, used in both heuristic-only and LLM paths
+    salience_threshold = config.salience_threshold if config else DEFAULT_SALIENCE_THRESHOLD
+
     # --- Heuristic Pre-Analysis (deterministic, no LLM) ---
     # Always run heuristic discovery as a baseline. This provides problem
     # candidates even without an LLM. When an LLM is available, it can
@@ -141,6 +149,7 @@ def analyze_issue(state: State, llm_gateway: Any = None, assessment_store: Any =
         # Rank heuristic problems by salience (deterministic)
         ranked_problems, saliences, skipped_problems = rank_problems_by_salience(
             heuristic_problems_result, assessment, history_store,
+            threshold=salience_threshold,
         )
 
         # Record skipped low-salience problems
@@ -344,6 +353,7 @@ Provide your root cause analysis as JSON. Remember: distinguish observations fro
         # filter out low-salience ones to reduce token waste.
         ranked_problems, saliences, skipped_problems = rank_problems_by_salience(
             knowledge_problems, assessment, history_store,
+            threshold=salience_threshold,
         )
         for sp in skipped_problems:
             skip_events.append(SkipEvent(
@@ -392,7 +402,8 @@ Provide your root cause analysis as JSON. Remember: distinguish observations fro
 @action(reads=["root_cause_analysis", "knowledge_problems", "affected_artifact_uris",
                "prior_failures", "assessment_id", "prior_diagnosis", "prior_strategy",
                "prior_verification", "decision_trace", "assessment_summary", "cumulative_tokens",
-               "problem_saliences", "prior_modification_steps", "systemic_clusters"],
+               "problem_saliences", "prior_modification_steps", "systemic_clusters",
+               "assessment_signals"],
         writes=["proposals", "selected_proposal_idx", "current_stage", "llm_metadata",
                 "decision_trace", "cumulative_tokens", "systemic_clusters"])
 def generate_proposal(state: State, llm_gateway: Any = None, history_store: Any = None,
@@ -696,6 +707,39 @@ Propose 1-3 improvement strategies as JSON. Focus on improving the knowledge sys
         # when the LLM generates overlapping steps for systemic clusters
         proposals = deduplicate_modification_steps(proposals)
 
+        # Constrain proposals to implemented, signal-mapped step types
+        # (Item 1.1 — no silent no-ops, no NotImplementedError crashes).
+        # Replace disabled/unknown step types with concrete steps from
+        # the remediation map so the executor always has actionable work.
+        assessment_signals = state.get("assessment_signals", [])
+        if not assessment_signals:
+            # Fall back to reconstructing from root cause analysis
+            assessment_signals = state.get("all_signals", [])
+        proposals = constrain_proposal_steps(proposals, assessment_signals)
+
+        # Fallback: if no proposals survived constraining, build concrete
+        # steps directly from the remediation map (Item 1.1 — the loop
+        # must always have actionable work for fixable signal types).
+        if not proposals and assessment_signals:
+            concrete_steps = build_remediation_steps_from_signals(assessment_signals)
+            if concrete_steps:
+                fallback_proposal = RemediationProposal(
+                    strategy="signal_mapped_remediation",
+                    description="Concrete remediation steps generated directly from signal types via the remediation map.",
+                    expected_impact=f"Resolve {len(concrete_steps)} signal(s)",
+                    risks=["Minimal — deterministic fixes matching collector detection format"],
+                    affected_artifact_uris=list({s.get("artifact_uri", "") for s in concrete_steps}),
+                    modification_steps=concrete_steps,
+                    root_cause_idx=0,
+                    reasoning="No LLM/heuristic proposals survived constraining. Falling back to concrete signal-mapped steps.",
+                    affected_dimensions=[],
+                    confidence=0.9,
+                    assumptions=["Collectors will re-assess and clear signals after fix"],
+                    rollback_considerations="Revert file changes via git",
+                )
+                proposals = [fallback_proposal]
+                llm_meta["fallback"] = "signal_mapped_remediation"
+
         # Track cumulative tokens across all actions
         action_tokens = (llm_meta.get("prompt_tokens", 0) or 0) + (llm_meta.get("completion_tokens", 0) or 0)
         cumulative_tokens += action_tokens
@@ -888,7 +932,8 @@ def verify_improvement(state: State, assessment_store: Any = None,
                        relationships: list[Any] = None,
                        source: str = "",
                        git_commit: str = "",
-                       diagnosis_quality_tracker: Any = None) -> State:
+                       diagnosis_quality_tracker: Any = None,
+                       cockroach_store: Any = None) -> State:
     """Verify whether the improvement worked by re-running the assessment.
 
     Verification operates at the Knowledge Problem level, not individual
@@ -909,6 +954,27 @@ def verify_improvement(state: State, assessment_store: Any = None,
                 success=False, summary="Execution failed — cannot verify",
                 failure_explanation="One or more execution steps failed. "
                     "The proposed modifications were not fully applied to the artifacts.",
+            ).to_dict(),
+        )
+
+    # Check if any steps were actually applied (not all skipped/blocked)
+    applied_steps = [s for s in execution_history if s.get("applied", True)]
+    skipped_steps = [s for s in execution_history if not s.get("applied", True)]
+    if not applied_steps:
+        # All steps were skipped/blocked — don't claim success
+        skipped_summary = "; ".join(
+            f"[{s.get('step_type', '?')}] {s.get('skipped_reason', 'unknown')}"
+            for s in skipped_steps
+        )
+        return state.update(
+            current_stage=RemediationStatus.FAILED_VERIFICATION.value,
+            verification_results=VerificationResult(
+                success=False,
+                summary="All execution steps were skipped or blocked — cannot verify",
+                failure_explanation=(
+                    f"No modifications were applied to the artifacts. "
+                    f"All {len(skipped_steps)} step(s) were skipped: {skipped_summary}"
+                ),
             ).to_dict(),
         )
 
@@ -1132,7 +1198,8 @@ def verify_improvement(state: State, assessment_store: Any = None,
                     f"Overall: {overall_outcome}. "
                     f"Resolved: {len(resolved_ids)}, New: {len(new_ids)}, "
                     f"Remaining targets: {len(remaining_target_ids)}/{len(target_signal_ids)}. "
-                    f"Strategy: {strategy}.",
+                    f"Strategy: {strategy}. "
+                    f"Steps applied: {len(applied_steps)}, skipped: {len(skipped_steps)}.",
             problem_verifications=problem_verifications,
             overall_outcome=overall_outcome,
             failure_explanation=failure_explanation,
@@ -1151,9 +1218,13 @@ def verify_improvement(state: State, assessment_store: Any = None,
             resolved_signal_ids = list(before_signal_ids - after_signal_ids)
             remaining_signal_ids = list(target_signal_ids & after_signal_ids)
 
-            if assessment_store and hasattr(assessment_store, '_store'):
-                # assessment_store is an AssessmentStore wrapper around CockroachDBStore
+            # Use cockroach_store if available (passed from manager),
+            # otherwise try assessment_store._store (legacy path).
+            db_store = cockroach_store
+            if db_store is None and assessment_store and hasattr(assessment_store, '_store'):
                 db_store = assessment_store._store
+
+            if db_store:
                 if resolved_signal_ids:
                     update_signal_lifecycle_post_verification(
                         store=db_store,
@@ -1161,6 +1232,7 @@ def verify_improvement(state: State, assessment_store: Any = None,
                         assessment_id=after_assessment.assessment_id,
                         status="resolved",
                     )
+                    logger.info(f"Signal lifecycle: {len(resolved_signal_ids)} signals → resolved")
                 if remaining_signal_ids:
                     update_signal_lifecycle_post_verification(
                         store=db_store,
@@ -1168,19 +1240,35 @@ def verify_improvement(state: State, assessment_store: Any = None,
                         assessment_id=after_assessment.assessment_id,
                         status="recurring",
                     )
+                    logger.info(f"Signal lifecycle: {len(remaining_signal_ids)} signals → recurring")
+            else:
+                logger.warning("Signal lifecycle transition skipped — no CockroachDB store available")
         except Exception as e:
-            logger.debug(f"Signal lifecycle transition skipped: {e}")
+            logger.warning(f"Signal lifecycle transition failed: {e}")
 
         # Update DecisionTrace with verification reasoning
         decision_trace = DecisionTrace.from_dict(state.get("decision_trace", {}))
         decision_trace.execution_summary = (
-            f"Executed {len(execution_history)} step(s) with strategy '{strategy}'."
+            f"Executed {len(execution_history)} step(s) with strategy '{strategy}'. "
+            f"Applied: {len(applied_steps)}, Skipped/blocked: {len(skipped_steps)}."
         )
-        decision_trace.verification_reasoning = (
-            f"Overall outcome: {overall_outcome}. "
-            f"Score: {before_score} -> {after_score} ({'+' if score_diff >= 0 else ''}{score_diff}). "
-            f"{len(problem_verifications)} problem(s) verified."
-        )
+        if skipped_steps:
+            skipped_detail = "; ".join(
+                f"[{s.get('step_type', '?')}] {s.get('skipped_reason', 'unknown')}"
+                for s in skipped_steps
+            )
+            decision_trace.verification_reasoning = (
+                f"Overall outcome: {overall_outcome}. "
+                f"Score: {before_score} -> {after_score} ({'+' if score_diff >= 0 else ''}{score_diff}). "
+                f"{len(problem_verifications)} problem(s) verified. "
+                f"Skipped steps: {skipped_detail}"
+            )
+        else:
+            decision_trace.verification_reasoning = (
+                f"Overall outcome: {overall_outcome}. "
+                f"Score: {before_score} -> {after_score} ({'+' if score_diff >= 0 else ''}{score_diff}). "
+                f"{len(problem_verifications)} problem(s) verified."
+            )
         decision_trace.final_outcome = (
             f"{'SUCCESS' if success else 'FAILURE'}: {result.summary}"
         )

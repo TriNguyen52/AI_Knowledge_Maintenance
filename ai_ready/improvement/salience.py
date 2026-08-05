@@ -294,7 +294,7 @@ def rank_problems_by_salience(
         problems: List of KnowledgeProblems to rank.
         assessment: The KnowledgeAssessment containing signals and dimensions.
         history_store: Optional ImprovementHistoryStore for outcome sub-score.
-        threshold: Minimum salience to include (default 0.15).
+        threshold: Minimum salience to include (default: Config.salience_threshold, currently 0.01).
         signal_lifecycles: Optional dict mapping signal_id to lifecycle
             objects with ``last_seen`` timestamps. Enables recency decay.
 

@@ -183,7 +183,7 @@ class CockroachDBStore:
         try:
             cur.execute(
                 "CREATE VECTOR INDEX IF NOT EXISTS idx_artifacts_embedding "
-                "ON knowledge_artifacts (embedding)"
+                "ON knowledge_artifacts (embedding vector_cosine_ops)"
             )
         except Exception as e:
             logger.info(
@@ -192,6 +192,35 @@ class CockroachDBStore:
             )
 
         self._initialized = True
+
+    def register_mcp_views(self) -> None:
+        """Create the MCP read-only views from mcp_views.sql.
+
+        These views (mcp_knowledge_health, mcp_signals, mcp_problem_queue,
+        mcp_remediation_history, mcp_active_workflows, mcp_health_trend,
+        mcp_decision_traces) expose a safe subset of the schema to external
+        AI agents via the CockroachDB Cloud managed MCP server.
+
+        Call this after ``initialize_schema()`` and after data has been
+        written.  The views are idempotent (CREATE OR REPLACE).
+        """
+        mcp_schema_path = os.path.join(
+            os.path.dirname(__file__), "mcp_views.sql"
+        )
+        with open(mcp_schema_path, "r", encoding="utf-8") as f:
+            mcp_sql = f.read()
+        with self.conn.cursor() as cur:
+            # Execute only the CREATE OR REPLACE VIEW statements (skip
+            # the commented-out CREATE ROLE / GRANT block)
+            statements = [
+                stmt.strip()
+                for stmt in mcp_sql.split(";")
+                if stmt.strip()
+                and stmt.strip().upper().startswith("CREATE OR REPLACE VIEW")
+            ]
+            for stmt in statements:
+                cur.execute(stmt)
+        logger.info("Registered %d MCP views", len(statements))
 
     def _execute(self, query: str, params: tuple = ()) -> Any:
         """Execute a write query and return None (cursor is closed).
@@ -209,28 +238,85 @@ class CockroachDBStore:
         return None
 
     def _execute_fetchone(self, query: str, params: tuple = ()) -> dict[str, Any] | None:
-        """Execute a query and return the first row as a dict."""
-        cur = self.conn.cursor()
-        try:
-            cur.execute(query, params)
-            row = cur.fetchone()
-            if row is None:
-                return None
-            cols = [desc[0] for desc in cur.description]
-            return dict(zip(cols, row))
-        finally:
-            cur.close()
+        """Execute a query and return the first row as a dict.
+
+        Reconnects and retries once on ``OperationalError`` or
+        closed-connection errors (e.g. server closed the connection
+        unexpectedly), so transient drops don't silently degrade to
+        SQLite-only fallbacks.
+        """
+        for attempt in range(MAX_RETRIES):
+            try:
+                cur = self.conn.cursor()
+                try:
+                    cur.execute(query, params)
+                    row = cur.fetchone()
+                    if row is None:
+                        return None
+                    cols = [desc[0] for desc in cur.description]
+                    return dict(zip(cols, row))
+                finally:
+                    cur.close()
+            except Exception as e:
+                if self._is_connection_error(e) and attempt < MAX_RETRIES - 1:
+                    delay = RETRY_DELAY_MS * (2 ** attempt) / 1000.0
+                    logger.warning(
+                        "Read retry %d (fetchone): %s. Reconnecting in %.1fs",
+                        attempt + 1, e, delay,
+                    )
+                    self.close()
+                    time.sleep(delay)
+                    continue
+                raise
+        return None  # unreachable
 
     def _execute_fetchall(self, query: str, params: tuple = ()) -> list[dict[str, Any]]:
-        """Execute a query and return all rows as dicts."""
-        cur = self.conn.cursor()
-        try:
-            cur.execute(query, params)
-            rows = cur.fetchall()
-            cols = [desc[0] for desc in cur.description]
-            return [dict(zip(cols, row)) for row in rows]
-        finally:
-            cur.close()
+        """Execute a query and return all rows as dicts.
+
+        Reconnects and retries once on ``OperationalError`` or
+        closed-connection errors, so transient drops don't silently
+        degrade to SQLite-only fallbacks.
+        """
+        for attempt in range(MAX_RETRIES):
+            try:
+                cur = self.conn.cursor()
+                try:
+                    cur.execute(query, params)
+                    rows = cur.fetchall()
+                    cols = [desc[0] for desc in cur.description]
+                    return [dict(zip(cols, row)) for row in rows]
+                finally:
+                    cur.close()
+            except Exception as e:
+                if self._is_connection_error(e) and attempt < MAX_RETRIES - 1:
+                    delay = RETRY_DELAY_MS * (2 ** attempt) / 1000.0
+                    logger.warning(
+                        "Read retry %d (fetchall): %s. Reconnecting in %.1fs",
+                        attempt + 1, e, delay,
+                    )
+                    self.close()
+                    time.sleep(delay)
+                    continue
+                raise
+        return []  # unreachable
+
+    @staticmethod
+    def _is_connection_error(e: Exception) -> bool:
+        """Check if an exception is a transient connection error worth retrying."""
+        error_str = str(e).lower()
+        return any(
+            marker in error_str
+            for marker in [
+                "server closed the connection",
+                "connection already closed",
+                "terminating connection",
+                "connection timeout",
+                "could not connect",
+                "40001",  # serialization failure
+                "40003",  # connection failure
+                "08006",  # connection failure
+            ]
+        )
 
     # ------------------------------------------------------------------
     # Knowledge Artifacts (with vector embeddings)
@@ -306,6 +392,44 @@ class CockroachDBStore:
             similarity = 1.0 - distance  # Convert distance to similarity
             results.append((self._row_to_artifact(row), similarity))
         return results
+
+    def explain_semantic_search(
+        self, query_embedding: list[float], limit: int = 10
+    ) -> str:
+        """Run EXPLAIN (VERBOSE) on the semantic search query.
+
+        Returns the query plan as a string.  Used to prove the vector
+        index ``idx_artifacts_embedding`` is actually used (not a full
+        scan).  The demo or a test can save the output to
+        ``docs/proof/vector_index_explain.txt``.
+
+        Args:
+            query_embedding: The query vector (same dimensionality as
+                the stored embeddings, e.g. 384).
+            limit: Same LIMIT used by ``search_artifacts_semantic``.
+
+        Returns:
+            Multi-line string with the EXPLAIN plan.
+        """
+        embedding_str = f"[{','.join(str(x) for x in query_embedding)}]"
+        rows = self._execute_fetchall(
+            """
+            EXPLAIN (VERBOSE)
+            SELECT *, embedding <=> %s::vector AS distance
+            FROM knowledge_artifacts
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+            """,
+            (embedding_str, embedding_str, limit),
+        )
+        lines = []
+        for row in rows:
+            # Each row is a dict with keys like "level", "tree", "field",
+            # "description" (CockroachDB EXPLAIN format).  Flatten to text.
+            parts = [str(v) for v in row.values() if v is not None]
+            lines.append(" | ".join(parts))
+        return "\n".join(lines)
 
     def _row_to_artifact(self, row: dict[str, Any]) -> ArtifactRecord:
         embedding = None
@@ -752,6 +876,7 @@ class CockroachDBStore:
             SELECT
                 count(*) as total_workflows,
                 count(*) FILTER (WHERE verification_outcome = 'resolved') as problems_resolved,
+                count(*) FILTER (WHERE verification_outcome = 'partially_resolved') as problems_partially_resolved,
                 count(*) FILTER (WHERE verification_outcome IN ('resolved', 'partially_resolved')) as successful,
                 avg(score_after - score_before) as avg_score_improvement,
                 count(*) FILTER (WHERE forked = true) as total_forks,
@@ -766,10 +891,15 @@ class CockroachDBStore:
         return {
             "total_workflows": total,
             "problems_resolved": row.get("problems_resolved", 0),
+            "problems_partially_resolved": row.get("problems_partially_resolved", 0),
+            "problems_improved": (
+                (row.get("problems_resolved", 0) or 0)
+                + (row.get("problems_partially_resolved", 0) or 0)
+            ),
             "verification_success_rate": successful / total if total > 0 else 0.0,
             "avg_score_improvement": row.get("avg_score_improvement", 0.0) or 0.0,
             "total_forks": row.get("total_forks", 0),
-            "total_tokens": row.get("total_tokens", 0),
+            "total_tokens": int(row.get("total_tokens", 0) or 0),
         }
 
     def _row_to_remediation(self, row: dict[str, Any]) -> RemediationRecord:

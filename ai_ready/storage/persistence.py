@@ -192,6 +192,14 @@ def persist_assessment(
                      severity, score, recommendation, ai_impact, evidence,
                      status, last_seen, access_count, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (signal_id) DO UPDATE SET
+                    severity = EXCLUDED.severity,
+                    score = EXCLUDED.score,
+                    recommendation = EXCLUDED.recommendation,
+                    ai_impact = EXCLUDED.ai_impact,
+                    evidence = EXCLUDED.evidence,
+                    status = EXCLUDED.status,
+                    last_seen = EXCLUDED.last_seen
                 """,
                 (
                     sr.signal_id, sr.artifact_uri, sr.collector_id,
@@ -262,8 +270,18 @@ def update_signal_lifecycle_post_verification(
         status: New lifecycle status — 'resolved', 'recurring', etc.
     """
     for sig_id in signal_ids:
+        # Update the signal_lifecycle table (tracking table with assessment IDs)
         store.save_signal_lifecycle(
             signal_id=sig_id,
             assessment_id=assessment_id,
+            status=status,
+        )
+        # Also update the knowledge_signals.status column so that
+        # get_signals_by_status() returns the correct lifecycle state.
+        # Without this, signals remain 'new' in knowledge_signals even
+        # after they've been resolved, because save_signal_lifecycle only
+        # writes to the separate signal_lifecycle table.
+        store.update_signal_status(
+            signal_id=sig_id,
             status=status,
         )

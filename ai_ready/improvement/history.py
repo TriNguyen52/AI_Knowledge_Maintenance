@@ -582,6 +582,7 @@ class ImprovementHistoryStore:
             "total_workflows": total,
             "problems_resolved": resolved,
             "problems_partially_resolved": partially,
+            "problems_improved": resolved + partially,
             "verification_success_rate": round(success_rate, 4),
             "avg_score_improvement": round(avg_score, 2),
             "strategy_reuse_rate": round(reuse_rate, 4),

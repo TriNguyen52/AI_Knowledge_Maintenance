@@ -112,6 +112,8 @@ def create_improvement_app(
     app_id: str | None = None,
     partition_key: str | None = None,
     diagnosis_quality_tracker: Any = None,
+    config: Any = None,
+    cockroach_store: Any = None,
 ) -> Any:
     """Create a Burr Application for the improvement workflow.
 
@@ -185,6 +187,8 @@ def create_improvement_app(
         "source": source,
         "git_commit": git_commit,
         "diagnosis_quality_tracker": diagnosis_quality_tracker,
+        "config": config,
+        "cockroach_store": cockroach_store,
     })
 
     return app

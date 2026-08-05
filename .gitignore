@@ -56,6 +56,8 @@ verify_imports.py
 docs
 tests
 IMPLEMENTATION_PLAN.md
+*.txt
+fastapi/
 
 # env
 .env

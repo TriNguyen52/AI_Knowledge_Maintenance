@@ -12,6 +12,7 @@ Architecture:
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
@@ -40,14 +41,28 @@ def _severity_rank(s: Severity) -> int:
     return _SEVERITY_ORDER.get(s, 0)
 
 
-def make_signal_id(collector_id: str, artifact_uri: str, signal_type: str) -> str:
+def make_signal_id(
+    collector_id: str,
+    artifact_uri: str,
+    signal_type: str,
+    evidence: dict[str, Any] | None = None,
+) -> str:
     """Generate a stable signal ID that survives line shifts and minor edits.
 
     The ID is derived from (collector_id, artifact_uri, signal_type) where
     signal_type identifies the *what* of the signal, not the *where*.
     Line numbers are deliberately excluded.
+
+    When *evidence* is provided, a short hash of the evidence is appended so
+    that multiple signals of the same type on the same artifact (e.g. several
+    terminology variants, or multiple missing canonical sources for different
+    topics) get distinct IDs.
     """
     raw = f"{collector_id}:{artifact_uri}:{signal_type}"
+    if evidence:
+        # Sort keys for deterministic hashing
+        ev_str = json.dumps(evidence, sort_keys=True, default=str)
+        raw = f"{raw}:{hashlib.sha256(ev_str.encode('utf-8')).hexdigest()[:8]}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -275,7 +290,8 @@ class KnowledgeSignal:
     def __post_init__(self) -> None:
         if not self.signal_id:
             self.signal_id = make_signal_id(
-                self.collector_id, self.artifact_uri, self.signal_type
+                self.collector_id, self.artifact_uri, self.signal_type,
+                self.evidence,
             )
 
     def to_dict(self) -> dict[str, Any]:

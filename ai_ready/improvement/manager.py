@@ -194,6 +194,21 @@ class ImprovementManager:
             assessment_id=assessment_id,
             signal_ids=signal_ids,
             affected_artifact_uris=artifact_uris,
+            assessment_signals=[
+                {
+                    "signal_id": s.signal_id,
+                    "signal_type": s.signal_type,
+                    "artifact_uri": s.artifact_uri,
+                    "artifact_id": s.artifact_id,
+                    "collector_id": s.collector_id,
+                    "severity": s.severity.value if hasattr(s.severity, "value") else str(s.severity),
+                    "score": s.score,
+                    "evidence": s.evidence if isinstance(s.evidence, dict) else {},
+                    "recommendation": s.recommendation or "",
+                }
+                for s in assessment.signals
+                if s.signal_id in signal_ids
+            ],
         )
 
         # Create the Burr application
@@ -211,6 +226,8 @@ class ImprovementManager:
             enable_tracking=self.enable_tracking,
             enable_otel=self.enable_otel,
             diagnosis_quality_tracker=self.diagnosis_quality_tracker,
+            config=self.config,
+            cockroach_store=self.cockroach_store,
         )
 
         app_id = app.uid
@@ -328,6 +345,8 @@ class ImprovementManager:
             enable_tracking=self.enable_tracking,
             enable_otel=self.enable_otel,
             diagnosis_quality_tracker=self.diagnosis_quality_tracker,
+            config=self.config,
+            cockroach_store=self.cockroach_store,
         )
 
         # Restore the persisted state into the rebuilt app
@@ -487,6 +506,8 @@ class ImprovementManager:
 
         result = "success" if current_stage == RemediationStatus.COMPLETED.value else "failure"
         score_change = verification.get("score_difference", 0)
+        score_before = verification.get("before_score", 0)
+        score_after = verification.get("after_score", 0)
         root_cause = root_causes[0].get("hypothesis", "") if root_causes else ""
         artifact_uris = state.get("affected_artifact_uris", [])
         failure_reason = (
@@ -513,6 +534,8 @@ class ImprovementManager:
             strategy=strategy,
             result=result,
             score_change=score_change,
+            score_before=score_before,
+            score_after=score_after,
             root_cause=root_cause,
             artifact_uris=artifact_uris,
             failure_reason=failure_reason,

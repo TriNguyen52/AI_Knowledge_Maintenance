@@ -7,7 +7,12 @@ Two embedding backends:
 1. HuggingFace Inference API — high-quality neural embeddings (all-MiniLM-L6-v2)
    Requires HF_TOKEN env var. Free tier with rate limits.
 2. TF-IDF + numpy — lightweight, dependency-free, deterministic
-   Automatic fallback when HuggingFace is unavailable or rate-limited.
+   **This is the default fallback** when HuggingFace is unavailable, rate-limited,
+   or returns 403. Without a valid HF_TOKEN, TF-IDF is the active backend.
+
+The provider tries HuggingFace first (if HF_TOKEN is set), falls back to
+TF-IDF automatically on the first failure. Once a backend succeeds, it
+becomes "sticky" for the process lifetime.
 
 Usage:
     from ai_ready.llm.embeddings import EmbeddingProvider
@@ -16,7 +21,8 @@ Usage:
     provider.fit(corpus_texts)  # Build IDF for TF-IDF fallback
     vector = provider.embed("text to embed")  # → list[float] of 384 dims
 
-The provider tries HuggingFace first, falls back to TF-IDF automatically.
+To check which backend is active:
+    provider.active_backend  # → "huggingface" or "tfidf" or "uninitialized"
 """
 
 from __future__ import annotations
