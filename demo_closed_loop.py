@@ -1,36 +1,45 @@
 #!/usr/bin/env python
-"""Closed-loop institutional memory demo — CockroachDB-only.
+"""Closed-loop institutional memory demo
 
-Demonstrates the full remediation memory loop across two workflow runs,
-with all reads and writes going to CockroachDB (no SQLite dependency):
+Demonstrates the full remediation memory loop across 3 workflow runs,
+with all reads and writes going to CockroachDB (no SQLite dependency).
+Each run re-assesses the knowledge base from disk, so the "before" score
+genuinely reflects modifications from the previous run:
 
   Run 1 (no history):
     1. Assess knowledge base → signals → problems
     2. Generate remediation proposal (no prior outcomes to learn from)
     3. Execute + verify
     4. Outcome saved to CockroachDB
-    5. Decision traces saved to CockroachDB
 
   Run 2 (with history from Run 1):
-    1. Assess same knowledge base
-    2. Generate remediation proposal — NOW reads CockroachDB context:
+    1. Re-assess knowledge base (picks up Run 1's modifications)
+    2. Generate remediation proposal — reads CockroachDB context:
        - Sees what strategy was tried in Run 1
        - Sees whether it succeeded or failed
        - Sees decision traces (reasoning from Run 1)
-    3. The LLM/proposal generator uses this institutional memory
-    4. Execute + verify
-    5. Second outcome saved — CockroachDB now has 2 outcomes
+    3. Execute + verify
+    4. Second outcome saved — CockroachDB now has 2 outcomes
 
-  After both runs:
-    - Show CockroachDB remediation_history table (2 outcomes)
-    - Show CockroachDB decision_traces table (reasoning from both runs)
-    - Show merged get_remediation_context() — what Run 3 would see
+  Run 3 (with history from Runs 1+2):
+    1. Re-assess knowledge base (picks up Run 2's modifications)
+    2. Generate remediation proposal — reads CockroachDB context:
+       - Sees both prior outcomes + decision traces
+    3. Execute + verify
+    4. Third outcome saved — CockroachDB now has 3 outcomes
+
+  After all runs:
+    - Per-run comparison table (score before/after, delta, signals resolved)
+    - Cumulative improvement summary
+    - CockroachDB verification (context storage, agent state, MCP tools, vector search)
+    - CockroachDB institutional memory (MCP tools showing all outcomes)
 
 Usage:
-    python demo_closed_loop.py [--source PATH] [--limit N]
+    python demo_closed_loop.py [--source PATH] [--limit N] [--runs N]
 
     --source    Path to the knowledge base (default: FastAPI docs)
     --limit     Max artifacts to assess (default: 20)
+    --runs      Number of improvement runs (default: 3)
 
 All formatting logic lives in ai_ready.cli.display — this script is call-only.
 """
@@ -104,7 +113,8 @@ def connect_cockroach() -> "CockroachDBStore":
                    "wont_fix_signatures", "problem_queue",
                    "assessment_signals", "signal_lifecycle",
                    "knowledge_signals", "knowledge_assessments",
-                   "knowledge_artifacts", "agent_state"]:
+                   "knowledge_artifacts", "agent_state",
+                   "modified_artifacts"]:
         try:
             store._execute(f"DROP TABLE IF EXISTS {table} CASCADE")
         except Exception:
@@ -288,7 +298,7 @@ def run_improvement(
     t1 = time.time()
     display.print_workflow_started(app_id, t1 - t0)
 
-    # P7: Agent state is persisted by ImprovementManager automatically
+    # Agent state is persisted by ImprovementManager automatically
     agent_state_db = cockroach_store.get_agent_state(app_id)
     if agent_state_db:
         display.print_agent_state(
@@ -340,11 +350,9 @@ def run_improvement(
     verification = final_state.get("verification_results", {})
     display.print_verification(verification)
 
-    # Item 1.3: Memory in Action
     memory_influence = final_state.get("memory_influence", {})
     display.print_memory_in_action(memory_influence)
 
-    # Item 3.1: Knowledge Health: Before → After
     display.print_knowledge_health(verification)
 
     # Confirm CockroachDB sync
@@ -356,7 +364,6 @@ def run_improvement(
     except Exception as e:
         display.print_warning(f"Could not read CockroachDB: {e}")
 
-    # P6: Signal lifecycle
     verification = final_state.get("verification_results", {})
     overall_outcome = verification.get("overall_outcome", "unknown")
     try:
@@ -432,13 +439,117 @@ def show_cockroach_memory(store):
         new_sigs = store.get_signals_by_status("new")
         persistent_sigs = store.get_signals_by_status("persistent")
         resolved_sigs = store.get_signals_by_status("resolved")
-        display.print_mcp_signal_lifecycle_summary(new_sigs, persistent_sigs, resolved_sigs)
+        recurring_sigs = store.get_signals_by_status("recurring")
+        display.print_mcp_signal_lifecycle_summary(new_sigs, persistent_sigs, resolved_sigs, recurring_sigs)
     except Exception as e:
         display.print_warning(f"Lifecycle summary unavailable: {e}")
 
     # MCP Tool: get_remediation_metrics
     result = handle_tool_call("get_remediation_metrics", {})
     display.print_mcp_metrics(result)
+
+# ---------------------------------------------------------------------------
+# Per-run result extraction
+# ---------------------------------------------------------------------------
+
+def extract_run_result(run_idx: int, final_state: dict, elapsed: float) -> dict:
+    """Extract per-run metrics from the final workflow state."""
+    verification = final_state.get("verification_results", {})
+    proposals = final_state.get("proposals", [])
+    selected_idx = final_state.get("selected_proposal_idx", 0)
+    strategy = (
+        proposals[selected_idx].get("strategy", "?")
+        if proposals and selected_idx < len(proposals)
+        else "?"
+    )
+    memory_influence = final_state.get("memory_influence", {})
+
+    return {
+        "run": run_idx,
+        "score_before": verification.get("before_score", 0),
+        "score_after": verification.get("after_score", 0),
+        "score_delta": verification.get("score_difference", 0),
+        "signals_resolved": len(verification.get("resolved_signal_ids", [])),
+        "new_signals": len(verification.get("new_signal_ids", [])),
+        "remaining_signals": len(verification.get("remaining_signal_ids", [])),
+        "outcome": verification.get("overall_outcome", "unknown"),
+        "strategy": strategy,
+        "tokens_used": final_state.get("cumulative_tokens", 0),
+        "elapsed": elapsed,
+        "memory_retrieved_count": len(memory_influence.get("retrieved", [])),
+        "memory_avoided_count": len(memory_influence.get("avoided_strategies", [])),
+        "memory_reused_strategy": memory_influence.get("reused_strategy"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Verify CockroachDB institutional memory
+# ---------------------------------------------------------------------------
+
+def verify_cockroachdb(store, results: list[dict]) -> None:
+    """Verify that CockroachDB is actually storing and retrieving data."""
+    verification = {}
+
+    # Context storage — remediation_history
+    history = store.get_remediation_history(limit=100)
+    issue_types = list(set(h.issue_type for h in history)) if history else []
+    all_have_steps = all(h.modification_steps for h in history) if history else False
+    verification["context_storage"] = {
+        "outcomes_count": len(history),
+        "all_have_modification_steps": all_have_steps,
+        "issue_types": issue_types,
+    }
+
+    # Agent state — Burr workflow persistence
+    all_workflows = store.get_all_workflows(limit=100)
+    all_completed = (
+        all(w.get("status") == "completed" for w in all_workflows)
+        if all_workflows
+        else False
+    )
+    stages = list(set(w.get("current_stage", "?") for w in all_workflows)) if all_workflows else []
+    verification["agent_state"] = {
+        "workflows_count": len(all_workflows),
+        "all_completed": all_completed,
+        "stages": stages,
+    }
+
+    # MCP tools — verify each returns real data
+    from ai_ready.cloud.mcp_server import handle_tool_call, set_store
+    set_store(store)
+
+    mcp_results = {}
+    for tool_name in [
+        "get_knowledge_health",
+        "get_signals",
+        "search_artifacts_semantic",
+        "get_active_workflows",
+        "get_remediation_history",
+        "get_remediation_metrics",
+    ]:
+        if tool_name == "search_artifacts_semantic":
+            result = handle_tool_call(tool_name, {"query": "broken link missing context", "limit": 5})
+        else:
+            result = handle_tool_call(tool_name, {"limit": 5})
+        mcp_results[tool_name] = result
+    verification["mcp_tools"] = mcp_results
+
+    # Vector search
+    verification["vector_search"] = mcp_results.get("search_artifacts_semantic", {})
+
+    # Memory influence summary (per run)
+    verification["memory_influence"] = [
+        {
+            "run": r.get("run", "?"),
+            "retrieved_count": r.get("memory_retrieved_count", 0),
+            "avoided_count": r.get("memory_avoided_count", 0),
+            "reused_strategy": r.get("memory_reused_strategy"),
+        }
+        for r in results
+    ]
+
+    display.print_cockroach_verification(verification)
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -470,8 +581,8 @@ def main() -> None:
         help="Skip file backup/restore (use when source is read-only or disposable)",
     )
     parser.add_argument(
-        "--runs", type=int, default=2,
-        help="Number of improvement runs (default: 2)",
+        "--runs", type=int, default=3,
+        help="Number of improvement runs (default: 3)",
     )
     args = parser.parse_args()
 
@@ -489,14 +600,6 @@ def main() -> None:
     cockroach_store = connect_cockroach()
 
     try:
-      # Load knowledge and assess (shared across both runs)
-      pipeline, assessment, artifacts, relationships, source_str, git_commit = (
-          load_and_assess(source, args.limit)
-      )
-
-      # Persist to CockroachDB with vector embeddings
-      persist_to_cockroach(cockroach_store, assessment, artifacts, source_str, git_commit)
-
       # Set up LLM gateway (optional — falls back to heuristics if not available)
       llm_gateway = None
       groq_key = os.environ.get("GROQ_API_KEY", "")
@@ -514,58 +617,96 @@ def main() -> None:
       else:
           display.print_llm_no_key()
 
-      # --- Backup artifact files so we can restore after demo ---
+      # --- Run N improvement cycles with per-run re-assessment ---
       import shutil
-      backup_dir = None
-      source_path = Path(source_str)
-      if not args.no_backup:
-          backup_dir = Path(".ai-ready/file_backup")
-          if backup_dir.exists():
-              shutil.rmtree(backup_dir)
-          backup_dir.mkdir(parents=True, exist_ok=True)
-          backed_up = 0
-          for a in artifacts:
-              src_file = source_path / a.uri
-              if src_file.exists():
-                  dst_file = backup_dir / a.uri
-                  dst_file.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copy2(src_file, dst_file)
-                  backed_up += 1
-          display.print_backup_done(backed_up, str(backup_dir))
-      else:
-          display.print_backup_skipped()
+      from ai_ready.improvement.closed_loop import run_closed_loop_cycle
 
-      # --- Run N improvement cycles ---
+      backup_dir = None
+      source_path = None
+      results = []
+
       for run_idx in range(1, args.runs + 1):
-          label = f"{run_idx} ({'no history' if run_idx == 1 else 'with CockroachDB history'})"
-          run_improvement(
-              run_label=label,
-              assessment=assessment,
-              pipeline=pipeline,
-              artifacts=artifacts,
-              relationships=relationships,
-              source=source_str,
-              git_commit=git_commit,
-              cockroach_store=cockroach_store,
+          # Backup files on first run only (before any modifications)
+          if run_idx == 1 and not args.no_backup:
+              from ai_ready.knowledge.registry import load_knowledge_source
+              exclude_patterns = ["/de/", "/es/", "/fr/", "/ja/", "/ko/", "/pt/",
+                                  "/ru/", "/tr/", "/zh/", "/uk/", "/az/", "/it/"]
+              ks = load_knowledge_source(str(source), exclude_patterns=exclude_patterns)
+              backup_dir = Path(".ai-ready/file_backup")
+              if backup_dir.exists():
+                  shutil.rmtree(backup_dir)
+              backup_dir.mkdir(parents=True, exist_ok=True)
+              backed_up = 0
+              for a in ks.artifacts[:args.limit] if args.limit > 0 else ks.artifacts:
+                  src_file = source / a.uri
+                  if src_file.exists():
+                      dst_file = backup_dir / a.uri
+                      dst_file.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(src_file, dst_file)
+                      backed_up += 1
+              display.print_backup_done(backed_up, str(backup_dir))
+          elif run_idx == 1 and args.no_backup:
+              display.print_backup_skipped()
+
+          # Run one closed-loop cycle (codebase handles everything)
+          display.print_dim(f"--- Run {run_idx} ---")
+          t0 = time.time()
+          result = run_closed_loop_cycle(
+              store=cockroach_store,
+              source=source,
+              limit=args.limit,
+              run_idx=run_idx,
               llm_gateway=llm_gateway,
           )
+          t1 = time.time()
 
-      # --- Show final CockroachDB state ---
+          display.print_dim(
+              f"Run {run_idx}: {result['score_before']} -> {result['score_after']} "
+              f"(+{result['score_delta']}), {result['signals_resolved']} resolved, "
+              f"{result['new_signals']} new, {len(result['modified_uris'])} modified"
+          )
+
+          results.append({
+              "run": run_idx,
+              "score_before": result["score_before"],
+              "score_after": result["score_after"],
+              "score_delta": result["score_delta"],
+              "signals_resolved": result["signals_resolved"],
+              "new_signals": result["new_signals"],
+              "outcome": result["outcome"],
+              "strategy": result["strategy"],
+              "elapsed": t1 - t0,
+              "memory_retrieved_count": len(result.get("memory_influence", {}).get("retrieved", [])),
+              "memory_avoided_count": len(result.get("memory_influence", {}).get("avoided_strategies", [])),
+              "memory_reused_strategy": result.get("memory_influence", {}).get("reused_strategy"),
+          })
+
+          source_path = source
+
+      # --- Per-run comparison and cumulative improvement ---
+      if results:
+          display.print_per_run_summary(results)
+          display.print_cumulative_improvement(results)
+
+      # --- CockroachDB verification ---
+      verify_cockroachdb(cockroach_store, results)
+
+      # --- Show final CockroachDB state (MCP tools) ---
       show_cockroach_memory(cockroach_store)
 
       # --- Restore original files ---
-      if backup_dir:
+      if backup_dir and source_path:
           restored = 0
-          for a in artifacts:
-              backup_file = backup_dir / a.uri
-              original_file = source_path / a.uri
-              if backup_file.exists() and original_file.exists():
+          for backup_file in backup_dir.rglob("*.md"):
+              rel = backup_file.relative_to(backup_dir)
+              original_file = source_path / rel
+              if original_file.exists():
                   shutil.copy2(backup_file, original_file)
                   restored += 1
           display.print_restore_done(restored)
           shutil.rmtree(backup_dir)
 
-      display.print_demo_complete()
+      display.print_demo_complete(args.runs)
     finally:
       cockroach_store.close()
 

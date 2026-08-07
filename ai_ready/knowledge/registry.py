@@ -90,3 +90,72 @@ def load_knowledge_source(
         )
 
     return ks
+
+
+def load_knowledge_source_with_modifications(
+    source: str | Path,
+    limit: int = 0,
+    exclude_patterns: list[str] | None = None,
+    modified_uris: list[str] | None = None,
+) -> KnowledgeSource:
+    """Load a knowledge source, apply the limit, then expand the artifact
+    set with previously-modified URIs from CockroachDB.
+
+    This solves the multi-run problem: the executor modifies files like
+    ``index.md`` (which may be outside the first-N-artifact limit) to
+    resolve orphan signals.  Without including those files in later
+    runs, the assessment can't see the cross-reference links and the
+    score regresses to the original value.
+
+    Args:
+        source: Path or URI to the knowledge base.
+        limit: Maximum number of artifacts (0 = no limit).
+        exclude_patterns: Optional list of substrings to exclude.
+        modified_uris: URIs of artifacts modified in prior runs
+            (from ``get_modified_artifact_uris``).  These are added
+            to the artifact set even if they fall outside the limit.
+
+    Returns:
+        KnowledgeSource with limited artifacts + modified URIs, and
+        pruned relationships.
+    """
+    ks = load_knowledge_source(source, exclude_patterns=exclude_patterns)
+
+    # Apply limit
+    if limit > 0 and len(ks.artifacts) > limit:
+        existing_uris = {a.uri for a in ks.artifacts[:limit]}
+        # Expand with modified URIs that aren't already in the limited set
+        if modified_uris:
+            for uri in modified_uris:
+                if uri not in existing_uris:
+                    # Find the artifact with this URI
+                    match = [a for a in ks.artifacts if a.uri == uri]
+                    if match:
+                        ks.artifacts = ks.artifacts[:limit] + match
+                        existing_uris.add(uri)
+        else:
+            ks.artifacts = ks.artifacts[:limit]
+    elif modified_uris:
+        # No limit, but still ensure modified URIs are present
+        existing_uris = {a.uri for a in ks.artifacts}
+        for uri in modified_uris:
+            if uri not in existing_uris:
+                match = [a for a in ks.artifacts if a.uri == uri]
+                if match:
+                    ks.artifacts.extend(match)
+                    existing_uris.add(uri)
+
+    # Prune relationships to only reference retained artifacts
+    retained_uris = {a.uri for a in ks.artifacts}
+    ks.relationships = [
+        r for r in ks.relationships
+        if r.source_uri in retained_uris and r.target_uri in retained_uris
+    ]
+
+    _logger = __import__("logging").getLogger(__name__)
+    _logger.info(
+        "load_knowledge_source_with_modifications: %d artifacts (%d modified added), %d relationships",
+        len(ks.artifacts), len(modified_uris or []), len(ks.relationships),
+    )
+
+    return ks

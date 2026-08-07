@@ -247,3 +247,23 @@ CREATE INDEX IF NOT EXISTS idx_skips_lane
     ON skip_events (lane);
 CREATE INDEX IF NOT EXISTS idx_skips_created
     ON skip_events (created_at DESC);
+
+-- --------------------------------------------------------
+-- modified_artifacts: Track which artifacts were modified by
+-- executor runs. Enables later runs to include these files in
+-- the artifact set even when limiting to N artifacts.
+-- Stores only URIs (not content) — lightweight tracking.
+-- Persists in CockroachDB so later runs (even on different
+-- cloud machines) can query which files were previously fixed.
+-- --------------------------------------------------------
+CREATE TABLE IF NOT EXISTS modified_artifacts (
+    artifact_uri    TEXT NOT NULL,
+    source          TEXT NOT NULL DEFAULT '',
+    run_idx         INT NOT NULL DEFAULT 0,
+    step_type       TEXT NOT NULL DEFAULT '',
+    modified_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (artifact_uri, source)
+);
+
+CREATE INDEX IF NOT EXISTS idx_modified_source
+    ON modified_artifacts (source);

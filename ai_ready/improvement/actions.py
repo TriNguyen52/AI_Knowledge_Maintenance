@@ -1285,18 +1285,37 @@ def verify_improvement(state: State, assessment_store: Any = None,
             )
         else:
             outcomes = [pv["outcome"] for pv in problem_verifications]
+            # Count how many problems were actually resolved or partially
+            # resolved at the signal level, vs misdiagnosed (signal IDs
+            # didn't match between analysis and verification).
+            resolved_problems = sum(
+                1 for o in outcomes
+                if o == VerificationOutcome.RESOLVED.value
+            )
+            partially_resolved_problems = sum(
+                1 for o in outcomes
+                if o == VerificationOutcome.PARTIALLY_RESOLVED.value
+            )
+            misdiagnosed_problems = sum(
+                1 for o in outcomes
+                if o == VerificationOutcome.MISDIAGNOSED.value
+            )
+
             if all(o == VerificationOutcome.RESOLVED.value for o in outcomes):
                 overall_outcome = VerificationOutcome.RESOLVED.value
             elif any(o == VerificationOutcome.REGRESSED.value for o in outcomes):
                 overall_outcome = VerificationOutcome.REGRESSED.value
-            elif any(o == VerificationOutcome.MISDIAGNOSED.value for o in outcomes):
+            elif misdiagnosed_problems > 0 and resolved_problems == 0 and partially_resolved_problems == 0 and score_diff <= 0:
+                # All problems were misdiagnosed with no signal-level
+                # improvement — the root cause diagnosis was wrong.
                 overall_outcome = VerificationOutcome.MISDIAGNOSED.value
+            elif resolved_problems > 0 or partially_resolved_problems > 0 or score_diff > 0:
+                # Some problems were resolved/partially resolved OR the
+                # score improved — don't let a misdiagnosed problem
+                # (signal IDs changed) override genuine improvement.
+                overall_outcome = VerificationOutcome.PARTIALLY_RESOLVED.value
             elif all(o in (VerificationOutcome.RESOLVED.value,
                           VerificationOutcome.PARTIALLY_RESOLVED.value) for o in outcomes):
-                overall_outcome = VerificationOutcome.PARTIALLY_RESOLVED.value
-            elif score_diff > 0:
-                # Score improved even though no signals were fully resolved —
-                # the remediation had a partial positive effect.
                 overall_outcome = VerificationOutcome.PARTIALLY_RESOLVED.value
             else:
                 overall_outcome = VerificationOutcome.UNCHANGED.value

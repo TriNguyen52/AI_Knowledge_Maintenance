@@ -201,7 +201,10 @@ def persist_assessment(
                     recommendation = EXCLUDED.recommendation,
                     ai_impact = EXCLUDED.ai_impact,
                     evidence = EXCLUDED.evidence,
-                    status = EXCLUDED.status,
+                    status = CASE
+                        WHEN knowledge_signals.status = 'resolved' THEN 'resolved'
+                        ELSE EXCLUDED.status
+                    END,
                     last_seen = EXCLUDED.last_seen
                 """,
                 (
@@ -238,7 +241,11 @@ def persist_assessment(
                 (assessment_record.assessment_id, sig_id),
             )
 
-        # Signal lifecycle (new → persistent)
+        # Signal lifecycle (new → persistent → resolved)
+        # On conflict: preserve 'resolved' status — don't downgrade a
+        # signal that was already resolved by a prior verify_improvement
+        # back to 'persistent'.  Only update to 'persistent' if the
+        # signal is new or was previously 'new'/'persistent'.
         for sig_id in signal_id_map:
             cur.execute(
                 """
@@ -247,7 +254,10 @@ def persist_assessment(
                 ON CONFLICT (signal_id) DO UPDATE SET
                     last_seen = now(),
                     last_assessment_id = EXCLUDED.last_assessment_id,
-                    status = EXCLUDED.status,
+                    status = CASE
+                        WHEN signal_lifecycle.status = 'resolved' THEN 'resolved'
+                        ELSE EXCLUDED.status
+                    END,
                     assessment_ids = array_append(signal_lifecycle.assessment_ids, %s),
                     access_count = signal_lifecycle.access_count + 1
                 """,
@@ -263,6 +273,137 @@ def persist_assessment(
         "artifact_count": len(artifacts),
         "signal_id_map": signal_id_map,
     }
+
+
+def record_modified_artifacts(
+    store: CockroachDBStore,
+    source: str,
+    artifact_uris: list[str],
+    run_idx: int = 0,
+    step_type: str = "",
+) -> int:
+    """Record which artifact URIs were modified by the executor.
+
+    Stores only URIs (not file content) in the ``modified_artifacts``
+    table.  Later runs query this table to include previously-modified
+    files in the artifact set, even when limiting to N artifacts.
+
+    Args:
+        store: Connected CockroachDBStore instance.
+        source: Source URI string for scoping.
+        artifact_uris: List of artifact URIs that were modified.
+        run_idx: Which run modified them (1-based).
+        step_type: The executor step type that modified them.
+
+    Returns:
+        Number of artifacts recorded.
+    """
+    from datetime import datetime, timezone
+
+    if not artifact_uris:
+        return 0
+
+    for uri in artifact_uris:
+        store._execute(
+            """
+            INSERT INTO modified_artifacts (artifact_uri, source, run_idx, step_type, modified_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (artifact_uri, source) DO UPDATE SET
+                run_idx = EXCLUDED.run_idx,
+                step_type = EXCLUDED.step_type,
+                modified_at = now()
+            """,
+            (uri, source, run_idx, step_type, datetime.now(timezone.utc)),
+        )
+
+    # Read-back verification
+    count = store._execute_fetchone(
+        "SELECT COUNT(*) as cnt FROM modified_artifacts WHERE source = %s",
+        (source,),
+    )
+    recorded = count["cnt"] if count else 0
+    logger.info(
+        "record_modified_artifacts: recorded %d URIs (total in DB for source: %d)",
+        len(artifact_uris), recorded,
+    )
+    return len(artifact_uris)
+
+
+def get_modified_artifact_uris(
+    store: CockroachDBStore,
+    source: str,
+) -> list[str]:
+    """Retrieve URIs of artifacts previously modified by executor runs.
+
+    Used by later runs to expand the artifact set beyond the limit,
+    ensuring that files modified in prior runs (e.g. index.md with
+    added cross-reference links) are included in the assessment.
+
+    Args:
+        store: Connected CockroachDBStore instance.
+        source: Source URI string for scoping.
+
+    Returns:
+        List of artifact URIs that were modified in any prior run.
+    """
+    rows = store._execute_fetchall(
+        "SELECT artifact_uri FROM modified_artifacts WHERE source = %s "
+        "ORDER BY modified_at",
+        (source,),
+    )
+    uris = [row["artifact_uri"] if isinstance(row, dict) else row[0] for row in rows]
+    logger.info("get_modified_artifact_uris: found %d modified URIs for source=%s", len(uris), source)
+    return uris
+
+
+def clear_assessment_signals(
+    store: CockroachDBStore,
+    source: str,
+) -> None:
+    """Clear assessment records for a source before persisting a new
+    assessment cycle.
+
+    Clears:
+    - ``assessment_signals`` junction entries for this source's assessments
+    - ``knowledge_assessments`` records for this source
+
+    Preserves (does NOT delete):
+    - ``knowledge_signals`` — signals persist across runs; their status
+      ('new', 'resolved', 'recurring') is managed by verify_improvement.
+      Deleting them would destroy the 'resolved' status set by prior runs.
+    - ``signal_lifecycle`` — keeps resolved status from prior runs
+    - ``remediation_history`` — institutional memory
+    - ``agent_state`` — workflow state
+    - ``knowledge_artifacts`` — content + embeddings
+    - ``modified_artifacts`` — which files were fixed
+
+    The ``persist_assessment`` call that follows will UPSERT signals
+    with ON CONFLICT, preserving 'resolved' status via a CASE expression.
+
+    Args:
+        store: Connected CockroachDBStore instance.
+        source: Source URI string to scope the clearing.
+    """
+    # 1. Find assessment IDs for this source and clear junction entries
+    rows = store._execute_fetchall(
+        "SELECT assessment_id FROM knowledge_assessments "
+        "WHERE metadata->>'source' = %s",
+        (source,),
+    )
+    if rows:
+        for row in rows:
+            aid = row["assessment_id"] if isinstance(row, dict) else row[0]
+            store._execute(
+                "DELETE FROM assessment_signals WHERE assessment_id = %s",
+                (aid,),
+            )
+        store._execute(
+            "DELETE FROM knowledge_assessments WHERE metadata->>'source' = %s",
+            (source,),
+        )
+
+    logger.info("clear_assessment_signals: cleared assessments for source=%s "
+                "(knowledge_signals preserved)", source)
 
 
 def update_signal_lifecycle_post_verification(

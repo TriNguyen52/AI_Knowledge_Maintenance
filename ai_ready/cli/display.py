@@ -153,11 +153,16 @@ def print_blank() -> None:
 
 def print_intro(source: str, limit: int, runs: int) -> None:
     """Print the demo intro panel."""
+    run_lines = []
+    for i in range(1, runs + 1):
+        if i == 1:
+            run_lines.append(f"  [green]Run {i}[/green]: No history -> outcome saved to CockroachDB")
+        else:
+            run_lines.append(f"  [green]Run {i}[/green]: Reads CockroachDB history -> LLM sees {i-1} prior outcome(s)")
     body = (
         f"[dim]This demo runs the improvement workflow {runs} time(s):[/dim]\n"
-        f"  [green]Run 1[/green]: No history -> outcome saved to CockroachDB\n"
-        f"  [green]Run 2[/green]: Reads CockroachDB history -> LLM sees past outcomes\n"
-        f"[dim]After all runs, shows CockroachDB institutional memory.[/dim]\n\n"
+        + "\n".join(run_lines) + "\n"
+        f"[dim]After all runs: per-run comparison + CockroachDB verification.[/dim]\n\n"
         f"[dim]Source:[/dim] {source}\n"
         f"[dim]Limit: [/dim] {limit} artifacts"
     )
@@ -812,9 +817,10 @@ def print_mcp_remediation_context(issue_type: str, result: dict) -> None:
         console.print(f"    [yellow](Fallback: broad match used -- no exact issue_type match)[/yellow]")
 
 
-def print_mcp_signal_lifecycle_summary(new_sigs: list, persistent_sigs: list, resolved_sigs: list) -> None:
+def print_mcp_signal_lifecycle_summary(new_sigs: list, persistent_sigs: list, resolved_sigs: list, recurring_sigs: list = None) -> None:
     print_section("Signal Lifecycle (new -> persistent -> resolved)")
-    console.print(f"  new: {len(new_sigs)}, persistent: {len(persistent_sigs)}, resolved: {len(resolved_sigs)}")
+    recurring_sigs = recurring_sigs or []
+    console.print(f"  new: {len(new_sigs)}, persistent: {len(persistent_sigs)}, resolved: {len(resolved_sigs)}, recurring: {len(recurring_sigs)}")
     if resolved_sigs:
         console.print(f"  [bold green]Resolved signals (sample):[/bold green]")
         for s in resolved_sigs[:3]:
@@ -843,22 +849,27 @@ def print_mcp_metrics(metrics: dict) -> None:
 # Demo complete
 # ---------------------------------------------------------------------------
 
-def print_demo_complete() -> None:
+def print_demo_complete(runs: int = 3) -> None:
     """Print the final demo completion summary."""
     console.print()
     console.print(Rule(style="bold green"))
     console.print(Align.center("[bold green]Demo Complete[/bold green]"))
     console.print(Rule(style="bold green"))
 
+    run_lines = []
+    for i in range(1, runs + 1):
+        if i == 1:
+            run_lines.append(f"  [green]{3+i}.[/green] Run {i} had no history -> outcome saved to CockroachDB")
+        else:
+            run_lines.append(f"  [green]{3+i}.[/green] Run {i} read CockroachDB history -> saw {i-1} prior outcome(s)")
+    run_lines.append(f"  [green]{3+runs+1}.[/green] Run {runs+1} would see ALL {runs} outcomes + decision traces + vector search")
+
     body = (
         "[bold]The closed loop is now functional (CockroachDB-only, no SQLite):[/bold]\n\n"
         "  [green]1.[/green] Artifacts saved with VECTOR(384) embeddings -> semantic search\n"
         "  [green]2.[/green] Signals + lifecycle tracked in CockroachDB (new -> persistent -> resolved)\n"
         "  [green]3.[/green] Agent workflow state persisted (active -> paused -> completed)\n"
-        "  [green]4.[/green] Run 1 had no history -> outcome saved to CockroachDB\n"
-        "  [green]5.[/green] Run 2 read CockroachDB context -> LLM saw Run 1's outcome\n"
-        "  [green]6.[/green] Run 2's outcome also saved to CockroachDB\n"
-        "  [green]7.[/green] Run 3 would see BOTH outcomes + decision traces + vector search\n\n"
+        + "\n".join(run_lines) + "\n\n"
         "[bold]CockroachDB tools demonstrated:[/bold]\n"
         "  [cyan]*[/cyan] Distributed Vector Indexing (VECTOR(384) + <=> cosine distance)\n"
         "  [cyan]*[/cyan] ACID Transactions (retry on serialization conflicts)\n"
@@ -869,6 +880,170 @@ def print_demo_complete() -> None:
     panel = Panel(body, border_style="green", width=100, padding=(1, 2))
     console.print(panel)
     console.print(Rule(style="bold green"))
+
+
+# ---------------------------------------------------------------------------
+# Per-run comparison and CockroachDB verification (3-run demo)
+# ---------------------------------------------------------------------------
+
+def print_per_run_summary(results: list[dict]) -> None:
+    """Display a per-run comparison table showing improvement across all runs."""
+    print_banner("Per-Run Improvement Summary")
+
+    table = Table(show_header=True, header_style="bold cyan", border_style="cyan", width=96)
+    table.add_column("Run", style="bold", justify="center", width=5)
+    table.add_column("Score Before", justify="right", width=13)
+    table.add_column("Score After", justify="right", width=12)
+    table.add_column("Delta", justify="right", width=8)
+    table.add_column("Resolved", justify="right", width=10)
+    table.add_column("New", justify="right", width=6)
+    table.add_column("Outcome", width=18)
+    table.add_column("Strategy", width=24)
+
+    for r in results:
+        delta = r.get("score_delta", 0)
+        delta_color = _delta_color(delta)
+        delta_str = f"{delta:+}" if isinstance(delta, (int, float)) else "?"
+        outcome = r.get("outcome", "unknown")
+        outcome_color = _outcome_color(outcome)
+        before = r.get("score_before", "?")
+        after = r.get("score_after", "?")
+        before_color = _score_color(before) if isinstance(before, (int, float)) else "white"
+        after_color = _score_color(after) if isinstance(after, (int, float)) else "white"
+
+        table.add_row(
+            str(r.get("run", "?")),
+            f"[{before_color}]{before}[/]",
+            f"[{after_color}]{after}[/]",
+            f"[{delta_color}]{delta_str}[/]",
+            str(r.get("signals_resolved", 0)),
+            str(r.get("new_signals", 0)),
+            f"[{outcome_color}]{outcome}[/]",
+            _truncate(r.get("strategy", "?"), 24),
+        )
+
+    console.print(table)
+
+
+def print_cumulative_improvement(results: list[dict]) -> None:
+    """Display total improvement across all runs."""
+    if not results:
+        return
+
+    print_section("Cumulative Improvement")
+
+    first = results[0]
+    last = results[-1]
+    total_delta = last.get("score_after", 0) - first.get("score_before", 0)
+    total_resolved = sum(r.get("signals_resolved", 0) for r in results)
+    total_new = sum(r.get("new_signals", 0) for r in results)
+
+    table = Table(show_header=True, header_style="bold green", border_style="green", width=96)
+    table.add_column("Metric", style="dim", width=30)
+    table.add_column("Value", style="bold white", width=20)
+    table.add_column("Trend", width=20)
+
+    table.add_row("Score (Run 1 before)", str(first.get("score_before", "?")), "")
+    table.add_row(f"Score (Run {len(results)} after)", str(last.get("score_after", "?")), "")
+    table.add_row(
+        "Total score improvement",
+        f"[{_delta_color(total_delta)}]{total_delta:+}[/]",
+        f"[{_delta_color(total_delta)}]{'improved' if total_delta > 0 else 'unchanged'}[/]",
+    )
+    table.add_row("Total signals resolved", str(total_resolved), "")
+    table.add_row("Total new signals", str(total_new), "")
+    table.add_row("Runs completed", str(len(results)), "")
+
+    console.print(table)
+
+
+def print_cockroach_verification(verification: dict) -> None:
+    """Display CockroachDB verification results."""
+    print_banner("CockroachDB Verification")
+
+    # Context storage
+    print_section("Context Storage (remediation_history)")
+    cs = verification.get("context_storage", {})
+    outcomes_count = cs.get("outcomes_count", 0)
+    all_have_steps = cs.get("all_have_modification_steps", False)
+    issue_types = cs.get("issue_types", [])
+
+    if outcomes_count > 0:
+        console.print(f"  [green]\u2713[/green] {outcomes_count} outcome(s) stored in remediation_history")
+        if all_have_steps:
+            console.print(f"  [green]\u2713[/green] All outcomes have modification_steps (institutional memory)")
+        else:
+            console.print(f"  [yellow]\u26a0[/yellow] Some outcomes missing modification_steps")
+        if issue_types:
+            console.print(f"  [dim]Issue types: {', '.join(issue_types)}[/dim]")
+    else:
+        console.print(f"  [red]\u2717[/red] No outcomes found in remediation_history")
+
+    # Agent state
+    print_section("Agent State (Burr + CockroachDB)")
+    as_state = verification.get("agent_state", {})
+    workflows_count = as_state.get("workflows_count", 0)
+    all_completed = as_state.get("all_completed", False)
+    stages = as_state.get("stages", [])
+
+    if workflows_count > 0:
+        console.print(f"  [green]\u2713[/green] {workflows_count} workflow(s) persisted in agent_state")
+        if all_completed:
+            console.print(f"  [green]\u2713[/green] All workflows have status=completed")
+        else:
+            console.print(f"  [yellow]\u26a0[/yellow] Some workflows not completed")
+        if stages:
+            console.print(f"  [dim]Stages: {', '.join(stages)}[/dim]")
+    else:
+        console.print(f"  [red]\u2717[/red] No workflows found in agent_state")
+
+    # MCP tools
+    print_section("MCP Tools (CockroachDB Cloud managed MCP)")
+    mcp_results = verification.get("mcp_tools", {})
+    for tool_name, result in mcp_results.items():
+        if "error" in result:
+            console.print(f"  [red]\u2717[/red] {tool_name}: {result.get('error', 'error')}")
+        elif "message" in result and "count" not in result and "score" not in result and "results" not in result and "total_workflows" not in result:
+            console.print(f"  [yellow]\u26a0[/yellow] {tool_name}: {result.get('message', 'no data')}")
+        elif "count" in result:
+            console.print(f"  [green]\u2713[/green] {tool_name}: {result['count']} items returned")
+        elif "score" in result:
+            console.print(f"  [green]\u2713[/green] {tool_name}: score={result.get('score', '?')}, signals={result.get('signals_count', '?')}")
+        elif "results" in result:
+            console.print(f"  [green]\u2713[/green] {tool_name}: {len(result['results'])} results returned")
+        elif "total_workflows" in result:
+            console.print(f"  [green]\u2713[/green] {tool_name}: {result['total_workflows']} workflows, {result.get('resolved', 0)} resolved")
+        else:
+            console.print(f"  [green]\u2713[/green] {tool_name}: data returned")
+
+    # Vector search
+    print_section("Vector Search (CockroachDB distributed vector index)")
+    vs = verification.get("vector_search", {})
+    vs_results = vs.get("results", [])
+    if vs_results:
+        console.print(f"  [green]\u2713[/green] {len(vs_results)} results returned")
+        for r in vs_results[:3]:
+            sim = r.get("similarity", 0)
+            uri = _truncate(r.get("artifact_uri", "?"), 60)
+            console.print(f"    [bold]sim={sim:.3f}[/bold]  [dim]{uri}[/dim]")
+    else:
+        console.print(f"  [red]\u2717[/red] No vector search results")
+
+    # Memory influence summary
+    print_section("Institutional Memory Influence (per run)")
+    memory_summary = verification.get("memory_influence", [])
+    for m in memory_summary:
+        run = m.get("run", "?")
+        retrieved = m.get("retrieved_count", 0)
+        avoided = m.get("avoided_count", 0)
+        reused = m.get("reused_strategy")
+        if retrieved > 0:
+            line = f"  Run {run}: [green]{retrieved} outcome(s) retrieved[/green], [red]{avoided} avoided[/red]"
+            if reused:
+                line += f", [green]reused: {_truncate(reused, 30)}[/green]"
+            console.print(line)
+        else:
+            console.print(f"  Run {run}: [dim]no prior outcomes (first run)[/dim]")
 
 
 # ---------------------------------------------------------------------------
