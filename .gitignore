@@ -51,11 +51,14 @@ setup_cockroachdb.py
 SUBMISSION.md
 certs/
 verify_imports.py
+diagnose_fix.py
 
 # Documents
 docs
 tests
 IMPLEMENTATION_PLAN.md
+IMPROVEMENT_PLAN_v2.md
+IMPROVEMENT_PLAN_FINAL.md
 *.txt
 fastapi/
 

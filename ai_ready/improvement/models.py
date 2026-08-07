@@ -451,6 +451,7 @@ class RemediationOutcome:
     verification_outcome: str = ""  # VerificationOutcome value
     strategy_description: str = ""  # what the strategy actually did
     proposal_reasoning: str = ""  # LLM's reasoning for choosing this strategy
+    modification_steps: list[dict[str, Any]] = field(default_factory=list)  # concrete steps taken
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -467,6 +468,7 @@ class RemediationOutcome:
             "verification_outcome": self.verification_outcome,
             "strategy_description": self.strategy_description,
             "proposal_reasoning": self.proposal_reasoning,
+            "modification_steps": self.modification_steps,
         }
 
 

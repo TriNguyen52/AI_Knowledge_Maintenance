@@ -144,9 +144,10 @@ class AssessmentRecord:
 
     @classmethod
     def new(cls, score: float, dimensions: dict[str, Any],
-            signals_count: int, metadata: dict[str, Any] | None = None) -> AssessmentRecord:
+            signals_count: int, metadata: dict[str, Any] | None = None,
+            assessment_id: str | None = None) -> AssessmentRecord:
         return cls(
-            assessment_id=str(uuid.uuid4()),
+            assessment_id=assessment_id or str(uuid.uuid4()),
             score=score,
             dimensions=json.dumps(dimensions),
             signals_count=signals_count,
@@ -228,13 +229,15 @@ class RemediationRecord:
     tokens_used: int
     latency_ms: float
     forked: bool = False
+    modification_steps: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @classmethod
     def new(cls, issue_type: str, strategy: str, strategy_description: str,
             verification_outcome: str, score_before: float, score_after: float,
             proposal_reasoning: str = "", tokens_used: int = 0,
-            latency_ms: float = 0.0, forked: bool = False) -> RemediationRecord:
+            latency_ms: float = 0.0, forked: bool = False,
+            modification_steps: list[dict[str, Any]] | None = None) -> RemediationRecord:
         return cls(
             outcome_id=str(uuid.uuid4()),
             issue_type=issue_type,
@@ -247,6 +250,7 @@ class RemediationRecord:
             tokens_used=tokens_used,
             latency_ms=latency_ms,
             forked=forked,
+            modification_steps=modification_steps if modification_steps is not None else [],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -262,6 +266,7 @@ class RemediationRecord:
             "tokens_used": self.tokens_used,
             "latency_ms": self.latency_ms,
             "forked": self.forked,
+            "modification_steps": self.modification_steps,
             "created_at": self.created_at.isoformat(),
         }
 

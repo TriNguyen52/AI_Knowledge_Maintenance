@@ -98,6 +98,17 @@ class KnowledgeExecutor:
         self.known_artifact_uris = known_artifact_uris or set()
         self._dry_run = artifact_store is None and self.source_path is None
 
+        # Discover ALL markdown files in the source path that are not
+        # already in known_artifact_uris.  This ensures the executor can
+        # modify any file in the knowledge base (e.g. navigation hub files
+        # like index.md that create_relationship operations need to edit
+        # to add inbound links to orphaned documents), regardless of the
+        # directory structure or naming conventions used by the source.
+        if self.source_path and not self._dry_run:
+            for md_file in self.source_path.rglob("*.md"):
+                rel_path = str(md_file.relative_to(self.source_path)).replace("\\", "/")
+                self.known_artifact_uris.add(rel_path)
+
     def _resolve_path(self, artifact_uri: str, is_create: bool = False) -> Path | None:
         """Resolve an artifact URI to a full file path safely.
 
@@ -257,23 +268,19 @@ class KnowledgeExecutor:
         """Handle document content update — fix broken links, dangling refs,
         and add canonical source links.
 
-        Solves the ROOT CAUSE by applying the fix to ALL artifacts that have
-        the relevant signal type, not just the one file mentioned in the step.
-        The LLM generates a representative step; the executor applies the fix
-        pattern across every affected file.
+        Targets ONLY the specific artifact_uri from the step (Item 5:
+        targeted modifications).  The remediation map generates one step
+        per signal, so each step already has a specific artifact to fix.
 
-        When source_path is set, reads each affected file and applies fixes:
+        When source_path is set, reads the target file and applies fixes:
         1. Removes broken markdown links (targets that don't exist in the
-           known artifact set) — applied to ALL files with broken_link signals
+           known artifact set) — uses signal evidence to identify which
+           specific links are broken.
         2. Rewrites dangling references ("see above", "as mentioned below")
-           to be self-contained — applied to ALL files with dangling_reference
-           signals. Conservative: only replaces clearly ambiguous phrases
-           that would be meaningless to an LLM reading a single chunk without
-           surrounding context.
-        3. Adds canonical source links for missing_canonical_source signals —
-           adds a markdown link to the canonical domain so the
-           CanonicalSourceCollector finds it on re-assessment.
-        4. Writes each modified file back to disk
+           to be self-contained — conservative: only replaces clearly
+           ambiguous phrases that would be meaningless to an LLM reading
+           a single chunk without surrounding context.
+        3. Writes the modified file back to disk
         """
         artifact_uri = step.get("artifact_uri", "")
         description = step.get("description", "")
@@ -300,28 +307,21 @@ class KnowledgeExecutor:
             fix_broken_links = True
             fix_dangling_refs = True
 
-        # Find ALL artifacts that have the relevant signal types.
-        # This solves the root cause — every file with broken links gets fixed,
-        # not just the one the LLM happened to mention.
-        artifacts_to_fix: set[str] = set()
-        for signal in self.assessment_signals:
-            if fix_broken_links and signal.signal_type == "broken_link":
-                artifacts_to_fix.add(signal.artifact_uri)
-            if fix_dangling_refs and signal.signal_type == "dangling_reference":
-                artifacts_to_fix.add(signal.artifact_uri)
+        # Item 5: Target ONLY the specific artifact_uri from the step.
+        # The remediation map generates one step per signal, so sweeping
+        # all matching artifacts would cause collateral changes to files
+        # that have their own separate steps.
+        if not artifact_uri:
+            return {"mode": "production", "files_fixed": 0,
+                    "message": "No artifact_uri in step"}
 
-        # Also include the specific artifact mentioned in the step
-        if artifact_uri:
-            artifacts_to_fix.add(artifact_uri)
-
-        if not artifacts_to_fix:
-            return {"mode": "production", "files_fixed": 0, "message": "No artifacts to fix"}
+        artifacts_to_fix: list[str] = [artifact_uri]
 
         total_files_fixed = 0
         total_fixes = 0
         all_fix_details: list[str] = []
 
-        for uri in sorted(artifacts_to_fix):
+        for uri in artifacts_to_fix:
             file_path = self._resolve_path(uri)
             if file_path is None:
                 continue
@@ -418,8 +418,8 @@ class KnowledgeExecutor:
         canonical domain at the top of the document (after the title)
         so the collector finds it on re-assessment.
 
-        Applies to ALL artifacts with missing_canonical_source signals
-        that match the same canonical domain, not just the one in the step.
+        Item 5: Targets ONLY the specific artifact_uri from the step,
+        not all artifacts with matching domain.
         """
         artifact_uri = step.get("artifact_uri", "")
         canonical_domain = params.get("canonical_domain", "")
@@ -429,22 +429,12 @@ class KnowledgeExecutor:
         if self._dry_run:
             return {"mode": "dry_run", "message": "Canonical link addition simulated"}
 
-        # Find ALL artifacts with missing_canonical_source signals for
-        # this canonical domain (root-cause fix, not just the one file)
-        artifacts_to_fix: set[str] = set()
-        for signal in self.assessment_signals:
-            if signal.signal_type == "missing_canonical_source":
-                evidence = signal.evidence or {}
-                sig_domain = evidence.get("canonical_domain", "")
-                if sig_domain == canonical_domain or not canonical_domain:
-                    artifacts_to_fix.add(signal.artifact_uri)
-
-        if artifact_uri:
-            artifacts_to_fix.add(artifact_uri)
-
-        if not artifacts_to_fix:
+        # Item 5: Target ONLY the specific artifact_uri from the step.
+        if not artifact_uri:
             return {"mode": "production", "files_fixed": 0,
-                    "message": "No artifacts with missing canonical source"}
+                    "message": "No artifact_uri in step"}
+
+        artifacts_to_fix: list[str] = [artifact_uri]
 
         total_files_fixed = 0
         total_fixes = 0
@@ -600,9 +590,9 @@ class KnowledgeExecutor:
         the index page to include links to the orphaned documents —
         integrating them into the knowledge graph at the source.
 
-        If the index page doesn't exist, falls back to adding cross-references
-        from the most-connected artifact (the one with the most inbound links)
-        to the orphaned documents.
+        Item 5: Targets ONLY the specific artifact_uri from the step,
+        not all orphaned artifacts.  The remediation map generates one
+        step per orphan signal, so each step has a specific artifact.
         """
         artifact_uri = step.get("artifact_uri", "")
         description = step.get("description", "")
@@ -610,33 +600,44 @@ class KnowledgeExecutor:
         if self._dry_run:
             return {"mode": "dry_run", "message": "Relationship creation simulated"}
 
-        # Find ALL artifacts with orphan signals (all signal type variants)
-        orphaned_uris: set[str] = set()
-        for signal in self.assessment_signals:
-            if signal.signal_type in ("orphan", "orphaned_documents", "orphan_artifact"):
-                orphaned_uris.add(signal.artifact_uri)
+        # Item 5: Target ONLY the specific artifact_uri from the step.
+        if not artifact_uri:
+            return {"mode": "production", "files_fixed": 0,
+                    "message": "No artifact_uri in step"}
 
-        if not orphaned_uris:
-            return {"mode": "production", "files_fixed": 0, "message": "No orphaned artifacts found"}
+        orphaned_uris: set[str] = {artifact_uri}
 
-        # Strategy: Update the index page to link to orphaned documents.
-        # This solves the root cause — the orphans exist because nothing
-        # links to them. Adding them to the index integrates them.
-        index_candidates = [
-            "docs/en/docs/index.md",
-            "docs/index.md",
-            "index.md",
-            "docs/en/index.md",
-        ]
-
+        # Strategy: Find the best navigation hub file to add links from.
+        # The root cause of orphaned documents is that no other file links
+        # to them. We find the root-level index.md (or closest equivalent)
+        # and add cross-reference links there, integrating the orphan into
+        # the knowledge graph at the source.
+        #
+        # Discovery is general: find index.md files at the root of the
+        # source path, then at increasing depth. This works for any
+        # knowledge base structure, not just FastAPI docs.
         index_path = None
         index_uri = None
-        for candidate in index_candidates:
-            resolved = self._resolve_path(candidate)
-            if resolved is not None:
-                index_path = resolved
-                index_uri = candidate
-                break
+
+        # Try root-level index.md first (most common navigation hub)
+        root_index = self._resolve_path("index.md")
+        if root_index is not None:
+            index_path = root_index
+            index_uri = "index.md"
+        else:
+            # Search for any index.md in the source path, shallowest first
+            if self.source_path:
+                index_files = sorted(
+                    self.source_path.rglob("index.md"),
+                    key=lambda p: len(p.relative_to(self.source_path).parts),
+                )
+                for idx_file in index_files:
+                    rel_uri = str(idx_file.relative_to(self.source_path)).replace("\\", "/")
+                    resolved = self._resolve_path(rel_uri)
+                    if resolved is not None:
+                        index_path = resolved
+                        index_uri = rel_uri
+                        break
 
         if index_path is None:
             # Fallback: use the artifact_uri from the step as the hub document

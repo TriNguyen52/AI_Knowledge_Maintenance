@@ -245,6 +245,8 @@ Your job:
 
 Think about the knowledge system holistically. Do not just list signals — explain WHY they exist. A signal like "document has no title" is an observation; the root cause might be "the ingestion pipeline doesn't enforce metadata requirements."
 
+GROUND YOUR ANALYSIS IN SIGNAL TYPES: The assessment summary includes a signal type legend explaining what each signal type means and how it's detected. Use these definitions — do not infer signal semantics from the signal type name alone. Each signal type is produced by a specific collector with a specific detection rule; your root cause hypotheses should reference the actual detection mechanism, not a guessed one.
+
 Respond in JSON format:
 {
   "hypotheses": [
@@ -594,6 +596,7 @@ Do NOT propose the same modification steps again, even under a different strateg
                         "verification_outcome": o.get("verification_outcome", ""),
                         "score_change": o.get("score_change", 0),
                         "issue_type": o.get("issue_type", ""),
+                        "modification_steps": o.get("modification_steps", []),
                     }
                     for o in prior_outcomes
                 ]
@@ -769,7 +772,13 @@ Propose 1-3 improvement strategies as JSON. Focus on improving the knowledge sys
         if not assessment_signals:
             # Fall back to reconstructing from root cause analysis
             assessment_signals = state.get("all_signals", [])
-        proposals = constrain_proposal_steps(proposals, assessment_signals)
+        # Item 3: Pass prior outcomes to constrain_proposal_steps so
+        # it can skip concrete steps for signals that have consistently
+        # failed in prior attempts (institutional memory).
+        prior_outcomes_for_constraining = memory_influence.get("retrieved", [])
+        proposals = constrain_proposal_steps(
+            proposals, assessment_signals, prior_outcomes_for_constraining
+        )
 
         # Fallback: if no proposals survived constraining, build concrete
         # steps directly from the remediation map (Item 1.1 — the loop
@@ -1079,21 +1088,46 @@ def verify_improvement(state: State, assessment_store: Any = None,
             fresh_knowledge = load_knowledge_source(source)
             # Filter to the same set of artifact URIs that were originally assessed
             original_uris = {a.uri for a in artifacts}
+
+            # Also include any files modified by the executor that are not
+            # in the original artifact set (e.g. navigation hub files like
+            # index.md that create_relationship operations modify to add
+            # inbound links to orphaned documents).  Without including these
+            # files in the re-assessment, the new links they contain would
+            # not be counted by the connectivity collector, and orphan_artifact
+            # signals would never resolve.
+            modified_uris: set[str] = set()
+            for step in execution_history:
+                step_details = step.get("details", {}) or {}
+                modified_file = step_details.get("file", "")
+                if modified_file:
+                    # Extract the artifact URI from the file path
+                    from pathlib import Path as PathlibPath
+                    try:
+                        rel = PathlibPath(modified_file).relative_to(
+                            PathlibPath(source).resolve()
+                        )
+                        modified_uris.add(str(rel).replace("\\", "/"))
+                    except (ValueError, TypeError):
+                        pass
+
+            assessment_uris = original_uris | modified_uris
             fresh_artifacts = [
-                a for a in fresh_knowledge.artifacts if a.uri in original_uris
+                a for a in fresh_knowledge.artifacts if a.uri in assessment_uris
             ]
             if fresh_artifacts:
                 artifacts = fresh_artifacts
                 # Also refresh relationships from the fresh load
                 fresh_rels = [
                     r for r in fresh_knowledge.relationships
-                    if r.source_uri in original_uris and r.target_uri in original_uris
+                    if r.source_uri in assessment_uris and r.target_uri in assessment_uris
                 ]
                 if fresh_rels:
                     relationships = fresh_rels
                 logger.info(
                     f"verify_improvement: reloaded {len(artifacts)} artifacts "
-                    f"and {len(relationships or [])} relationships from disk"
+                    f"and {len(relationships or [])} relationships from disk "
+                    f"(original={len(original_uris)}, modified_extra={len(modified_uris)})"
                 )
         except Exception as e:
             logger.warning(
@@ -1138,6 +1172,57 @@ def verify_improvement(state: State, assessment_store: Any = None,
             remaining_kp_signals = before_kp_signals & after_kp_signals
             new_kp_signals = after_kp_signals - before_kp_signals
 
+            # Signal-type-level fallback (Item 2): when signal ID matching
+            # fails (before_kp_signals is empty), fall back to matching by
+            # signal type.  This handles cases where signal IDs changed
+            # between the analysis phase and verification — e.g. because
+            # evidence fields shifted, a new assessment was run, or the
+            # signal ID discriminator keys changed after the fix.
+            used_type_fallback = False
+            if not before_kp_signals and kp.signal_ids:
+                from ai_ready.improvement.remediation_map import (
+                    CATEGORY_TO_SIGNAL_TYPES,
+                )
+                # Determine the signal types this problem produces
+                kp_signal_types: set[str] = set(
+                    CATEGORY_TO_SIGNAL_TYPES.get(kp.category, [])
+                )
+                # If the category isn't mapped, infer types from the
+                # before-assessment by looking up the problem's signal IDs
+                if not kp_signal_types:
+                    for sig in before_assessment.signals:
+                        if sig.signal_id in set(kp.signal_ids):
+                            kp_signal_types.add(sig.signal_type)
+
+                if kp_signal_types:
+                    kp_artifact_uris = set(kp.artifact_uris)
+                    # Match by (signal_type, artifact_uri) in before/after
+                    before_type_signals = {
+                        s.signal_id for s in before_assessment.signals
+                        if s.signal_type in kp_signal_types
+                        and (not kp_artifact_uris
+                             or s.artifact_uri in kp_artifact_uris)
+                    }
+                    after_type_signals = {
+                        s.signal_id for s in after_assessment.signals
+                        if s.signal_type in kp_signal_types
+                        and (not kp_artifact_uris
+                             or s.artifact_uri in kp_artifact_uris)
+                    }
+                    if before_type_signals:
+                        used_type_fallback = True
+                        before_kp_signals = before_type_signals
+                        after_kp_signals = after_type_signals
+                        resolved_kp_signals = (
+                            before_type_signals - after_type_signals
+                        )
+                        remaining_kp_signals = (
+                            before_type_signals & after_type_signals
+                        )
+                        new_kp_signals = (
+                            after_type_signals - before_type_signals
+                        )
+
             # Determine outcome
             if not before_kp_signals:
                 outcome = VerificationOutcome.MISDIAGNOSED.value
@@ -1151,6 +1236,8 @@ def verify_improvement(state: State, assessment_store: Any = None,
                     f"Problem '{kp.problem_id}' ({kp.category}): all {len(before_kp_signals)} "
                     f"signal(s) resolved. Signals gone: {resolved_kp_signals}."
                 )
+                if used_type_fallback:
+                    explanation += " (Matched by signal type — signal IDs changed.)"
             elif len(remaining_kp_signals) < len(before_kp_signals):
                 outcome = VerificationOutcome.PARTIALLY_RESOLVED.value
                 explanation = (
@@ -1158,6 +1245,8 @@ def verify_improvement(state: State, assessment_store: Any = None,
                     f"of {len(before_kp_signals)} signal(s) resolved. "
                     f"Remaining: {remaining_kp_signals}."
                 )
+                if used_type_fallback:
+                    explanation += " (Matched by signal type — signal IDs changed.)"
             elif len(new_kp_signals) > 0 and len(remaining_kp_signals) == len(before_kp_signals):
                 outcome = VerificationOutcome.REGRESSED.value
                 explanation = (
@@ -1171,6 +1260,8 @@ def verify_improvement(state: State, assessment_store: Any = None,
                     f"Problem '{kp.problem_id}' ({kp.category}): no change. "
                     f"All {len(remaining_kp_signals)} signal(s) remain."
                 )
+                if used_type_fallback:
+                    explanation += " (Matched by signal type — signal IDs changed.)"
 
             pv = ProblemVerification(
                 problem_id=kp.problem_id,

@@ -63,6 +63,33 @@ EXISTING_SIGNAL_TYPES = {
     "dangling_reference",
 }
 
+# Problem category → signal types that category produces.
+# Used by problem-level verification as a fallback when signal IDs
+# don't match between before/after assessments (e.g. because evidence
+# changed after a fix).  Instead of matching by signal ID, verification
+# can match by signal type: "did the signal TYPES this problem produces
+# disappear from the after-assessment?"
+CATEGORY_TO_SIGNAL_TYPES: dict[str, list[str]] = {
+    "missing_metadata": ["no_date_signal", "stale_content"],
+    "freshness": ["no_date_signal", "stale_content"],
+    "stale_content": ["stale_content"],
+    "missing_canonical_source": ["missing_canonical_source"],
+    "missing_context": ["missing_canonical_source"],
+    "broken_links": ["broken_link"],
+    "dangling_references": ["dangling_reference"],
+    "orphaned_documents": ["orphan_artifact"],
+    "orphan_artifact": ["orphan_artifact"],
+    "poor_structure": [],
+    "duplicate_content": ["duplicate_content"],
+    "terminology_inconsistency": ["terminology_variant"],
+}
+
+# Reverse map: signal_type → categories that produce it
+SIGNAL_TYPE_TO_CATEGORIES: dict[str, list[str]] = {}
+for _cat, _types in CATEGORY_TO_SIGNAL_TYPES.items():
+    for _t in _types:
+        SIGNAL_TYPE_TO_CATEGORIES.setdefault(_t, []).append(_cat)
+
 
 def _get_signal_field(signal: Any, field: str, default: Any = None) -> Any:
     """Get a field from a signal that may be a dict or an object."""
@@ -184,6 +211,7 @@ def build_remediation_steps_from_signals(
 def constrain_proposal_steps(
     proposals: list[Any],
     signals: list[Any],
+    prior_outcomes: list[Any] | None = None,
 ) -> list[Any]:
     """Constrain LLM proposal steps to implemented, signal-mapped types.
 
@@ -193,14 +221,46 @@ def constrain_proposal_steps(
 
     This ensures the executor never silently no-ops on a step.
 
+    Item 3 (Institutional Memory): When prior_outcomes are provided,
+    concrete steps for signals that have consistently FAILED in prior
+    attempts are skipped (not auto-proposed again).  This prevents the
+    system from repeatedly proposing the same fix that has never worked.
+
     Args:
         proposals: List of RemediationProposal objects.
         signals: List of KnowledgeSignal objects from the assessment.
+        prior_outcomes: Optional list of prior remediation outcome dicts.
+            Each dict should have 'strategy', 'result', and optionally
+            'verification_outcome' and 'modification_steps'.
 
     Returns:
         New list of RemediationProposal with constrained steps.
     """
     from ai_ready.improvement.models import RemediationProposal
+
+    # Item 3: Build a set of (signal_type, artifact_uri) keys that have
+    # consistently failed in prior attempts.  These should NOT be
+    # auto-proposed as concrete fallback steps.
+    failed_keys: set[str] = set()
+    if prior_outcomes:
+        for outcome in prior_outcomes:
+            result = (outcome.get("result", "") or "").lower()
+            verification = (outcome.get("verification_outcome", "") or "").lower()
+            # Skip outcomes that were successful — either the legacy
+            # 'result' field says "success" with a positive verification,
+            # or the CockroachDB 'verification_outcome' field directly
+            # indicates resolution (CockroachDB outcomes lack 'result').
+            if result == "success" and verification in ("resolved", "partially_resolved"):
+                continue
+            if not result and verification in ("resolved", "partially_resolved"):
+                continue
+            # Extract signal_type+artifact_uri from the outcome's
+            # modification steps
+            for step in outcome.get("modification_steps", []):
+                sig_type = step.get("parameters", {}).get("signal_type", "")
+                artifact_uri = step.get("artifact_uri", "")
+                if sig_type and artifact_uri:
+                    failed_keys.add(f"{sig_type}|{artifact_uri}")
 
     # Build concrete steps from signals as a fallback source
     concrete_steps = build_remediation_steps_from_signals(signals)
@@ -208,7 +268,15 @@ def constrain_proposal_steps(
     for step in concrete_steps:
         uri = step.get("artifact_uri", "")
         st = step.get("parameters", {}).get("signal_type", "")
-        concrete_by_key[f"{st}|{uri}"] = step
+        key = f"{st}|{uri}"
+        # Item 3: Skip concrete steps that have consistently failed
+        if key in failed_keys:
+            logger.info(
+                f"Skipping concrete step for {key} — consistently "
+                f"failed in prior outcomes (institutional memory)."
+            )
+            continue
+        concrete_by_key[key] = step
 
     # Track which fixable signals are already covered by LLM proposals
     covered_keys: set[str] = set()
@@ -320,7 +388,7 @@ def constrain_proposal_steps(
             expected_impact=f"Resolve {len(uncovered_concrete)} signal(s)",
             risks=["Minimal — deterministic fixes matching collector detection format"],
             affected_artifact_uris=list({s.get("artifact_uri", "") for s in uncovered_concrete}),
-            modification_steps=uncovered_concrete[:20],
+            modification_steps=uncovered_concrete,
             root_cause_idx=0,
             reasoning="Concrete signal-mapped steps that will clear signals on re-assessment.",
             affected_dimensions=[],

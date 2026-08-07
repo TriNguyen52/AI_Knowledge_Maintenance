@@ -823,15 +823,17 @@ class CockroachDBStore:
             INSERT INTO remediation_history
                 (outcome_id, issue_type, strategy, strategy_description,
                  verification_outcome, score_before, score_after,
-                 proposal_reasoning, tokens_used, latency_ms, forked, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 proposal_reasoning, tokens_used, latency_ms, forked,
+                 modification_steps, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 record.outcome_id, record.issue_type, record.strategy,
                 record.strategy_description, record.verification_outcome,
                 record.score_before, record.score_after,
                 record.proposal_reasoning, record.tokens_used,
-                record.latency_ms, record.forked, record.created_at,
+                record.latency_ms, record.forked,
+                json.dumps(record.modification_steps), record.created_at,
             ),
         )
         return record.outcome_id
@@ -910,6 +912,12 @@ class CockroachDBStore:
         }
 
     def _row_to_remediation(self, row: dict[str, Any]) -> RemediationRecord:
+        mod_steps = row.get("modification_steps", [])
+        if isinstance(mod_steps, str):
+            try:
+                mod_steps = json.loads(mod_steps)
+            except (json.JSONDecodeError, TypeError):
+                mod_steps = []
         return RemediationRecord(
             outcome_id=str(row["outcome_id"]),
             issue_type=row["issue_type"],
@@ -922,6 +930,7 @@ class CockroachDBStore:
             tokens_used=row["tokens_used"],
             latency_ms=row["latency_ms"],
             forked=row["forked"],
+            modification_steps=mod_steps if isinstance(mod_steps, list) else [],
             created_at=row["created_at"],
         )
 
@@ -1108,7 +1117,7 @@ class CockroachDBStore:
             """
             SELECT r.outcome_id, r.issue_type, r.strategy, r.verification_outcome,
                    r.score_before, r.score_after, r.proposal_reasoning,
-                   r.tokens_used, r.created_at
+                   r.tokens_used, r.created_at, r.modification_steps
             FROM remediation_history r
             WHERE r.issue_type = %s
             ORDER BY r.created_at DESC
@@ -1125,7 +1134,7 @@ class CockroachDBStore:
                 """
                 SELECT r.outcome_id, r.issue_type, r.strategy, r.verification_outcome,
                        r.score_before, r.score_after, r.proposal_reasoning,
-                       r.tokens_used, r.created_at
+                       r.tokens_used, r.created_at, r.modification_steps
                 FROM remediation_history r
                 ORDER BY r.created_at DESC
                 LIMIT %s

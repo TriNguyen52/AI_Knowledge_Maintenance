@@ -318,6 +318,7 @@ class CockroachHistoryStore:
             tokens_used=tokens_used,
             latency_ms=latency_ms,
             forked=bool(forked_from_app_id),
+            modification_steps=outcome.modification_steps,
         )
 
         outcome_id = self._store.save_remediation_outcome(record)

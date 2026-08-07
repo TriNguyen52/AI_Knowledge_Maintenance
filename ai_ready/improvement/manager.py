@@ -119,8 +119,23 @@ class ImprovementManager:
         else:
             sqlite_store = None
 
-        # Wrap in DualHistoryStore if CockroachDB is available
-        if sqlite_store and cockroach_store:
+        # Detect if history_store is already a DualHistoryStore or a
+        # CockroachHistoryStore — if so, wrapping it again in
+        # DualHistoryStore would cause duplicate CockroachDB writes.
+        # (DualHistoryStore.record_outcome writes to both its sqlite_store
+        #  and cockroach_store; if sqlite_store IS a CockroachHistoryStore,
+        #  the same CockroachDB gets written twice per outcome.)
+        _already_dual = isinstance(sqlite_store, DualHistoryStore)
+        _already_cockroach = False
+        if sqlite_store is not None:
+            # CockroachHistoryStore wraps a CockroachDBStore in _store
+            if hasattr(sqlite_store, "_store") and not isinstance(sqlite_store, DualHistoryStore):
+                from ai_ready.storage.adapters import CockroachHistoryStore
+                _already_cockroach = isinstance(sqlite_store, CockroachHistoryStore)
+
+        # Wrap in DualHistoryStore if CockroachDB is available AND the
+        # existing store is not already dual-write or cockroach-backed
+        if sqlite_store and cockroach_store and not _already_dual and not _already_cockroach:
             self.history_store = DualHistoryStore(
                 sqlite_store=sqlite_store,
                 cockroach_store=cockroach_store,
@@ -129,6 +144,21 @@ class ImprovementManager:
                 "ImprovementManager initialized with DualHistoryStore "
                 "(SQLite + CockroachDB). Outcomes will sync to both stores."
             )
+        elif sqlite_store and cockroach_store and (_already_dual or _already_cockroach):
+            # Store is already dual-write or cockroach-backed — use as-is
+            self.history_store = sqlite_store
+            if _already_cockroach:
+                logger.info(
+                    "ImprovementManager: history_store is already a "
+                    "CockroachHistoryStore — skipping DualHistoryStore wrapper "
+                    "to prevent duplicate CockroachDB writes."
+                )
+            else:
+                logger.info(
+                    "ImprovementManager: history_store is already a "
+                    "DualHistoryStore — skipping re-wrap to prevent "
+                    "duplicate writes."
+                )
         else:
             self.history_store = sqlite_store
 
@@ -435,6 +465,59 @@ class ImprovementManager:
 
         return final_state
 
+    def auto_approve(
+        self,
+        app_id: str,
+        selected_proposal_idx: int | None = None,
+    ) -> dict[str, Any]:
+        """Auto-approve a proposal based on institutional memory (Item 3).
+
+        Checks prior outcomes for the selected proposal's strategy.
+        If the strategy has consistently failed in prior attempts,
+        auto-rejects instead of auto-approving.
+
+        Args:
+            app_id: The app_id of the workflow waiting for approval.
+            selected_proposal_idx: Optional index to select a different proposal.
+
+        Returns:
+            Final state dict.
+        """
+        state = self.get_state(app_id)
+        proposals = state.get("proposals", [])
+        idx = selected_proposal_idx or state.get("selected_proposal_idx", 0)
+
+        if not proposals or idx >= len(proposals):
+            return self.approve_and_complete(
+                app_id, approved=False,
+                reason="No valid proposal to auto-approve",
+            )
+
+        selected = proposals[idx]
+        strategy = selected.get("strategy", "")
+
+        # Check prior outcomes for this strategy
+        should_approve = True
+        reject_reason = ""
+        memory_influence = state.get("memory_influence", {})
+        avoided = memory_influence.get("avoided_strategies", [])
+        for failed in avoided:
+            if failed.get("strategy", "") == strategy:
+                should_approve = False
+                reject_reason = (
+                    f"Strategy '{strategy}' has failed in prior attempts "
+                    f"(reason: {failed.get('failure_reason', 'unknown')}). "
+                    f"Auto-rejecting based on institutional memory."
+                )
+                break
+
+        return self.approve_and_complete(
+            app_id,
+            approved=should_approve,
+            reason=reject_reason if not should_approve else "Auto-approved",
+            selected_proposal_idx=selected_proposal_idx,
+        )
+
     def should_retry(self, app_id: str) -> bool:
         """Check if a failed workflow should be retried via forking."""
         state = self.get_state(app_id)
@@ -528,6 +611,10 @@ class ImprovementManager:
             proposals[selected_idx].get("reasoning", "")
             if selected_idx < len(proposals) else ""
         )
+        modification_steps = (
+            proposals[selected_idx].get("modification_steps", [])
+            if selected_idx < len(proposals) else []
+        )
 
         outcome = RemediationOutcome(
             issue_type=issue_type,
@@ -543,6 +630,7 @@ class ImprovementManager:
             verification_outcome=verification_outcome,
             strategy_description=strategy_description,
             proposal_reasoning=proposal_reasoning,
+            modification_steps=modification_steps,
         )
 
         self.history_store.record_outcome(

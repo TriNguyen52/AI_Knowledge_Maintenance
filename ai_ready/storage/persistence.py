@@ -143,7 +143,9 @@ def persist_assessment(
         signal_id_map[sig_id] = sig_id
         signal_count += 1
 
-    # 2. Pre-build assessment record
+    # 2. Pre-build assessment record — use the original assessment_id
+    #    so that verify_improvement can load it by the same ID that's
+    #    stored in the workflow state.
     assessment_record = AssessmentRecord.new(
         score=assessment.score,
         dimensions={name: d.score for name, d in assessment.dimensions.items()},
@@ -153,6 +155,7 @@ def persist_assessment(
             "artifact_count": len(artifacts),
             **({"dedup_key": dedup_key} if dedup_key else {}),
         },
+        assessment_id=assessment.assessment_id,
     )
 
     # 3. Execute all writes in a single transaction (atomic — all or nothing)
@@ -222,6 +225,18 @@ def persist_assessment(
                 assessment_record.metadata, assessment_record.created_at,
             ),
         )
+
+        # Assessment-Signal junction table — links each signal to this
+        # assessment so that CockroachAssessmentStore._get_signals_for_assessment()
+        # can reconstruct the full signal list via a JOIN.
+        for sig_id in signal_id_map:
+            cur.execute(
+                """
+                INSERT INTO assessment_signals (assessment_id, signal_id)
+                VALUES (%s, %s) ON CONFLICT DO NOTHING
+                """,
+                (assessment_record.assessment_id, sig_id),
+            )
 
         # Signal lifecycle (new → persistent)
         for sig_id in signal_id_map:

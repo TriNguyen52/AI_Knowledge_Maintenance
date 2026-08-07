@@ -41,6 +41,37 @@ def _severity_rank(s: Severity) -> int:
     return _SEVERITY_ORDER.get(s, 0)
 
 
+# Stable discriminator keys per signal type.
+# Only these evidence keys are used to differentiate signals of the same
+# type on the same artifact.  All other evidence fields are ignored for
+# ID purposes, so minor changes (e.g. a date shifting from 2024-01-15 to
+# 2024-01-16) do NOT change the signal ID and break before/after matching.
+#
+# Rationale: verification compares before-assessment signal IDs with
+# after-assessment signal IDs.  If the evidence hash includes volatile
+# fields, the same underlying problem gets a different ID after the fix
+# is applied, and verification reports "unchanged" even though the signal
+# was actually cleared.
+#
+# Signal types not listed here use NO evidence discriminator — the ID is
+# purely (collector_id, artifact_uri, signal_type), which is stable across
+# assessments as long as the artifact and signal type don't change.
+STABLE_DISCRIMINATOR_KEYS: dict[str, list[str]] = {
+    # missing_canonical_source: discriminate by which canonical domain is
+    # missing, so multiple missing-source signals for different domains on
+    # the same artifact get distinct IDs.
+    "missing_canonical_source": ["canonical_domain", "topic_keyword"],
+    # broken_link: discriminate by the link target so multiple broken links
+    # in the same document get distinct IDs.  link_text is NOT stable (it
+    # can be edited without changing the underlying broken link).
+    "broken_link": ["link_target"],
+    # dangling_reference: discriminate by the reference phrase.
+    "dangling_reference": ["reference_text", "phrase"],
+    # duplicate_content: discriminate by the duplicate artifact URI.
+    "duplicate_content": ["duplicate_uri", "duplicate_artifact"],
+}
+
+
 def make_signal_id(
     collector_id: str,
     artifact_uri: str,
@@ -53,16 +84,33 @@ def make_signal_id(
     signal_type identifies the *what* of the signal, not the *where*.
     Line numbers are deliberately excluded.
 
-    When *evidence* is provided, a short hash of the evidence is appended so
-    that multiple signals of the same type on the same artifact (e.g. several
-    terminology variants, or multiple missing canonical sources for different
-    topics) get distinct IDs.
+    When *evidence* is provided, only the **stable discriminator keys** for
+    this signal type (see ``STABLE_DISCRIMINATOR_KEYS``) are hashed and
+    appended.  This ensures that:
+
+    * Multiple signals of the same type on the same artifact (e.g. several
+      missing canonical sources for different domains) still get distinct IDs.
+    * Volatile evidence fields (dates, line numbers, scores) do NOT change
+      the ID, so before/after verification can match signals across
+      assessments even after the fix is applied.
+
+    Signal types not in ``STABLE_DISCRIMINATOR_KEYS`` use no evidence
+    discriminator — the ID is purely (collector_id, artifact_uri,
+    signal_type).
     """
     raw = f"{collector_id}:{artifact_uri}:{signal_type}"
     if evidence:
-        # Sort keys for deterministic hashing
-        ev_str = json.dumps(evidence, sort_keys=True, default=str)
-        raw = f"{raw}:{hashlib.sha256(ev_str.encode('utf-8')).hexdigest()[:8]}"
+        # Use only stable discriminator keys for this signal type
+        disc_keys = STABLE_DISCRIMINATOR_KEYS.get(signal_type, [])
+        if disc_keys:
+            disc_parts = []
+            for key in disc_keys:
+                val = evidence.get(key)
+                if val is not None:
+                    disc_parts.append(f"{key}={val}")
+            if disc_parts:
+                disc_str = "|".join(sorted(disc_parts))
+                raw = f"{raw}:{disc_str}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 

@@ -201,6 +201,7 @@ CREATE TABLE IF NOT EXISTS remediation_history (
     tokens_used          INT NOT NULL DEFAULT 0,
     latency_ms           FLOAT NOT NULL DEFAULT 0.0,
     forked               BOOL NOT NULL DEFAULT false,
+    modification_steps    JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

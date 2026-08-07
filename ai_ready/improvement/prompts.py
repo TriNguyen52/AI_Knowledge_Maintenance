@@ -315,4 +315,21 @@ def build_assessment_summary(
         )
         lines.append(f"        artifacts: {', '.join(shown)}{suffix}")
 
+    # Item 6: Signal type legend — only for types present in this assessment
+    _SIGNAL_LEGEND = {
+        "no_date_signal": "No date metadata. Fix: add 'date' to frontmatter.",
+        "stale_content": "Date is old. Fix: update 'date' after review.",
+        "missing_canonical_source": "No link to canonical source. Fix: add link to canonical domain.",
+        "broken_link": "Links to non-existent targets. Fix: remove or fix.",
+        "dangling_reference": "Ambiguous refs meaningless in isolation. Fix: rewrite self-contained.",
+        "orphan_artifact": "No inbound links. Fix: add link from index page.",
+        "duplicate_content": "Overlaps another artifact. Fix: consolidate.",
+        "terminology_variant": "Non-canonical term. Fix: standardize.",
+    }
+    present = {g["signal_type"] for g in type_groups.values()}
+    legend = [f"  {t}: {_SIGNAL_LEGEND[t]}" for t in sorted(present) if t in _SIGNAL_LEGEND]
+    if legend:
+        lines.append("\nSignal type legend:")
+        lines.extend(legend)
+
     return "\n".join(lines)
