@@ -35,6 +35,7 @@ State Field Audit (2026-07-29):
     last_analysis_signal_ids — signal IDs from last analysis (signal-delta gate)
     problem_saliences       — list of ProblemSalience dicts (quantitative ranking)
     systemic_clusters       — list of SystemicCluster dicts (root-cause pattern groups)
+    cross_check_diagnostics — list of CrossCheckResult dicts (co-occurring signal patterns)
 
   INFORMATIONAL (written by actions, read by manager but not by other actions):
     llm_metadata            — dict of LLM call metadata (provider, model, tokens)
@@ -523,4 +524,5 @@ def initial_state(
         "problem_saliences": [],
         "systemic_clusters": [],
         "assessment_signals": assessment_signals or [],
+        "cross_check_diagnostics": [],
     }

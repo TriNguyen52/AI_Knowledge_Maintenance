@@ -64,6 +64,7 @@ from ai_ready.improvement.remediation_map import (
     constrain_proposal_steps,
     build_remediation_steps_from_signals,
 )
+from ai_ready.improvement.cross_checks import run_cross_checks, cross_checks_to_dict
 from ai_ready.llm.base import LLMMessage
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,8 @@ logger = logging.getLogger(__name__)
                "last_analysis_signal_ids", "skip_events"],
         writes=["root_cause_analysis", "knowledge_problems", "current_stage",
                 "llm_metadata", "decision_trace", "assessment_summary", "cumulative_tokens",
-                "last_analysis_signal_ids", "skip_events", "problem_saliences"])
+                "last_analysis_signal_ids", "skip_events", "problem_saliences",
+                "cross_check_diagnostics"])
 def analyze_issue(state: State, llm_gateway: Any = None, assessment_store: Any = None,
                   history_store: Any = None,
                   diagnosis_quality_tracker: Any = None,
@@ -132,6 +134,30 @@ def analyze_issue(state: State, llm_gateway: Any = None, assessment_store: Any =
     assessment = assessment_store.latest() if assessment_store else None
     heuristic_problems_result, heuristic_hypotheses = discover_problems_heuristic(signal_ids, assessment)
 
+    # --- Cross-Check Diagnostics (deterministic, no LLM) ---
+    # Detect co-occurring signal patterns across collectors that indicate
+    # systemic root causes (e.g., navigation_collapse, retrieval_breakdown).
+    cross_check_results = run_cross_checks(assessment) if assessment else []
+    cross_check_context = ""
+    if cross_check_results:
+        cross_check_lines = []
+        for cc in cross_check_results:
+            cross_check_lines.append(
+                f"  - {cc.name} ({cc.severity.value}): {cc.description}\n"
+                f"    Evidence: {'; '.join(cc.evidence)}\n"
+                f"    Affected: {len(cc.affected_artifact_uris)} artifact(s)\n"
+                f"    Recommendation: {cc.recommendation}"
+            )
+        cross_check_context = (
+            "## Cross-Check Diagnostics (systemic patterns detected)\n"
+            "The following co-occurring signal patterns were detected across "
+            "multiple collectors. These indicate systemic root causes, not just "
+            "individual signal issues. Use these to guide your root cause "
+            "analysis toward systemic fixes rather than per-signal patches.\n\n"
+            + "\n".join(cross_check_lines)
+            + "\n"
+        )
+
     # Cluster signals and build a compact reusable assessment summary
     clusters = cluster_signals(signal_ids, assessment_store)
     assessment_summary = build_assessment_summary(
@@ -172,6 +198,11 @@ def analyze_issue(state: State, llm_gateway: Any = None, assessment_store: Any =
             f"{len(ranked_problems)} knowledge problem(s) from {len(signal_ids)} signal(s). "
             f"Salience ranking: {len(saliences)} above threshold, {len(skipped_problems)} skipped."
         )
+        if cross_check_results:
+            cc_names = [cc.name for cc in cross_check_results]
+            decision_trace.root_cause_reasoning += (
+                f" Cross-check diagnostics: {', '.join(cc_names)}."
+            )
 
         return state.update(
             root_cause_analysis=[h.to_dict() for h in heuristic_hypotheses],
@@ -187,6 +218,7 @@ def analyze_issue(state: State, llm_gateway: Any = None, assessment_store: Any =
             last_analysis_signal_ids=signal_ids,
             skip_events=skip_events,
             problem_saliences=[s.to_dict() for s in saliences],
+            cross_check_diagnostics=cross_checks_to_dict(cross_check_results),
         )
 
     # Use clustered signal context (representative examples) instead of raw signal list
@@ -289,6 +321,8 @@ If prior attempts failed, explain WHY the prior strategy failed and how your ana
 ## Assessment Summary (clustered signals — representative shown with cluster count)
 {assessment_summary}
 
+{cross_check_context}
+
 ## Affected Artifacts
 {artifact_context}
 
@@ -349,6 +383,11 @@ Provide your root cause analysis as JSON. Remember: distinguish observations fro
             decision_trace.root_cause_reasoning += (
                 " Prior attempt context was provided for forked retry."
             )
+        if cross_check_results:
+            cc_names = [cc.name for cc in cross_check_results]
+            decision_trace.root_cause_reasoning += (
+                f" Cross-check diagnostics: {', '.join(cc_names)}."
+            )
 
         # --- Salience Ranking (deterministic, no LLM) ---
         # Rank knowledge problems by quantitative salience score and
@@ -380,6 +419,7 @@ Provide your root cause analysis as JSON. Remember: distinguish observations fro
             "last_analysis_signal_ids": signal_ids,
             "skip_events": skip_events,
             "problem_saliences": [s.to_dict() for s in saliences],
+            "cross_check_diagnostics": cross_checks_to_dict(cross_check_results),
         }
 
         if not hypotheses or not ranked_problems:
@@ -1097,16 +1137,21 @@ def verify_improvement(state: State, assessment_store: Any = None,
             # not be counted by the connectivity collector, and orphan_artifact
             # signals would never resolve.
             modified_uris: set[str] = set()
+            from pathlib import Path as PathlibPath
+            source_resolved = PathlibPath(source).resolve()
             for step in execution_history:
+                if not step.get("applied", True):
+                    continue
+                # 1. artifact_uri from the step (matches _extract_modified_uris)
+                uri = step.get("artifact_uri", "")
+                if uri:
+                    modified_uris.add(uri)
+                # 2. actual file modified (e.g. index.md from create_relationship)
                 step_details = step.get("details", {}) or {}
                 modified_file = step_details.get("file", "")
                 if modified_file:
-                    # Extract the artifact URI from the file path
-                    from pathlib import Path as PathlibPath
                     try:
-                        rel = PathlibPath(modified_file).relative_to(
-                            PathlibPath(source).resolve()
-                        )
+                        rel = PathlibPath(modified_file).relative_to(source_resolved)
                         modified_uris.add(str(rel).replace("\\", "/"))
                     except (ValueError, TypeError):
                         pass

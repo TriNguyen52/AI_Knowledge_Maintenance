@@ -58,7 +58,6 @@ from ai_ready.improvement.application import (
 from ai_ready.improvement.forking import fork_from_proposal, should_fork
 from ai_ready.improvement.history import ImprovementHistoryStore, OutcomeEMATracker
 from ai_ready.improvement.dual_history import DualHistoryStore
-from ai_ready.improvement.test_generation import generate_test
 from ai_ready.improvement.diagnosis_quality import DiagnosisQualityTracker
 from ai_ready.improvement.problem_queue import ProblemQueue
 
@@ -448,20 +447,6 @@ class ImprovementManager:
 
         # Record outcome in history
         self._record_outcome(app_id, final_state)
-
-        # Generate regression test if failed
-        if final_state.get("current_stage") in {
-            RemediationStatus.FAILED_EXECUTION.value,
-            RemediationStatus.FAILED_VERIFICATION.value,
-        }:
-            try:
-                generate_test(
-                    state=final_state,
-                    output_dir=self.test_output_dir,
-                    app_id=app_id if self.enable_tracking else None,
-                )
-            except Exception as e:
-                logger.warning(f"Test generation failed: {e}")
 
         return final_state
 

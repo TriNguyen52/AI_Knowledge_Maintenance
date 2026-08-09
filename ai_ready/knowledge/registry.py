@@ -98,22 +98,23 @@ def load_knowledge_source_with_modifications(
     exclude_patterns: list[str] | None = None,
     modified_uris: list[str] | None = None,
 ) -> KnowledgeSource:
-    """Load a knowledge source, apply the limit, then expand the artifact
-    set with previously-modified URIs from CockroachDB.
+    """Load a knowledge source, filter by exclude_patterns, take the first
+    ``limit`` artifacts, then expand with previously-modified URIs from
+    CockroachDB.
 
     This solves the multi-run problem: the executor modifies files like
-    ``index.md`` (which may be outside the first-N-artifact limit) to
-    resolve orphan signals.  Without including those files in later
-    runs, the assessment can't see the cross-reference links and the
-    score regresses to the original value.
+    ``index.md`` to resolve orphan signals.  Without including those files
+    in later runs, the assessment can't see the cross-reference links and
+    the score regresses to the original value.
 
     Args:
         source: Path or URI to the knowledge base.
-        limit: Maximum number of artifacts (0 = no limit).
+        limit: Maximum number of base artifacts (0 = no limit).  The first
+            N artifacts (sorted) are kept, then modified URIs are appended.
         exclude_patterns: Optional list of substrings to exclude.
         modified_uris: URIs of artifacts modified in prior runs
-            (from ``get_modified_artifact_uris``).  These are added
-            to the artifact set even if they fall outside the limit.
+            (from ``get_modified_artifact_uris``).  These are appended
+            to the artifact set if not already present.
 
     Returns:
         KnowledgeSource with limited artifacts + modified URIs, and
@@ -121,28 +122,22 @@ def load_knowledge_source_with_modifications(
     """
     ks = load_knowledge_source(source, exclude_patterns=exclude_patterns)
 
-    # Apply limit
+    # Keep a lookup of ALL artifacts before applying limit.  Modified URIs
+    # from prior runs may correspond to artifacts outside the first N.
+    all_by_uri = {a.uri: a for a in ks.artifacts}
+
+    # Apply limit -- take the first N artifacts
     if limit > 0 and len(ks.artifacts) > limit:
-        existing_uris = {a.uri for a in ks.artifacts[:limit]}
-        # Expand with modified URIs that aren't already in the limited set
-        if modified_uris:
-            for uri in modified_uris:
-                if uri not in existing_uris:
-                    # Find the artifact with this URI
-                    match = [a for a in ks.artifacts if a.uri == uri]
-                    if match:
-                        ks.artifacts = ks.artifacts[:limit] + match
-                        existing_uris.add(uri)
-        else:
-            ks.artifacts = ks.artifacts[:limit]
-    elif modified_uris:
-        # No limit, but still ensure modified URIs are present
+        ks.artifacts = ks.artifacts[:limit]
+
+    # Expand with modified URIs from prior runs
+    if modified_uris:
         existing_uris = {a.uri for a in ks.artifacts}
         for uri in modified_uris:
             if uri not in existing_uris:
-                match = [a for a in ks.artifacts if a.uri == uri]
+                match = all_by_uri.get(uri)
                 if match:
-                    ks.artifacts.extend(match)
+                    ks.artifacts.append(match)
                     existing_uris.add(uri)
 
     # Prune relationships to only reference retained artifacts

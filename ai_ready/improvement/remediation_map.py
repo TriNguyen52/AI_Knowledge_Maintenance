@@ -9,11 +9,16 @@ The constraint: the collector's *detection* format and the executor's
 ``date`` from front-matter, the executor must write ``date`` to
 front-matter — not ``title`` or some other key the collector ignores.
 
-Signal types mapped:
-  no_date_signal        → add_metadata (writes ``date`` front-matter key)
-  stale_content         → add_metadata (writes ``date`` front-matter key with recent date)
-  missing_canonical_source → update_document (adds markdown link to canonical domain)
-  orphan_artifact       → create_relationship (adds inbound link from index page)
+Signal types mapped (one step per artifact per run — cheapest weight first):
+  no_date_signal        → add_metadata (0.05) — priority 1
+  stale_content         → add_metadata (0.05) — priority 1 (shares fix with no_date)
+  orphan_artifact       → create_relationship (0.05) — priority 2
+  missing_canonical_source → update_document (0.15) — priority 3
+
+When an artifact has multiple fixable signal types, only the cheapest-
+weight signal gets a step this run; remaining signals are resolved in
+subsequent closed-loop iterations.  This prevents step accumulation
+that would exceed the 20% edit budget gate.
 
 Signal types NOT mapped (no deterministic fix):
   broken_link           → handled by _handle_update_document (existing)
@@ -108,6 +113,19 @@ def build_remediation_steps_from_signals(
     writes in the exact format the collector reads.  This ensures
     that re-assessment after execution will clear the signal.
 
+    **One step per artifact per run** (edit-budget safety):
+    When an artifact has multiple fixable signal types, only the
+    highest-priority (cheapest-weight) signal gets a step this run.
+    Remaining signals are resolved in subsequent closed-loop
+    iterations.  This prevents step accumulation that would exceed
+    the 20% edit budget gate (e.g., add_metadata 0.05 +
+    update_document 0.15 + create_relationship 0.05 = 0.25 > 0.20).
+
+    Priority order (cheapest step weight first):
+      1. no_date_signal / stale_content → add_metadata (0.05)
+      2. orphan_artifact → create_relationship (0.05)
+      3. missing_canonical_source → update_document (0.15)
+
     Args:
         signals: List of KnowledgeSignal objects or signal dicts.
         artifact_uris: Optional list of affected artifact URIs (for
@@ -116,32 +134,39 @@ def build_remediation_steps_from_signals(
     Returns:
         List of modification step dicts suitable for the executor.
     """
-    steps: list[dict[str, Any]] = []
-    seen_step_keys: set[str] = set()  # (step_type, artifact_uri) dedup
-    seen_freshness_artifacts: set[str] = set()  # no_date + stale share one fix
+    # Priority: cheapest step weight first so each artifact stays
+    # well within the 20% edit budget.  Lower number = higher priority.
+    _SIGNAL_PRIORITY: dict[str, int] = {
+        "no_date_signal": 0,            # add_metadata (weight 0.05)
+        "stale_content": 0,             # add_metadata (weight 0.05) — shares fix
+        "orphan_artifact": 1,           # create_relationship (weight 0.05)
+        "missing_canonical_source": 2,  # update_document (weight 0.15)
+    }
 
+    # Select the highest-priority (cheapest) signal per artifact.
+    # One step per artifact per run — remaining signals are left for
+    # subsequent closed-loop iterations.
+    best_signal_per_artifact: dict[str, Any] = {}
     for signal in signals:
         signal_type = _get_signal_field(signal, "signal_type", "")
         artifact_uri = _get_signal_field(signal, "artifact_uri", "")
 
-        # Skip if not a fixable signal type
         if signal_type not in FIXABLE_SIGNAL_TYPES:
             continue
 
-        # no_date_signal and stale_content are both fixed by the same
-        # add_metadata step (writing "date" front-matter).  Deduplicate
-        # so each artifact gets at most ONE add_metadata step, keeping
-        # the edit budget well within the 20% limit.
-        if signal_type in ("no_date_signal", "stale_content"):
-            if artifact_uri in seen_freshness_artifacts:
-                continue
-            seen_freshness_artifacts.add(artifact_uri)
+        priority = _SIGNAL_PRIORITY.get(signal_type, 99)
+        existing = best_signal_per_artifact.get(artifact_uri)
+        if existing is None:
+            best_signal_per_artifact[artifact_uri] = signal
         else:
-            # Deduplicate by (step_type, artifact_uri) for other types
-            step_key = f"{signal_type}|{artifact_uri}"
-            if step_key in seen_step_keys:
-                continue
-            seen_step_keys.add(step_key)
+            existing_type = _get_signal_field(existing, "signal_type", "")
+            if priority < _SIGNAL_PRIORITY.get(existing_type, 99):
+                best_signal_per_artifact[artifact_uri] = signal
+
+    # Build one step per artifact from the selected signal
+    steps: list[dict[str, Any]] = []
+    for artifact_uri, signal in best_signal_per_artifact.items():
+        signal_type = _get_signal_field(signal, "signal_type", "")
 
         if signal_type in ("no_date_signal", "stale_content"):
             # FreshnessCollector reads metadata keys: "last_modified",

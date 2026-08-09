@@ -16,23 +16,22 @@ previous run, because the modified URIs (e.g. index.md with added
 cross-reference links) are included in the artifact set even when
 they fall outside the N-artifact limit.
 
-Usage (CLI or programmatic)::
+**Rollback-on-regression safety net:**
 
-    from ai_ready.improvement.closed_loop import run_closed_loop_cycle
-
-    result = run_closed_loop_cycle(
-        store=cockroach_store,
-        source=Path("fastapi/docs/en/docs"),
-        limit=30,
-        run_idx=1,
-        llm_gateway=gateway,
-    )
-    # result = {run, score_before, score_after, delta, ...}
+Before the executor modifies any files, the cycle backs up the
+current content of every artifact in the assessment set.  After
+verification, if the score regressed (``score_after < score_before``),
+the cycle restores all modified files from the backup and marks
+the outcome as ``rolled_back``.  This ensures the closed loop never
+degrades system health — a bad proposal is detected by verification
+and undone, exactly as a human reviewer would reject a change that
+made things worse.
 """
 
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +55,62 @@ _EXCLUDE_PATTERNS = [
     "/de/", "/es/", "/fr/", "/ja/", "/ko/", "/pt/",
     "/ru/", "/tr/", "/zh/", "/uk/", "/az/", "/it/",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Rollback-on-regression helpers
+# ---------------------------------------------------------------------------
+
+def _backup_artifacts(
+    source: Path,
+    artifacts: list[Any],
+    backup_dir: Path,
+) -> dict[str, str]:
+    """Snapshot every artifact file to *backup_dir*.
+
+    Returns a mapping of ``uri -> backup_path`` for files that were
+    successfully backed up.  Only files that exist on disk and are
+    inside *source* are included.
+    """
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backed_up: dict[str, str] = {}
+    for artifact in artifacts:
+        uri = artifact.uri
+        src_file = source / uri
+        if src_file.exists() and src_file.is_file():
+            dst_file = backup_dir / uri
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_file, dst_file)
+            backed_up[uri] = str(dst_file)
+    logger.info("Backed up %d artifact files to %s", len(backed_up), backup_dir)
+    return backed_up
+
+
+def _restore_artifacts(
+    source: Path,
+    backed_up: dict[str, str],
+) -> int:
+    """Restore files from the backup mapping.
+
+    Returns the number of files restored.
+    """
+    restored = 0
+    for uri, backup_path in backed_up.items():
+        src_file = source / uri
+        backup_file = Path(backup_path)
+        if backup_file.exists():
+            src_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup_file, src_file)
+            restored += 1
+    logger.info("Restored %d artifact files from backup", restored)
+    return restored
+
+
+def _cleanup_backup(backup_dir: Path) -> None:
+    """Remove the backup directory."""
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
+        logger.info("Cleaned up backup directory %s", backup_dir)
 
 
 def _get_git_commit(source: str) -> str:
@@ -112,6 +167,7 @@ def run_closed_loop_cycle(
     limit: int = 0,
     run_idx: int = 1,
     llm_gateway: Any = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Run a single closed-loop improvement cycle.
 
@@ -126,9 +182,12 @@ def run_closed_loop_cycle(
     Args:
         store: Connected CockroachDBStore instance.
         source: Path to the knowledge base on disk.
-        limit: Maximum number of artifacts (0 = no limit).
+        limit: Maximum number of base artifacts (0 = no limit).  The first
+            N artifacts are kept, then modified URIs from prior runs are
+            appended.
         run_idx: 1-based run index (for tracking in modified_artifacts).
         llm_gateway: Optional LLM gateway for proposal generation.
+        offset: Deprecated, ignored.  Kept for backward compatibility.
 
     Returns:
         Dict with keys:
@@ -138,11 +197,12 @@ def run_closed_loop_cycle(
         - score_delta: score_after - score_before
         - signals_resolved: count of resolved signals
         - new_signals: count of new signals
-        - outcome: verification outcome string
+        - outcome: verification outcome string (or "rolled_back")
         - strategy: selected proposal strategy
         - modified_uris: list of URIs modified by the executor
         - memory_influence: dict showing how prior outcomes influenced this run
         - final_state: full final workflow state
+        - rolled_back: True if regression detected and files restored
     """
     source_str = str(source.resolve())
 
@@ -190,6 +250,10 @@ def run_closed_loop_cycle(
         source=source_str,
     )
 
+    # 3.5. Backup artifact files before the executor can modify them.
+    backup_dir = Path(".ai-ready/rollback_backup") / f"run_{run_idx}"
+    backed_up = _backup_artifacts(source, artifacts, backup_dir)
+
     # 4. Run improvement workflow
     assessment_store = CockroachAssessmentStore(store)
     history_store = CockroachHistoryStore(store)
@@ -225,9 +289,31 @@ def run_closed_loop_cycle(
         app_id, approved=True, reason="auto-approved for closed-loop cycle"
     )
 
-    # 5. Record modified URIs to CockroachDB
+    # 5. Check for regression and rollback if needed
+    verification = final_state.get("verification_results", {})
+    score_after = verification.get("after_score", score_before)
+    score_delta = verification.get("score_difference", 0)
+    outcome = verification.get("overall_outcome", "unknown")
+    rolled_back = False
+
     new_modified_uris = _extract_modified_uris(final_state, source_str)
-    if new_modified_uris:
+
+    if score_after < score_before and backed_up:
+        # Regression detected — restore files from backup
+        logger.warning(
+            "Run %d: score regressed (%d -> %d), rolling back %d files",
+            run_idx, score_before, score_after, len(backed_up),
+        )
+        restored = _restore_artifacts(source, backed_up)
+        rolled_back = True
+        outcome = "rolled_back"
+        # Don't record modified URIs — the changes were undone
+        new_modified_uris = []
+        # Update the score to reflect the restored state
+        score_after = score_before
+        score_delta = 0
+    elif new_modified_uris:
+        # Changes were beneficial (or neutral) — record them for future runs
         record_modified_artifacts(
             store, source_str, new_modified_uris,
             run_idx=run_idx, step_type="mixed",
@@ -235,8 +321,10 @@ def run_closed_loop_cycle(
         logger.info("Run %d: recorded %d modified URIs to CockroachDB",
                      run_idx, len(new_modified_uris))
 
+    # Clean up the backup regardless
+    _cleanup_backup(backup_dir)
+
     # 6. Extract results
-    verification = final_state.get("verification_results", {})
     proposals = final_state.get("proposals", [])
     selected_idx = final_state.get("selected_proposal_idx", 0)
     strategy = (
@@ -246,9 +334,6 @@ def run_closed_loop_cycle(
     )
     memory_influence = final_state.get("memory_influence", {})
 
-    score_after = verification.get("after_score", score_before)
-    score_delta = verification.get("score_difference", 0)
-
     return {
         "run": run_idx,
         "score_before": score_before,
@@ -256,9 +341,10 @@ def run_closed_loop_cycle(
         "score_delta": score_delta,
         "signals_resolved": len(verification.get("resolved_signal_ids", [])),
         "new_signals": len(verification.get("new_signal_ids", [])),
-        "outcome": verification.get("overall_outcome", "unknown"),
+        "outcome": outcome,
         "strategy": strategy,
         "modified_uris": new_modified_uris,
         "memory_influence": memory_influence,
         "final_state": final_state,
+        "rolled_back": rolled_back,
     }

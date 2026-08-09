@@ -60,6 +60,8 @@ def _outcome_color(outcome: str) -> str:
         return "dim white"
     if o in ("regressed", "misdiagnosed"):
         return "bold red"
+    if o == "rolled_back":
+        return "bold magenta"
     return "white"
 
 
@@ -937,6 +939,7 @@ def print_cumulative_improvement(results: list[dict]) -> None:
     total_delta = last.get("score_after", 0) - first.get("score_before", 0)
     total_resolved = sum(r.get("signals_resolved", 0) for r in results)
     total_new = sum(r.get("new_signals", 0) for r in results)
+    total_rollbacks = sum(1 for r in results if r.get("rolled_back", False))
 
     table = Table(show_header=True, header_style="bold green", border_style="green", width=96)
     table.add_column("Metric", style="dim", width=30)
@@ -953,6 +956,8 @@ def print_cumulative_improvement(results: list[dict]) -> None:
     table.add_row("Total signals resolved", str(total_resolved), "")
     table.add_row("Total new signals", str(total_new), "")
     table.add_row("Runs completed", str(len(results)), "")
+    if total_rollbacks:
+        table.add_row("Rollbacks (regression safety)", str(total_rollbacks), "")
 
     console.print(table)
 

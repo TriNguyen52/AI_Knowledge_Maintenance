@@ -129,7 +129,7 @@ def connect_cockroach() -> "CockroachDBStore":
 # Load knowledge and assess
 # ---------------------------------------------------------------------------
 
-def load_and_assess(source: Path, limit: int):
+def load_and_assess(source: Path, limit: int, offset: int = 0):
     display.print_load_start(str(source), limit)
 
     from ai_ready.knowledge.registry import load_knowledge_source
@@ -145,6 +145,8 @@ def load_and_assess(source: Path, limit: int):
     relationships = knowledge.relationships
     display.print_load_done(len(artifacts), len(relationships), t1 - t0)
 
+    if offset > 0 and len(artifacts) > offset:
+        artifacts = artifacts[offset:]
     if limit > 0 and len(artifacts) > limit:
         artifacts = artifacts[:limit]
         display.print_load_done(len(artifacts), len(relationships), t1 - t0, limited=limit)
@@ -569,6 +571,10 @@ def main() -> None:
         help="Max artifacts to assess (default: 20)",
     )
     parser.add_argument(
+        "--offset", type=int, default=0,
+        help="Skip first N artifacts (use with --limit to test different subsets)",
+    )
+    parser.add_argument(
         "--db-url", type=str, default="",
         help="CockroachDB connection URL (default: from COCKROACH_DB_URL env)",
     )
@@ -637,7 +643,7 @@ def main() -> None:
                   shutil.rmtree(backup_dir)
               backup_dir.mkdir(parents=True, exist_ok=True)
               backed_up = 0
-              for a in ks.artifacts[:args.limit] if args.limit > 0 else ks.artifacts:
+              for a in (ks.artifacts[args.offset:args.offset+args.limit] if args.limit > 0 else ks.artifacts[args.offset:]):
                   src_file = source / a.uri
                   if src_file.exists():
                       dst_file = backup_dir / a.uri
@@ -657,13 +663,16 @@ def main() -> None:
               limit=args.limit,
               run_idx=run_idx,
               llm_gateway=llm_gateway,
+              offset=args.offset,
           )
           t1 = time.time()
 
+          rollback_tag = " [ROLLED BACK]" if result.get("rolled_back") else ""
           display.print_dim(
               f"Run {run_idx}: {result['score_before']} -> {result['score_after']} "
               f"(+{result['score_delta']}), {result['signals_resolved']} resolved, "
               f"{result['new_signals']} new, {len(result['modified_uris'])} modified"
+              f"{rollback_tag}"
           )
 
           results.append({
@@ -674,6 +683,7 @@ def main() -> None:
               "signals_resolved": result["signals_resolved"],
               "new_signals": result["new_signals"],
               "outcome": result["outcome"],
+              "rolled_back": result.get("rolled_back", False),
               "strategy": result["strategy"],
               "elapsed": t1 - t0,
               "memory_retrieved_count": len(result.get("memory_influence", {}).get("retrieved", [])),

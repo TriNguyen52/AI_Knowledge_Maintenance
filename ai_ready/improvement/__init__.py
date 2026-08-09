@@ -17,6 +17,7 @@ Architecture:
   prompts.py      — Prompt context builders (signal, artifact, history, assessment)
   heuristics.py   — Heuristic fallbacks, proposal filtering, LLM response parsing
   salience.py     — Signal-delta gating, problem discovery, salience ranking
+  cross_checks.py — Cross-check diagnostics (co-occurring signal patterns across collectors)
   diagnosis_quality.py — Rolling correlation for diagnosis quality tracking
 
 Flow:
