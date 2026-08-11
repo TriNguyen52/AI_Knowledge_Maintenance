@@ -55,13 +55,13 @@ Problem Discovery (cluster signals → root causes)
 Assessment (scored, versioned, stored in CockroachDB)
     │
     ▼
-LLM Proposal Generation (with institutional memory)
+LLM Proposal Generation (with memory from CockroachDB)
     │
     ▼
-Human Approval → Execution → Verification → Learning
+Human Approval → Execution → Verification → Rollback on Regression → Learning
 ```
 
-Assessment is **always deterministic**, no LLM required. Ten signal collectors across six dimensions (retrieval, context, consistency, trust, connectivity, workflow) scan the knowledge base and produce reproducible results regardless of which language model is available. The LLM only participates in the improvement loop, where it proposes fixes informed by the agent's past outcomes.
+Assessment is **always deterministic**, no LLM required. Ten signal collectors across six dimensions (retrieval, context, consistency, trust, connectivity, workflow) scan the knowledge base and produce reproducible results regardless of which language model is available. The LLM only participates in the improvement loop, where it proposes fixes learnt by the agent's past outcomes. If verification detects regression, the system rolls back modifications.
 
 ## Signal Collectors
 
@@ -96,18 +96,77 @@ The agent doesn't just fix problems, it remembers which fixes worked and which d
 - **EMA strategy scoring** — tracks which remediation strategies worked (Exponential Moving Average), so successful strategies are reinforced and failed ones suppressed.
 - **CockroachDB persistence** — workflow state is snapshotted at each transition and survives restarts. Resumable via `ImprovementManager.resume_workflow()`.
 
-## Cloud Deployment
+## Cloud Architecture
 
-For persistent agent memory and serverless deployment:
-
-```bash
-# Set up CockroachDB Cloud
-python setup_cockroachdb.py
-
-# Configure environment
-cp .env.example .env  # Add connection string + LLM provider
+The system deploys as a serverless agent on AWS with CockroachDB Cloud as its persistent memory layer:
 
 ```
+                    ┌─────────────────────────────────────────────────┐
+                    │              AWS (Serverless)                    │
+                    │                                                  │
+  S3 Upload ──────▶ │  S3 (Artifact Storage)                          │
+                    │    │                                             │
+                    │    ├─ Event ──▶ Lambda (S3 Trigger)              │
+                    │    │             │  Incremental assessment        │
+                    │    │             ▼  on single changed file       │
+  EventBridge ─────▶ │  Schedule ──▶ Lambda (Assessment)              │
+  (hourly)           │                │  Full scan → signals →         │
+                    │                │  dimensions → score            │
+  API Gateway ──────▶ │  POST /assess │                                │
+  (on-demand)        │  POST /proposal──▶ Lambda (Proposal)       │
+                    │  GET /status       │  Burr workflow:            │
+                    │                    │  diagnose → propose →     │
+                    │                    │  execute → verify →       │
+                    │                    │  rollback on regression    │
+                    │                    │                            │
+                    │  SQS DLQ ◀── failed invocations                 │
+                    │  CloudWatch ◀── logs + error alarms             │
+                    └──────────────────────┬──────────────────────────┘
+                                           │
+                    ┌──────────────────────▼──────────────────────────┐
+                    │         CockroachDB Cloud (Agent Memory)        │
+                    │                                                 │
+                    │  Working Memory:    agent_state table            │
+                    │    Workflow state survives across Lambda         │
+                    │    invocations — pause at approval, resume later │
+                    │                                                 │
+                    │  Long-Term Memory:  remediation_history table    │
+                    │    Every outcome stored with strategy, score,    │
+                    │    tokens, decision traces. Agent reads its own  │
+                    │    history before generating new proposals.      │
+                    │                                                 │
+                    │  Semantic Memory:                                │
+                    │    Cosine distance search for related artifacts   │
+                    │    and similar past problems                     │
+                    │                                                 │
+                    │  ACID Transactions:                              │
+                    │    automatic retry on concurrent Lambda writes   │
+                    │                                                 │
+                    │  MCP Server: 10 read-only SQL views for external │
+                    │    AI agents to query the agent's memory         │
+                    └─────────────────────────────────────────────────┘
+```
+
+### Local Deployment (Free, No AWS Account)
+
+Runs entirely via Docker + Floci (local AWS emulator):
+
+```powershell
+docker compose -f deploy/compose.yaml up -d
+.\deploy\deploy.ps1
+```
+
+The same `lambda_handler.py` code runs unchanged with only the endpoint URL differs (`http://localhost:4566` vs real AWS). S3 uploads trigger incremental assessment, EventBridge runs scheduled assessments, and `aws lambda invoke` triggers on-demand assess/remediate/status.
+
+### Production Deployment
+
+The same `template.yaml` deploys to real AWS via SAM:
+
+```bash
+sam build && sam deploy --guided
+```
+
+The code is identical; only the endpoint URL changes.
 
 ### LLM Providers
 
@@ -134,6 +193,9 @@ Set `LLM_PROVIDER` in `.env` to switch providers. Assessment (signal collection)
 4. **Institutional memory for remediation** — The system remembers which fixes worked and which failed, scored by EMA. Over time, the agent's proposals improve because it has historical context. This is Long-Term Potentiation (LTP) applied to software maintenance.
 
 5. **MCP agent-to-agent communication** — The CockroachDB managed MCP server lets external AI agents (Claude Code, Cursor, VS Code Copilot) query the knowledge maintenance agent's memory via read-only SQL views. An AI coding assistant can ask "what are the top knowledge problems?" and "what strategies worked for broken links?", creating an ecosystem where agents share institutional knowledge.
+
+6. **Stateful agent in a serverless environment** — By persisting Burr workflow state to CockroachDB at every transition, the agent becomes stateful across Lambda invocations, a workflow can start in one invocation, pause at approval, and resume in a completely different invocation hours later.
+
 
 ## Design Principles
 
