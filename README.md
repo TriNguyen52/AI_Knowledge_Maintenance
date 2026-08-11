@@ -100,51 +100,57 @@ The agent doesn't just fix problems, it remembers which fixes worked and which d
 
 The system deploys as a serverless agent on AWS with CockroachDB Cloud as its persistent memory layer:
 
-```
-                    ┌─────────────────────────────────────────────────┐
-                    │              AWS (Serverless)                    │
-                    │                                                  │
-  S3 Upload ──────▶ │  S3 (Artifact Storage)                          │
-                    │    │                                             │
-                    │    ├─ Event ──▶ Lambda (S3 Trigger)              │
-                    │    │             │  Incremental assessment        │
-                    │    │             ▼  on single changed file       │
-  EventBridge ─────▶ │  Schedule ──▶ Lambda (Assessment)              │
-  (hourly)           │                │  Full scan → signals →         │
-                    │                │  dimensions → score            │
-  API Gateway ──────▶ │  POST /assess │                                │
-  (on-demand)        │  POST /proposal──▶ Lambda (Proposal)       │
-                    │  GET /status       │  Burr workflow:            │
-                    │                    │  diagnose → propose →     │
-                    │                    │  execute → verify →       │
-                    │                    │  rollback on regression    │
-                    │                    │                            │
-                    │  SQS DLQ ◀── failed invocations                 │
-                    │  CloudWatch ◀── logs + error alarms             │
-                    └──────────────────────┬──────────────────────────┘
-                                           │
-                    ┌──────────────────────▼──────────────────────────┐
-                    │         CockroachDB Cloud (Agent Memory)        │
-                    │                                                 │
-                    │  Working Memory:    agent_state table            │
-                    │    Workflow state survives across Lambda         │
-                    │    invocations — pause at approval, resume later │
-                    │                                                 │
-                    │  Long-Term Memory:  remediation_history table    │
-                    │    Every outcome stored with strategy, score,    │
-                    │    tokens, decision traces. Agent reads its own  │
-                    │    history before generating new proposals.      │
-                    │                                                 │
-                    │  Semantic Memory:                                │
-                    │    Cosine distance search for related artifacts   │
-                    │    and similar past problems                     │
-                    │                                                 │
-                    │  ACID Transactions:                              │
-                    │    automatic retry on concurrent Lambda writes   │
-                    │                                                 │
-                    │  MCP Server: 10 read-only SQL views for external │
-                    │    AI agents to query the agent's memory         │
-                    └─────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+
+    subgraph INPUT["Inputs"]
+        S3["S3<br/>Artifact Storage"]
+        API["API Gateway<br/>On-Demand API"]
+        EB["EventBridge<br/>Hourly Schedule"]
+    end
+
+    subgraph ASSESS["Assessment"]
+        INC["Lambda<br/>Incremental Assessment"]
+        FULL["Lambda<br/>Full Assessment"]
+    end
+
+    subgraph REMEDIATE["Remediation"]
+        PROP["Lambda<br/>Proposal"]
+        BURR["Apache Burr<br/>Remediation Workflow"]
+    end
+
+    subgraph MEMORY["Agent Memory"]
+        STATE["Working Memory<br/>agent_state"]
+        HISTORY["Long-Term Memory<br/>remediation_history"]
+        SEMANTIC["Semantic Memory<br/>Similarity Search"]
+    end
+
+    subgraph OPERATIONS["Operations"]
+        DLQ["SQS DLQ"]
+        CW["CloudWatch"]
+    end
+
+    S3 -->|"Object Event"| INC
+    EB -->|"Scheduled Trigger"| FULL
+    API -->|"POST /assess"| FULL
+    API -->|"POST /proposal"| PROP
+
+    INC --> BURR
+    FULL --> BURR
+    PROP --> BURR
+
+    BURR -->|"Read / Write"| STATE
+    BURR -->|"Read / Write"| HISTORY
+    BURR -->|"Retrieve"| SEMANTIC
+
+    INC -.-> DLQ
+    FULL -.-> DLQ
+    PROP -.-> DLQ
+
+    INC -.-> CW
+    FULL -.-> CW
+    PROP -.-> CW
+    BURR -.-> CW
 ```
 
 ### Local Deployment (Free, No AWS Account)
