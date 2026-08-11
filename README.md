@@ -188,7 +188,7 @@ AI-Ready supports multiple LLM providers for the improvement workflow:
 
 Set `LLM_PROVIDER` in `.env` to switch providers. Assessment (signal collection) is always deterministic and never requires an LLM.
 
-## What's Novel
+## Why this product
 
 1. **Closed-loop agentic memory** — Most agent memory systems are write-only (store context, retrieve by similarity). This system creates a learning loop whcih the agent reads its own past outcomes from CockroachDB before making new decisions, so it gets progressively better at resolving recurring problem types.
 
@@ -202,13 +202,6 @@ Set `LLM_PROVIDER` in `.env` to switch providers. Assessment (signal collection)
 
 6. **Stateful agent in a serverless environment** — By persisting Burr workflow state to CockroachDB at every transition, the agent becomes stateful across Lambda invocations, a workflow can start in one invocation, pause at approval, and resume in a completely different invocation hours later.
 
-
-## Design Principles
-
-- **Deterministic before AI.** Every assessment is reproducible regardless of which language model is available. Signal collection never calls an LLM.
-- **Knowledge is infrastructure.** Documentation is treated as an engineering artifact, not application data. It deserves the same observability as code.
-- **Evidence is never discarded.** Every assessment, proposed modification, verification result, and remediation outcome becomes part of the historical record.
-- **Conservative bias throughout.** No-CI paths give cautious verdicts. Underpowered assessments produce no conclusion rather than a false one. Fail closed on reuse.
 
 ## License
 
