@@ -114,14 +114,14 @@ flowchart TB
         FULL["Lambda<br/>Full Assessment"]
     end
 
-    subgraph REMEDIATE["Remediation"]
+    subgraph REMEDIATE["Proposal"]
         PROP["Lambda<br/>Proposal"]
-        BURR["Apache Burr<br/>Remediation Workflow"]
+        BURR["Apache Burr<br/>Proposal Workflow"]
     end
 
     subgraph MEMORY["Agent Memory"]
         STATE["Working Memory<br/>agent_state"]
-        HISTORY["Long-Term Memory<br/>remediation_history"]
+        HISTORY["Long-Term Memory<br/>proposal_history"]
         SEMANTIC["Semantic Memory<br/>Similarity Search"]
     end
 
