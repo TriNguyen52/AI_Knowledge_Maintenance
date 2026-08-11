@@ -436,6 +436,66 @@ def show_cockroach_memory(store):
                                   {"issue_type": issue_type, "limit": 5})
         display.print_mcp_remediation_context(issue_type, result)
 
+    # A/B Memory Test (Item 1): prove memory influences LLM proposals
+    try:
+        from ai_ready.improvement.actions import run_memory_ab_test
+        from ai_ready.improvement.history import ImprovementHistoryStore
+        from burr.core import State
+        # Build a minimal state with the latest history's issue type
+        if history:
+            ab_issue_type = history[0].get("issue_type", "missing_metadata")
+            ab_state = State({
+                "root_cause_analysis": [{"category": ab_issue_type, "hypothesis": "test", "confidence": 0.8}],
+                "knowledge_problems": [],
+                "affected_artifact_uris": [],
+                "prior_failures": [],
+                "assessment_id": "",
+                "prior_diagnosis": {},
+                "prior_strategy": {},
+                "prior_verification": {},
+                "decision_trace": {},
+                "assessment_summary": "Test assessment for A/B comparison.",
+                "cumulative_tokens": 0,
+                "problem_saliences": [],
+                "prior_modification_steps": [],
+                "systemic_clusters": [],
+                "assessment_signals": [],
+            })
+            # Use a SQLite history store seeded from CockroachDB outcomes
+            import tempfile, os
+            tmp_dir = tempfile.mkdtemp(prefix="ab_demo_")
+            ab_db = os.path.join(tmp_dir, "ab_history.db")
+            ab_store = ImprovementHistoryStore(ab_db)
+            # Seed with the latest outcome
+            for h in history[:1]:
+                from ai_ready.improvement.models import RemediationOutcome
+                outcome = RemediationOutcome(
+                    issue_type=h.get("issue_type", ab_issue_type),
+                    strategy=h.get("strategy", "signal_mapped_remediation"),
+                    result=h.get("result", "failure"),
+                    score_change=h.get("score_change", 0),
+                    verification_outcome=h.get("verification_outcome", "unchanged"),
+                    modification_steps=h.get("modification_steps", []),
+                )
+                ab_store.record_outcome(outcome)
+
+            ab_result = run_memory_ab_test(
+                ab_state,
+                llm_gateway=None,
+                history_store=ab_store,
+                assessment_store=None,
+            )
+            display.print_memory_ab_test(ab_result)
+
+            # Clean up
+            try:
+                os.remove(ab_db)
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
+    except Exception as e:
+        display.print_warning(f"A/B memory test unavailable: {e}")
+
     # Signal lifecycle summary
     try:
         new_sigs = store.get_signals_by_status("new")

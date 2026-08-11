@@ -30,8 +30,11 @@ made things worse.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -251,7 +254,9 @@ def run_closed_loop_cycle(
     )
 
     # 3.5. Backup artifact files before the executor can modify them.
-    backup_dir = Path(".ai-ready/rollback_backup") / f"run_{run_idx}"
+    # Use /tmp as base (Lambda-safe) with fallback to CWD for local runs.
+    import tempfile
+    backup_dir = Path(tempfile.gettempdir()) / "ai-ready-rollback" / f"run_{run_idx}"
     backed_up = _backup_artifacts(source, artifacts, backup_dir)
 
     # 4. Run improvement workflow
@@ -347,4 +352,562 @@ def run_closed_loop_cycle(
         "memory_influence": memory_influence,
         "final_state": final_state,
         "rolled_back": rolled_back,
+    }
+
+
+def demonstrate_pause_resume(
+    store: CockroachDBStore,
+    source: Path,
+    limit: int = 0,
+    llm_gateway: Any = None,
+) -> dict[str, Any]:
+    """Demonstrate pause/resume across a simulated process restart.
+
+    This function proves that workflow state survives across process
+    restarts via CockroachDB persistence. It:
+
+    1. Loads and assesses knowledge (same as run_closed_loop_cycle)
+    2. Starts an improvement workflow (persists to CockroachDB as "paused")
+    3. Simulates a process restart by creating a NEW ImprovementManager
+    4. Resumes the workflow from CockroachDB on the new manager
+    5. Verifies the resumed state matches the persisted state
+    6. Approves and completes the resumed workflow
+    7. Returns verification of the pause/resume cycle
+
+    Args:
+        store: Connected CockroachDBStore instance.
+        source: Path to the knowledge base on disk.
+        limit: Maximum number of base artifacts (0 = no limit).
+        llm_gateway: Optional LLM gateway for proposal generation.
+
+    Returns:
+        Dict with keys:
+        - paused_stage: The stage when the workflow was paused
+        - resumed_stage: The stage after resuming (should match)
+        - state_match: True if resumed state matches persisted state
+        - completed: True if the workflow reached a terminal stage
+        - final_stage: The terminal stage after completion
+        - app_id: The workflow app_id
+    """
+    source_str = str(source.resolve())
+
+    # 1. Load knowledge and assess
+    knowledge = load_knowledge_source_with_modifications(
+        source=str(source),
+        limit=limit,
+        exclude_patterns=_EXCLUDE_PATTERNS,
+    )
+    artifacts = knowledge.artifacts
+    relationships = knowledge.relationships
+    git_commit = _get_git_commit(source_str)
+
+    pipeline = AssessmentPipeline()
+    assessment = pipeline.run(
+        artifacts=artifacts,
+        source=source_str,
+        git_commit=git_commit,
+        relationships=relationships,
+    )
+
+    persist_assessment(
+        store=store,
+        assessment=assessment,
+        signals=assessment.signals,
+        artifacts=artifacts,
+        source=source_str,
+    )
+
+    # 2. Start improvement workflow (persists to CockroachDB as "paused")
+    assessment_store = CockroachAssessmentStore(store)
+    history_store = CockroachHistoryStore(store)
+    config = Config.default()
+
+    known_uris = {a.uri for a in artifacts}
+    executor = KnowledgeExecutor(
+        artifact_store=assessment_store,
+        source_path=source_str,
+        assessment_signals=assessment.signals,
+        known_artifact_uris=known_uris,
+    )
+
+    manager1 = ImprovementManager(
+        llm_gateway=llm_gateway,
+        assessment_store=assessment_store,
+        assessment_pipeline=pipeline,
+        history_store=history_store,
+        executor=executor,
+        artifacts=artifacts,
+        relationships=relationships,
+        source=source_str,
+        git_commit=git_commit,
+        enable_tracking=False,
+        enable_otel=False,
+        max_fork_attempts=2,
+        cockroach_store=store,
+        config=config,
+    )
+
+    app_id = manager1.start_improvement(assessment)
+
+    # Capture the paused stage
+    paused_state = store.get_agent_state(app_id)
+    paused_stage = paused_state.get("current_stage", "unknown") if paused_state else "unknown"
+    logger.info("Pause/Resume demo: workflow paused at stage '%s', app_id=%s", paused_stage, app_id)
+
+    # 3. Simulate process restart: create a FRESH manager (no in-memory state)
+    manager2 = ImprovementManager(
+        llm_gateway=llm_gateway,
+        assessment_store=assessment_store,
+        assessment_pipeline=pipeline,
+        history_store=history_store,
+        executor=executor,
+        artifacts=artifacts,
+        relationships=relationships,
+        source=source_str,
+        git_commit=git_commit,
+        enable_tracking=False,
+        enable_otel=False,
+        max_fork_attempts=2,
+        cockroach_store=store,
+        config=config,
+    )
+
+    # 4. Resume the workflow from CockroachDB on the new manager
+    resumed_id = manager2.resume_workflow(app_id, assessment)
+    resumed_state = manager2.get_state(app_id)
+    resumed_stage = resumed_state.get("current_stage", "unknown") if resumed_state else "unknown"
+
+    # 5. Verify state match
+    state_match = (paused_stage == resumed_stage)
+    logger.info("Pause/Resume demo: resumed at stage '%s', state_match=%s", resumed_stage, state_match)
+
+    # 6. Approve and complete the resumed workflow
+    final_state = manager2.approve_and_complete(
+        app_id, approved=True, reason="auto-approved for pause/resume demo"
+    )
+    final_stage = final_state.get("current_stage", "unknown")
+
+    # Check if the workflow reached a terminal stage
+    terminal_stages = [
+        "completed", "failed_verification", "failed_analysis",
+        "failed_execution", "verified",
+    ]
+    completed = final_stage in terminal_stages
+
+    logger.info("Pause/Resume demo: completed=%s, final_stage='%s'", completed, final_stage)
+
+    return {
+        "paused_stage": paused_stage,
+        "resumed_stage": resumed_stage,
+        "state_match": state_match,
+        "completed": completed,
+        "final_stage": final_stage,
+        "app_id": app_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cloud (S3-backed) closed-loop remediation
+# ---------------------------------------------------------------------------
+
+def _download_s3_artifacts(bucket: str, prefix: str, local_dir: Path) -> None:
+    """Download all artifacts from S3 bucket/prefix to a local directory.
+
+    Preserves the full S3 key structure as the relative path, so artifacts
+    have the same URIs as they would in the local demo.
+    """
+    import boto3
+    from botocore.config import Config
+
+    _endpoint = os.environ.get("AWS_ENDPOINT_URL")
+    _s3_kw: dict = {"config": Config(s3={"addressing_style": "path"})}
+    if _endpoint:
+        _s3_kw["endpoint_url"] = _endpoint
+    s3 = boto3.client("s3", **_s3_kw)
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    kwargs = {"Bucket": bucket}
+    if prefix:
+        kwargs["Prefix"] = prefix
+
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(**kwargs):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith("/"):
+                continue
+            local_file = local_dir / key
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            s3.download_file(bucket, key, str(local_file))
+
+    logger.info("Downloaded S3 artifacts from s3://%s/%s to %s",
+                bucket, prefix, local_dir)
+
+
+def _upload_modified_to_s3(
+    bucket: str, prefix: str, local_dir: Path, modified_uris: list[str]
+) -> None:
+    """Upload only the modified files from local directory back to S3.
+
+    The executor modifies specific files in /tmp — only those are uploaded,
+    not the entire artifact set.
+    """
+    import boto3
+    from botocore.config import Config
+
+    _endpoint = os.environ.get("AWS_ENDPOINT_URL")
+    _s3_kw: dict = {"config": Config(s3={"addressing_style": "path"})}
+    if _endpoint:
+        _s3_kw["endpoint_url"] = _endpoint
+    s3 = boto3.client("s3", **_s3_kw)
+
+    for uri in modified_uris:
+        local_file = local_dir / uri
+        if local_file.exists():
+            s3_key = uri  # URI already contains the full key path
+            s3.upload_file(str(local_file), bucket, s3_key)
+
+    logger.info("Uploaded %d modified files to s3://%s/%s",
+                len(modified_uris), bucket, prefix)
+
+
+def _get_next_run_idx(store: CockroachDBStore) -> int:
+    """Determine the next run_idx by counting existing remediation outcomes.
+
+    run_idx > 1 triggers lookup of previously modified URIs from CockroachDB
+    so prior fixes are included in the artifact set — same mechanism as
+    demo_closed_loop.py's loop counter.
+    """
+    try:
+        result = store._execute_fetchone(
+            "SELECT COUNT(*) as cnt FROM remediation_history"
+        )
+        return (result["cnt"] if result else 0) + 1
+    except Exception:
+        return 1
+
+
+def run_cloud_remediation_cycle(
+    store: CockroachDBStore,
+    bucket: str,
+    prefix: str = "",
+    problem_id: str | None = None,
+    llm_gateway: Any = None,
+) -> dict[str, Any]:
+    """Run a single closed-loop remediation cycle with S3-backed artifacts.
+
+    This is the cloud equivalent of ``run_closed_loop_cycle`` — the only
+    difference is that artifacts live in S3 instead of local disk. The
+    function:
+
+    1. Downloads S3 artifacts to /tmp/knowledge_base
+    2. Calls ``run_closed_loop_cycle`` (assess → improve → verify → rollback)
+    3. Uploads only the modified files back to S3
+    4. Stores the remediation outcome in CockroachDB (institutional memory)
+    5. Updates problem status and decision traces
+    6. Returns a formatted result dict
+
+    CockroachDB tracks all modifications, institutional memory, and agent
+    state — same as the local demo. Each subsequent call picks up
+    modifications from prior calls via the ``modified_artifacts`` table.
+
+    Args:
+        store: Connected CockroachDBStore instance.
+        bucket: S3 bucket containing knowledge artifacts.
+        prefix: S3 prefix (optional, defaults to "").
+        problem_id: Specific problem to remediate (optional). If not
+            provided, the top open problem is used.
+        llm_gateway: Optional LLM gateway for proposal generation.
+
+    Returns:
+        Dict with keys:
+        - action: "remediate"
+        - problem_id, problem_category, outcome_id
+        - verification_outcome, score_before, score_after, score_delta
+        - strategy, tokens_used, forked
+        - context_used: past_attempts, successful/failed strategies, similar problems
+        - modified_uris: list of URIs modified by the executor
+        - rolled_back: True if regression detected and files restored
+        - elapsed_seconds
+    """
+    from ai_ready.storage.models import RemediationRecord
+
+    start_time = time.monotonic()
+
+    # 1. Download S3 artifacts to /tmp
+    local_source = Path("/tmp/knowledge_base")
+    _download_s3_artifacts(bucket, prefix, local_source)
+
+    # 2. Determine run_idx from CockroachDB
+    run_idx = _get_next_run_idx(store)
+
+    # 3. Get the target problem and remediation context
+    if problem_id:
+        problems = store.get_problems(status="open", limit=50)
+        target_problem = next(
+            (p for p in problems if p.problem_id == problem_id), None
+        )
+        if target_problem is None:
+            return {"error": f"Problem {problem_id} not found or not open"}
+    else:
+        problems = store.get_problems(status="open", limit=1)
+        if not problems:
+            return {"message": "No open problems in the queue"}
+        target_problem = problems[0]
+
+    artifact_uris = (
+        target_problem.artifact_uris if hasattr(target_problem, "artifact_uris") else []
+    )
+    remediation_context = store.get_remediation_context(target_problem.category)
+    similar_problems = store.get_similar_problems(
+        target_problem.category, artifact_uris
+    )
+
+    # 4. Run the closed-loop cycle (all assessment/improvement/verification logic)
+    result = run_closed_loop_cycle(
+        store=store,
+        source=local_source,
+        limit=0,
+        run_idx=run_idx,
+        llm_gateway=llm_gateway,
+    )
+
+    # 5. Upload only the modified files back to S3
+    modified_uris = result.get("modified_uris", [])
+    if modified_uris and not result.get("rolled_back", False):
+        _upload_modified_to_s3(bucket, prefix, local_source, modified_uris)
+
+    # 6. Store outcome in CockroachDB (institutional memory)
+    final_state = result.get("final_state", {})
+    verification_outcome = result.get("outcome", "unchanged")
+    score_before = result.get("score_before", 0)
+    score_after = result.get("score_after", 0)
+    strategy = result.get("strategy", "unknown")
+    tokens_used = final_state.get("cumulative_tokens", 0)
+    forked = final_state.get("forked", False)
+
+    record = RemediationRecord.new(
+        issue_type=target_problem.category,
+        strategy=strategy,
+        strategy_description=final_state.get("strategy_description", ""),
+        verification_outcome=verification_outcome,
+        score_before=score_before,
+        score_after=score_after,
+        proposal_reasoning=final_state.get("proposal_reasoning", ""),
+        tokens_used=tokens_used,
+        latency_ms=(time.monotonic() - start_time) * 1000,
+        forked=forked,
+    )
+    store.save_remediation_outcome(record)
+
+    # 7. Update problem status
+    if verification_outcome == "resolved":
+        store.update_problem_status(target_problem.problem_id, "resolved")
+    elif verification_outcome == "partially_resolved":
+        store.update_problem_status(target_problem.problem_id, "in_progress")
+
+    # 8. Store decision traces
+    proposals = final_state.get("proposals", [])
+    if proposals:
+        store.save_decision_trace(
+            outcome_id=record.outcome_id,
+            stage="proposal_generation",
+            reasoning=json.dumps(proposals, default=str),
+            llm_metadata={"proposal_count": len(proposals)},
+        )
+
+    diagnosis = final_state.get("diagnosis", {})
+    if diagnosis:
+        store.save_decision_trace(
+            outcome_id=record.outcome_id,
+            stage="root_cause_analysis",
+            reasoning=json.dumps(diagnosis, default=str),
+            llm_metadata={},
+        )
+
+    elapsed = time.monotonic() - start_time
+
+    return {
+        "action": "remediate",
+        "problem_id": target_problem.problem_id,
+        "problem_category": target_problem.category,
+        "outcome_id": record.outcome_id,
+        "app_id": final_state.get("app_id", ""),
+        "verification_outcome": verification_outcome,
+        "score_before": score_before,
+        "score_after": score_after,
+        "score_delta": score_after - score_before,
+        "strategy": strategy,
+        "tokens_used": tokens_used,
+        "forked": forked,
+        "context_used": {
+            "past_attempts": remediation_context.get("total_attempts", 0),
+            "successful_strategies": len(remediation_context.get("successful_strategies", [])),
+            "failed_strategies": len(remediation_context.get("failed_strategies", [])),
+            "similar_problems": len(similar_problems),
+        },
+        "modified_uris": modified_uris,
+        "rolled_back": result.get("rolled_back", False),
+        "elapsed_seconds": round(elapsed, 2),
+        "signals_resolved": result.get("signals_resolved", 0),
+        "new_signals": result.get("new_signals", 0),
+        "memory_influence": result.get("memory_influence", {}),
+        "verification_results": final_state.get("verification_results", {}),
+    }
+
+
+def run_cloud_assessment_cycle(
+    store: CockroachDBStore,
+    bucket: str,
+    prefix: str = "",
+    limit: int = 0,
+    dedup_key: str = "",
+) -> dict[str, Any]:
+    """Run a full knowledge assessment cycle with S3-backed artifacts.
+
+    This is the cloud equivalent of the assessment half of
+    ``run_closed_loop_cycle`` — it downloads S3 artifacts to /tmp,
+    runs the assessment pipeline, persists results to CockroachDB,
+    discovers and ranks problems, and stores them in the queue.
+
+    No improvement/remediation is performed — use
+    ``run_cloud_remediation_cycle`` for that.
+
+    Args:
+        store: Connected CockroachDBStore instance.
+        bucket: S3 bucket containing knowledge artifacts.
+        prefix: S3 prefix (optional, defaults to "").
+        limit: Maximum number of artifacts to assess (0 = no limit).
+        dedup_key: Optional idempotency key — if an assessment with this
+            key already exists, the function returns early.
+
+    Returns:
+        Dict with keys:
+        - action: "assess"
+        - assessment_id, score, dimensions
+        - artifact_count, signal_count
+        - problems_discovered, problems_skipped
+        - top_problems (list of dicts with category, description, artifact_uris, salience)
+        - elapsed_seconds
+        - source
+    """
+    start_time = time.monotonic()
+
+    s3_uri = f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}"
+
+    # Idempotency check
+    if dedup_key:
+        existing = store._execute_fetchone(
+            "SELECT assessment_id FROM knowledge_assessments "
+            "WHERE metadata->>'dedup_key' = %s LIMIT 1",
+            (dedup_key,),
+        )
+        if existing:
+            return {
+                "action": "assess",
+                "assessment_id": existing["assessment_id"],
+                "message": "Assessment already exists (idempotent skip)",
+                "source": s3_uri,
+            }
+
+    # 1. Download S3 artifacts to /tmp
+    local_source = Path("/tmp/knowledge_base")
+    _download_s3_artifacts(bucket, prefix, local_source)
+
+    source_str = str(local_source.resolve())
+    git_commit = _get_git_commit(source_str)
+
+    # 2. Load knowledge from local /tmp copy
+    knowledge = load_knowledge_source_with_modifications(
+        source=str(local_source),
+        limit=limit,
+        exclude_patterns=_EXCLUDE_PATTERNS,
+    )
+    artifacts = knowledge.artifacts
+    relationships = knowledge.relationships
+
+    logger.info("Cloud assessment: loaded %d artifacts, %d relationships from S3",
+                len(artifacts), len(relationships))
+
+    # 3. Run assessment pipeline
+    pipeline = AssessmentPipeline()
+    assessment = pipeline.run(
+        artifacts=artifacts,
+        source=source_str,
+        git_commit=git_commit,
+        relationships=relationships,
+    )
+
+    logger.info("Cloud assessment: score=%d, signals=%d",
+                assessment.score, len(assessment.signals))
+
+    # 4. Persist assessment to CockroachDB
+    persist_result = persist_assessment(
+        store=store,
+        assessment=assessment,
+        signals=assessment.signals,
+        artifacts=artifacts,
+        source=source_str,
+        dedup_key=dedup_key,
+    )
+    assessment_record_id = persist_result["assessment_id"]
+    signal_count = persist_result["signal_count"]
+    signal_id_map = persist_result["signal_id_map"]
+
+    # 5. Discover and rank problems by salience
+    from ai_ready.improvement.salience import (
+        discover_problems_heuristic,
+        rank_problems_by_salience,
+    )
+    from ai_ready.storage.models import ProblemRecord
+
+    salience_threshold = float(os.environ.get("SALIENCE_THRESHOLD", "0.01"))
+    signal_ids = list(signal_id_map.keys())
+    problems, hypotheses = discover_problems_heuristic(signal_ids, assessment)
+    ranked, saliences, skipped = rank_problems_by_salience(
+        problems, assessment, history_store=None,
+        threshold=salience_threshold,
+    )
+
+    # 6. Store top problems in queue
+    for problem in ranked[:25]:
+        salience_info = next(
+            (s for s in saliences if s.problem_id == problem.problem_id), None
+        )
+        problem_record = ProblemRecord.new(
+            category=problem.category,
+            artifact_uris=problem.artifact_uris,
+            salience=salience_info.total if salience_info else 0.0,
+            encoding_score=salience_info.encoding if salience_info else 0.0,
+            outcome_score=salience_info.outcome if salience_info else 0.0,
+            retrieval_score=salience_info.retrieval if salience_info else 0.0,
+            staleness_factor=salience_info.staleness_factor if salience_info else 1.0,
+            description=problem.description,
+        )
+        store.save_problem(problem_record)
+
+    elapsed = time.monotonic() - start_time
+
+    return {
+        "action": "assess",
+        "assessment_id": assessment_record_id,
+        "score": assessment.score,
+        "dimensions": {name: d.score for name, d in assessment.dimensions.items()},
+        "artifact_count": len(artifacts),
+        "signal_count": signal_count,
+        "problems_discovered": len(ranked),
+        "problems_skipped": len(skipped),
+        "top_problems": [
+            {
+                "category": p.category,
+                "description": p.description,
+                "artifact_uris": p.artifact_uris[:3],
+                "salience": next(
+                    (s.total for s in saliences if s.problem_id == p.problem_id), 0.0
+                ),
+            }
+            for p in ranked[:5]
+        ],
+        "elapsed_seconds": round(elapsed, 2),
+        "source": s3_uri,
     }

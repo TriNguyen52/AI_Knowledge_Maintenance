@@ -1,0 +1,34 @@
+# Docker Compose for local AWS emulation via Floci
+#
+# Floci is a free, open-source local AWS emulator that runs via Docker
+# with no account, no auth token, and no feature gates.
+# All services are available at http://localhost:4566
+#
+# Usage:
+#   docker compose -f deploy/compose.yaml up -d
+#   .\deploy\deploy.ps1
+#
+# Teardown:
+#   .\deploy\teardown.ps1
+#   docker compose -f deploy/compose.yaml down -v
+
+services:
+  floci:
+    image: floci/floci:latest-compat
+    ports:
+      - "4566:4566"
+    environment:
+      - FLOCI_HOSTNAME=floci
+      - FLOCI_STORAGE_MODE=hybrid
+      - FLOCI_STORAGE_PERSISTENT_PATH=./data
+      # Lambda execution requires Docker socket access
+      - FLOCI_SERVICES_LAMBDA_ENABLED=true
+      - FLOCI_SERVICES_LAMBDA_DEFAULT_TIMEOUT_SECONDS=900
+      - FLOCI_SERVICES_LAMBDA_DEFAULT_MEMORY_MB=2048
+    volumes:
+      - floci_data:/data
+      # Lambda requires the Docker socket to spin up runtime containers
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  floci_data:

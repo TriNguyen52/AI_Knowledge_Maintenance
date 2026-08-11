@@ -34,7 +34,7 @@ from ai_ready.storage.models import (
     AssessmentRecord,
     SignalRecord,
 )
-from ai_ready.llm.embeddings import embed_artifacts
+from ai_ready.llm.embeddings import embed_artifacts, get_embedder
 from ai_ready.models import KnowledgeAssessment, KnowledgeSignal
 
 logger = logging.getLogger(__name__)
@@ -98,6 +98,10 @@ def persist_assessment(
     # 0. Pre-compute embeddings (outside the transaction — no DB needed)
     artifact_records: list[tuple[ArtifactRecord, list[float] | None]] = []
     if embed and artifacts:
+        # Fit the TF-IDF embedder on the full corpus before embedding,
+        # ensuring IDF weights are properly computed for all artifacts.
+        corpus_texts = [_artifact_to_text(a) for a in artifacts]
+        embedder = get_embedder(corpus_texts=corpus_texts)
         embeddings = embed_artifacts(artifacts)
         for artifact, emb in zip(artifacts, embeddings):
             content_text = _artifact_to_text(artifact)

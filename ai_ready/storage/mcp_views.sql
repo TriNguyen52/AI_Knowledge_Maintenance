@@ -121,6 +121,46 @@ FROM decision_traces dt
 LEFT JOIN remediation_history rh ON dt.outcome_id = rh.outcome_id
 ORDER BY dt.created_at DESC;
 
+-- View 8: Remediation metrics (aggregate)
+CREATE OR REPLACE VIEW mcp_remediation_metrics AS
+SELECT
+    count(*) AS total_workflows,
+    count(*) FILTER (WHERE verification_outcome = 'resolved') AS problems_resolved,
+    count(*) FILTER (WHERE verification_outcome = 'partially_resolved') AS problems_partially_resolved,
+    avg(score_after - score_before) AS avg_score_improvement,
+    avg(tokens_used) AS avg_tokens_per_workflow
+FROM remediation_history;
+
+-- View 9: Assessment history (longitudinal)
+CREATE OR REPLACE VIEW mcp_assessment_history AS
+SELECT
+    assessment_id,
+    score,
+    dimensions,
+    signals_count,
+    source,
+    git_commit,
+    created_at
+FROM knowledge_assessments
+ORDER BY created_at DESC;
+
+-- View 10: Remediation context (per-issue-type)
+CREATE OR REPLACE VIEW mcp_remediation_context AS
+SELECT
+    outcome_id,
+    issue_type,
+    strategy,
+    strategy_description,
+    verification_outcome,
+    score_before,
+    score_after,
+    proposal_reasoning,
+    modification_steps,
+    tokens_used,
+    created_at
+FROM remediation_history
+ORDER BY created_at DESC;
+
 -- ============================================================
 -- Read-only role for MCP access
 -- ============================================================
@@ -135,6 +175,9 @@ ORDER BY dt.created_at DESC;
 -- GRANT SELECT ON mcp_active_workflows TO mcp_reader;
 -- GRANT SELECT ON mcp_health_trend TO mcp_reader;
 -- GRANT SELECT ON mcp_decision_traces TO mcp_reader;
+-- GRANT SELECT ON mcp_remediation_metrics TO mcp_reader;
+-- GRANT SELECT ON mcp_assessment_history TO mcp_reader;
+-- GRANT SELECT ON mcp_remediation_context TO mcp_reader;
 --
 -- Revoke access to base tables (defense in depth):
 -- REVOKE ALL ON knowledge_artifacts FROM mcp_reader;

@@ -1055,6 +1055,139 @@ def print_cockroach_verification(verification: dict) -> None:
 # Error display
 # ---------------------------------------------------------------------------
 
+def print_memory_ab_test(ab_result: dict) -> None:
+    """Display the A/B memory test result (Item 1).
+
+    Shows two proposal generations side-by-side:
+    - With memory (prior outcomes retrievable)
+    - Without memory (empty history store)
+
+    Highlights whether the strategy or proposal count differs,
+    proving that institutional memory causally influences LLM output.
+    """
+    print_banner("A/B Memory Test (proves memory influences LLM)")
+
+    with_mem = ab_result.get("with_memory", {})
+    without_mem = ab_result.get("without_memory", {})
+    differs = ab_result.get("differs", False)
+    explanation = ab_result.get("explanation", "")
+
+    # Side-by-side comparison table
+    table = Table(show_header=True, header_style="bold cyan", border_style="cyan", width=96)
+    table.add_column("Metric", style="dim", width=22)
+    table.add_column("With Memory", style="bold green", width=35)
+    table.add_column("Without Memory", style="bold yellow", width=35)
+
+    table.add_row(
+        "Strategy",
+        _truncate(with_mem.get("strategy", "?"), 33),
+        _truncate(without_mem.get("strategy", "?"), 33),
+    )
+    table.add_row(
+        "Proposal count",
+        str(with_mem.get("proposals_count", 0)),
+        str(without_mem.get("proposals_count", 0)),
+    )
+    table.add_row(
+        "Reasoning (excerpt)",
+        _truncate(with_mem.get("reasoning_excerpt", ""), 33),
+        _truncate(without_mem.get("reasoning_excerpt", ""), 33),
+    )
+
+    # Memory influence details
+    mi_with = with_mem.get("memory_influence", {})
+    mi_without = without_mem.get("memory_influence", {})
+    retrieved_with = len(mi_with.get("retrieved", []))
+    retrieved_without = len(mi_without.get("retrieved", []))
+    avoided_with = len(mi_with.get("avoided_strategies", []))
+    avoided_without = len(mi_without.get("avoided_strategies", []))
+
+    table.add_row(
+        "Retrieved outcomes",
+        str(retrieved_with),
+        str(retrieved_without),
+    )
+    table.add_row(
+        "Avoided strategies",
+        str(avoided_with),
+        str(avoided_without),
+    )
+
+    reused = mi_with.get("reused_strategy", "")
+    table.add_row(
+        "Reused strategy",
+        _truncate(reused, 33) if reused else "(none)",
+        "(none)",
+    )
+
+    console.print(table)
+
+    # Verdict
+    if differs:
+        console.print()
+        console.print(f"  [bold green]RESULT: Memory DID influence the proposal.[/bold green]")
+    else:
+        console.print()
+        console.print(f"  [yellow]RESULT: Memory did not change the proposal.[/yellow]")
+    console.print(f"  [dim]{explanation}[/dim]")
+
+
+def print_pause_resume_demo(result: dict) -> None:
+    """Display the pause/resume demonstration result (Item 2).
+
+    Shows that workflow state survives across a simulated process restart
+    via CockroachDB persistence:
+    - The paused stage (e.g., "awaiting_approval")
+    - The resumed stage (should match paused)
+    - Whether the state matched
+    - The final stage after completion
+    """
+    print_banner("Pause/Resume Demonstration (proves state survives restart)")
+
+    paused_stage = result.get("paused_stage", "unknown")
+    resumed_stage = result.get("resumed_stage", "unknown")
+    state_match = result.get("state_match", False)
+    completed = result.get("completed", False)
+    final_stage = result.get("final_stage", "unknown")
+    app_id = result.get("app_id", "?")
+
+    table = Table(show_header=True, header_style="bold cyan", border_style="cyan", width=96)
+    table.add_column("Phase", style="dim", width=30)
+    table.add_column("Value", style="bold white", width=60)
+
+    table.add_row("App ID", _truncate(app_id, 58))
+    table.add_row("Paused stage", paused_stage)
+    table.add_row("Resumed stage", resumed_stage)
+
+    match_str = "[bold green]MATCH[/bold green]" if state_match else "[bold red]MISMATCH[/bold red]"
+    table.add_row("State match", match_str)
+    table.add_row("Final stage", final_stage)
+
+    completed_str = "[bold green]YES[/bold green]" if completed else "[bold red]NO[/bold red]"
+    table.add_row("Completed", completed_str)
+
+    console.print(table)
+
+    if state_match and completed:
+        console.print()
+        console.print(
+            "  [bold green]RESULT: Workflow successfully resumed from CockroachDB[/bold green]"
+        )
+        console.print(
+            f"  [dim]Paused at '{paused_stage}' -> resumed at '{resumed_stage}' -> completed at '{final_stage}'[/dim]"
+        )
+    elif not state_match:
+        console.print()
+        console.print(
+            "  [bold red]RESULT: State mismatch — resume did not restore correct state[/bold red]"
+        )
+    elif not completed:
+        console.print()
+        console.print(
+            f"  [yellow]RESULT: Workflow resumed but did not complete (final stage: {final_stage})[/yellow]"
+        )
+
+
 def print_error(msg: str) -> None:
     console.print(f"  [bold red]ERROR: {msg}[/bold red]")
 
@@ -1069,3 +1202,181 @@ def print_dim(msg: str) -> None:
 
 def print_ok(msg: str) -> None:
     console.print(f"  [green]{msg}[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Cloud (Lambda/S3/EventBridge) display functions
+# ---------------------------------------------------------------------------
+
+def print_cloud_intro(
+    endpoint: str,
+    function_name: str,
+    s3_bucket: str,
+    s3_prefix: str,
+    num_cycles: int,
+    artifact_count: int = 0,
+) -> None:
+    """Print the cloud demo intro panel showing the AWS architecture."""
+    body = (
+        f"[bold cyan]AWS Cloud Architecture:[/bold cyan]\n\n"
+        f"  [dim]EventBridge[/dim]  [cyan]---schedule--->[/cyan]  [bold]Lambda[/bold]  [cyan]---assess--->[/cyan]  [bold]S3[/bold]\n"
+        f"  [dim](rate 5 min)[/dim]                    [bold](serverless)[/bold]    [cyan]<---remediate--[/cyan]  [bold](artifacts)[/bold]\n"
+        f"                                       |                          |\n"
+        f"                                       [cyan]---persist--->[/cyan]  [bold]CockroachDB[/bold] [dim](memory + vectors)[/dim]\n"
+        f"                                       [cyan]<---context---[/cyan]  [bold](ACID + distributed)[/bold]\n\n"
+        f"[dim]This demo runs the improvement workflow {num_cycles} time(s) entirely on AWS Lambda:[/dim]\n"
+        f"  [green]*[/green] Artifacts stored in S3 (durable, versioned)\n"
+        f"  [green]*[/green] Assessment + remediation run as Lambda functions (serverless)\n"
+        f"  [green]*[/green] Institutional memory in CockroachDB (survives cold starts)\n"
+        f"  [green]*[/green] EventBridge triggers periodic assessment (automated)\n\n"
+        f"[dim]Endpoint:    [/dim] {endpoint}\n"
+        f"[dim]Function:   [/dim] {function_name}\n"
+        f"[dim]S3 source:  [/dim] s3://{s3_bucket}/{s3_prefix}/\n"
+        f"[dim]Artifacts:  [/dim] {artifact_count if artifact_count else '(loading...)'}\n"
+        f"[dim]Cycles:     [/dim] {num_cycles}"
+    )
+    panel = Panel(
+        body,
+        title="[bold cyan]Cloud-Native Closed-Loop Demo (Lambda + S3 + CockroachDB)[/bold cyan]",
+        subtitle="[dim]Serverless • Event-driven • Distributed[/dim]",
+        border_style="cyan",
+        width=100,
+    )
+    console.print(panel)
+
+
+def print_lambda_invoking(action: str, cycle: int | None = None) -> None:
+    """Print a message before invoking Lambda."""
+    label = f"Cycle {cycle} " if cycle else ""
+    console.print(f"  [dim]{label}Invoking Lambda: action={action}...[/dim]", end=" ")
+
+
+def print_lambda_response(
+    action: str,
+    elapsed: float,
+    result: dict,
+    cycle: int | None = None,
+) -> None:
+    """Print a summary of a Lambda response."""
+    label = f"Cycle {cycle} " if cycle else ""
+    console.print(f"[green]OK[/green] ({elapsed:.1f}s)")
+
+    if action == "assess":
+        score = result.get("score", "?")
+        artifacts = result.get("artifact_count", "?")
+        signals = result.get("signal_count", "?")
+        problems = result.get("problems_discovered", "?")
+        console.print(f"  [dim]{label}Assessment:[/dim] score={score}, "
+                       f"artifacts={artifacts}, signals={signals}, "
+                       f"problems={problems}")
+
+    elif action == "remediate":
+        outcome = result.get("verification_outcome", "?")
+        before = result.get("score_before", "?")
+        after = result.get("score_after", "?")
+        delta = result.get("score_delta", 0)
+        strategy = _truncate(result.get("strategy", "?"), 30)
+        ctx = result.get("context_used", {})
+        past = ctx.get("past_attempts", 0)
+        resolved = result.get("signals_resolved", 0)
+        new_sigs = result.get("new_signals", 0)
+        modified = len(result.get("modified_uris", []))
+        rolled_back = result.get("rolled_back", False)
+
+        outcome_color = _outcome_color(outcome)
+        delta_color = _delta_color(delta)
+
+        console.print(f"  [dim]{label}Remediation:[/dim]")
+        console.print(f"    Outcome:  [{outcome_color}]{outcome}[/{outcome_color}]")
+        console.print(f"    Score:     {before} -> {after} "
+                       f"[{delta_color}]({delta:+})[/{delta_color}]")
+        console.print(f"    Strategy:  {strategy}")
+        console.print(f"    Signals:  {resolved} resolved, {new_sigs} new")
+        console.print(f"    Modified: {modified} file(s)")
+        if rolled_back:
+            console.print(f"    [bold magenta]ROLLED BACK (regression detected)[/bold magenta]")
+        console.print(f"    Memory:   past_attempts={past}, "
+                       f"successful={ctx.get('successful_strategies', 0)}, "
+                       f"failed={ctx.get('failed_strategies', 0)}, "
+                       f"similar={ctx.get('similar_problems', 0)}")
+
+    elif action == "status":
+        queue = result.get("problem_queue", {})
+        metrics = result.get("remediation_metrics", {})
+        console.print(f"  [dim]Status:[/dim] "
+                       f"open={queue.get('open', 0)}, "
+                       f"resolved={queue.get('resolved', 0)}, "
+                       f"total_outcomes={metrics.get('total_outcomes', 0)}")
+
+
+def print_s3_summary(bucket: str, prefix: str, artifact_count: int) -> None:
+    """Print S3 storage summary."""
+    print_section("S3 Knowledge Storage")
+    console.print(f"  [bold]Bucket:[/bold] s3://{bucket}/{prefix}/")
+    console.print(f"  [green]Artifacts: {artifact_count}[/green]")
+    console.print(f"  [dim]Durable: 11 nines (99.999999999%)[/dim]")
+    console.print(f"  [dim]Versioned: S3 versioning enabled[/dim]")
+
+
+def print_eventbridge_summary(rules: list[dict]) -> None:
+    """Print EventBridge rules summary."""
+    print_section("EventBridge Scheduled Rules")
+    if not rules:
+        console.print(f"  [dim]No rules configured[/dim]")
+        return
+    table = Table(show_header=True, header_style="bold cyan", border_style="cyan", width=96)
+    table.add_column("Rule Name", style="bold", width=25)
+    table.add_column("Schedule", width=20)
+    table.add_column("State", width=10)
+    table.add_column("Target", width=35)
+    for r in rules:
+        name = r.get("name", "?")
+        schedule = r.get("schedule", "?")
+        state = r.get("state", "?")
+        target = r.get("target", "?")
+        state_color = "green" if state == "ENABLED" else "dim red"
+        table.add_row(name, schedule, f"[{state_color}]{state}[/{state_color}]",
+                       _truncate(target, 35))
+    console.print(table)
+
+
+def print_cloud_demo_complete(runs: int, total_elapsed: float,
+                               lambda_invocations: int) -> None:
+    """Print the cloud demo completion summary."""
+    console.print()
+    console.print(Rule(style="bold green"))
+    console.print(Align.center("[bold green]Cloud Demo Complete[/bold green]"))
+    console.print(Rule(style="bold green"))
+
+    run_lines = []
+    for i in range(1, runs + 1):
+        if i == 1:
+            run_lines.append(
+                f"  [green]{3+i}.[/green] Run {i} had no history -> outcome saved to CockroachDB"
+            )
+        else:
+            run_lines.append(
+                f"  [green]{3+i}.[/green] Run {i} read CockroachDB history -> saw {i-1} prior outcome(s)"
+            )
+    run_lines.append(
+        f"  [green]{3+runs+1}.[/green] Run {runs+1} would see ALL {runs} outcomes + decision traces + vector search"
+    )
+
+    body = (
+        "[bold]The closed loop is now functional entirely on AWS Lambda:[/bold]\n\n"
+        "  [green]1.[/green] Artifacts stored in S3 -> durable, versioned, event-driven\n"
+        "  [green]2.[/green] Assessment + remediation run as Lambda -> serverless, auto-scaling\n"
+        "  [green]3.[/green] Institutional memory in CockroachDB -> survives cold starts\n"
+        "  [green]4.[/green] EventBridge triggers periodic assessment -> automated\n"
+        + "\n".join(run_lines) + "\n\n"
+        f"[bold]Cloud services demonstrated:[/bold]\n"
+        "  [cyan]*[/cyan] S3 (durable artifact storage, 11 nines)\n"
+        "  [cyan]*[/cyan] Lambda (serverless compute, 15-min timeout)\n"
+        "  [cyan]*[/cyan] EventBridge (scheduled assessment, event routing)\n"
+        "  [cyan]*[/cyan] CockroachDB (distributed ACID, vector index, agent state)\n\n"
+        f"[dim]Total elapsed: {total_elapsed:.1f}s[/dim]\n"
+        f"[dim]Lambda invocations: {lambda_invocations}[/dim]"
+    )
+    panel = Panel(body, border_style="green", width=100, padding=(1, 2))
+    console.print(panel)
+    console.print(Rule(style="bold green"))

@@ -64,7 +64,8 @@ fastapi/
 
 # env
 .env
-
+lambda_package/
+lambda_package_linux/
 # Data
 *.db
 validation_results.json

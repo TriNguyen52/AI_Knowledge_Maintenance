@@ -680,6 +680,20 @@ Recent outcomes weigh more than old ones. Diversity floor prevents rare strategi
 
 PREFER strategies with EMA > 0.5. AVOID strategies with EMA < 0.3 unless you have a specific reason.
 """
+
+                # Increment signal access_count (Item 4 — LTP for signals)
+                # Signals retrieved for remediation context get boosted,
+                # demonstrating retrieval frequency influences future priority.
+                if assessment and hasattr(assessment, 'signals') and assessment.signals:
+                    signal_ids = [s.signal_id for s in assessment.signals if hasattr(s, 'signal_id') and s.signal_id]
+                    if signal_ids:
+                        try:
+                            from ai_ready.storage.cockroach import CockroachDBStore
+                            if isinstance(history_store, CockroachDBStore):
+                                history_store.increment_signal_access_count(signal_ids)
+                        except Exception:
+                            pass  # access_count is best-effort, don't block proposals
+
             except Exception:
                 remediation_context_str = "History store unavailable."
 
@@ -1629,3 +1643,132 @@ def handle_failure(state: State) -> State:
         current_stage=new_stage,
         decision_trace=decision_trace.to_dict(),
     )
+
+
+# ---------------------------------------------------------------------------
+# A/B Test: Prove Memory Influence on LLM Proposals (Item 1)
+# ---------------------------------------------------------------------------
+
+def run_memory_ab_test(
+    state: State,
+    llm_gateway: Any = None,
+    history_store: Any = None,
+    assessment_store: Any = None,
+) -> dict[str, Any]:
+    """Run an A/B test proving that institutional memory influences LLM proposals.
+
+    Calls generate_proposal() twice with identical root causes and
+    assessment context:
+
+    - **With memory:** Pass ``history_store`` as-is (prior outcomes are
+      retrievable, so the LLM sees what strategies worked/failed before).
+    - **Without memory:** Pass a fresh empty ``ImprovementHistoryStore``
+      so ``get_remediation_context()`` returns ``total_prior_attempts: 0``.
+
+    Returns a dict::
+
+        {
+            "with_memory": {
+                "strategy": str,           # top proposal's strategy
+                "proposals_count": int,    # number of proposals
+                "reasoning_excerpt": str,  # first 200 chars of reasoning
+                "memory_influence": dict,  # full memory_influence object
+            },
+            "without_memory": { same fields },
+            "differs": bool,               # True if strategy or count differ
+            "explanation": str,            # human-readable summary
+        }
+
+    The ``differs`` field is True when the selected strategy or the number
+    of proposals differs between the two runs — proving the LLM changed
+    its output based on memory context.
+    """
+    from ai_ready.improvement.history import ImprovementHistoryStore
+    import tempfile, os
+
+    # --- Without memory: fresh empty history store ---
+    tmp_dir = tempfile.mkdtemp(prefix="ab_test_empty_")
+    empty_db = os.path.join(tmp_dir, "empty_history.db")
+    empty_store = ImprovementHistoryStore(empty_db)
+
+    state_without = generate_proposal(
+        state,
+        llm_gateway=llm_gateway,
+        history_store=empty_store,
+        assessment_store=assessment_store,
+    )
+
+    # --- With memory: pass the real history store ---
+    state_with = generate_proposal(
+        state,
+        llm_gateway=llm_gateway,
+        history_store=history_store,
+        assessment_store=assessment_store,
+    )
+
+    # Clean up temp DB
+    try:
+        os.remove(empty_db)
+        os.rmdir(tmp_dir)
+    except OSError:
+        pass
+
+    # Extract results
+    proposals_with = state_with.get("proposals", [])
+    proposals_without = state_without.get("proposals", [])
+
+    strategy_with = (
+        proposals_with[0].get("strategy", "none")
+        if proposals_with else "none"
+    )
+    strategy_without = (
+        proposals_without[0].get("strategy", "none")
+        if proposals_without else "none"
+    )
+
+    reasoning_with = (
+        proposals_with[0].get("reasoning", "")[:200]
+        if proposals_with else ""
+    )
+    reasoning_without = (
+        proposals_without[0].get("reasoning", "")[:200]
+        if proposals_without else ""
+    )
+
+    memory_with = state_with.get("memory_influence", {})
+    memory_without = state_without.get("memory_influence", {})
+
+    differs = (
+        strategy_with != strategy_without
+        or len(proposals_with) != len(proposals_without)
+    )
+
+    if differs:
+        explanation = (
+            f"Memory influenced the proposal: with memory the top strategy "
+            f"was '{strategy_with}' ({len(proposals_with)} proposal(s)), "
+            f"without memory it was '{strategy_without}' "
+            f"({len(proposals_without)} proposal(s))."
+        )
+    else:
+        explanation = (
+            f"Memory did not change the top strategy ('{strategy_with}') "
+            f"or proposal count ({len(proposals_with)})."
+        )
+
+    return {
+        "with_memory": {
+            "strategy": strategy_with,
+            "proposals_count": len(proposals_with),
+            "reasoning_excerpt": reasoning_with,
+            "memory_influence": memory_with,
+        },
+        "without_memory": {
+            "strategy": strategy_without,
+            "proposals_count": len(proposals_without),
+            "reasoning_excerpt": reasoning_without,
+            "memory_influence": memory_without,
+        },
+        "differs": differs,
+        "explanation": explanation,
+    }

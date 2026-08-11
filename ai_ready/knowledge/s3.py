@@ -97,12 +97,30 @@ class S3KnowledgeSDK(KnowledgeSDK):
         self._relationship_cache = None
 
     def _init_s3_client(self) -> None:
-        """Initialize the boto3 S3 client."""
+        """Initialize the boto3 S3 client.
+
+        Uses path-style addressing (``http://<endpoint>/<bucket>/<key>``)
+        instead of virtual-hosted style (``http://<bucket>.<endpoint>/<key>``).
+        Path-style always works — inside Docker containers the virtual-hosted
+        wildcard DNS (``*.localhost.floci.io``) may not resolve, causing S3
+        requests to hang silently.  When ``AWS_ENDPOINT_URL`` is set (e.g.
+        by Floci inside Lambda containers), it is used as the endpoint.
+        """
         try:
             import boto3  # type: ignore[import-untyped]
+            from botocore.config import Config  # type: ignore[import-untyped]
 
             region = os.environ.get("AWS_REGION", "us-east-1")
-            self._s3_client = boto3.client("s3", region_name=region)
+            endpoint_url = os.environ.get("AWS_ENDPOINT_URL")
+
+            kwargs: dict[str, Any] = {
+                "region_name": region,
+                "config": Config(s3={"addressing_style": "path"}),
+            }
+            if endpoint_url:
+                kwargs["endpoint_url"] = endpoint_url
+
+            self._s3_client = boto3.client("s3", **kwargs)
         except ImportError:
             raise ImportError(
                 "boto3 package not installed. Install with: pip install boto3"

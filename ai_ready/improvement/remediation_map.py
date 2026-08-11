@@ -401,11 +401,19 @@ def constrain_proposal_steps(
         )
         result.append(new_proposal)
 
-    # Add uncovered concrete steps as a FIRST proposal so they get
+    # Add uncovered concrete steps as a proposal so they get
     # selected (selected_proposal_idx=0) and executed.  LLM proposals
     # may exceed the edit budget gate with generic update_document
     # steps; the concrete signal-mapped steps are small and within
     # budget (Item 1.1).
+    #
+    # Item 3 (EMA Strategy Switching): When prior outcomes show
+    # signal_mapped_remediation has failed (verification_outcome in
+    # {misdiagnosed, unchanged, regressed}), demote it to the END of
+    # the result list so LLM proposals take priority at index 0.  When
+    # the prior outcome was resolved or partially_resolved, keep it at
+    # index 0 (reuse proven strategy).  On the first run (no prior
+    # outcomes), keep it at index 0 (default safety net).
     if uncovered_concrete:
         supplementary = RemediationProposal(
             strategy="signal_mapped_remediation",
@@ -421,7 +429,56 @@ def constrain_proposal_steps(
             assumptions=["Collectors will re-assess and clear signals after fix"],
             rollback_considerations="Revert file changes via git",
         )
-        result.insert(0, supplementary)
+
+        # Check prior outcomes for signal_mapped_remediation failures
+        smr_failed = False
+        smr_failure_reason = ""
+        if prior_outcomes:
+            for outcome in prior_outcomes:
+                strategy = (outcome.get("strategy", "") or "").lower()
+                verification = (outcome.get("verification_outcome", "") or "").lower()
+                result_field = (outcome.get("result", "") or "").lower()
+                if strategy == "signal_mapped_remediation":
+                    if verification in ("misdiagnosed", "unchanged", "regressed"):
+                        smr_failed = True
+                        smr_failure_reason = verification
+                        break
+                    if result_field == "failure" and verification not in (
+                        "resolved",
+                        "partially_resolved",
+                    ):
+                        smr_failed = True
+                        smr_failure_reason = result_field
+                        break
+
+        if smr_failed:
+            # Demote to end — LLM proposals get priority at index 0
+            result.append(supplementary)
+            logger.info(
+                "Demoting signal_mapped_remediation to fallback position — "
+                "prior outcome was %s",
+                smr_failure_reason,
+            )
+        else:
+            # Deterministic proposal is the safe baseline (safety net
+            # against LLM proposals that could degrade score). It wins
+            # by default. LLM wins only if it's a viable challenger:
+            # covers more fixable signals AND first LLM proposal has
+            # confidence >= 0.6.
+            llm_fixable_coverage = covered_keys & set(concrete_by_key.keys())
+            if (llm_fixable_coverage
+                    and len(llm_fixable_coverage) > len(uncovered_concrete)
+                    and result
+                    and getattr(result[0], "confidence", 0) >= 0.6):
+                result.append(supplementary)   # LLM takes index 0
+                logger.info(
+                    "LLM proposal wins selection — covers %d fixable "
+                    "signals vs deterministic %d, confidence >= 0.6",
+                    len(llm_fixable_coverage),
+                    len(uncovered_concrete),
+                )
+            else:
+                result.insert(0, supplementary) # deterministic stays at index 0
 
     return result
 

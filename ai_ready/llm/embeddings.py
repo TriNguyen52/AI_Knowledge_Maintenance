@@ -59,8 +59,38 @@ def _tokenize(text: str) -> list[str]:
     return [t for t in tokens if t not in stop and len(t) >= 2]
 
 
+def _extract_features(text: str) -> list[str]:
+    """Extract features from text: word tokens + character n-grams.
+
+    Combines word-level tokens with character 3-grams from each word
+    to capture partial word overlap (e.g., "fastapi" and "openapi"
+    share the trigrams "api" and "pia"). This significantly improves
+    similarity scores for short texts with related but non-identical
+    vocabulary.
+    """
+    words = _tokenize(text)
+    features: list[str] = list(words)  # word-level features
+
+    # Character 3-grams from each word (skip words shorter than 3 chars)
+    for word in words:
+        if len(word) >= 3:
+            for i in range(len(word) - 2):
+                features.append(f"c3:{word[i:i+3]}")
+
+    return features
+
+
 class TFIDFEmbedder:
-    """TF-IDF embedding with signed hashing to fixed dimension."""
+    """TF-IDF embedding with k-hashing and L2 normalization to fixed dimension.
+
+    Uses k-hashing (k=3) to map each token to multiple dimensions, producing
+    denser, more discriminative vectors than single-hash approaches. When
+    fitted, TF-IDF weighting is applied; when unfitted, uniform weighting
+    with a default IDF of 1.0 is used. All vectors are L2-normalized.
+    """
+
+    # Number of hash functions per token (k-hashing)
+    K_HASH = 3
 
     def __init__(self, dim: int = EMBEDDING_DIM) -> None:
         self.dim = dim
@@ -68,7 +98,11 @@ class TFIDFEmbedder:
         self._fitted = False
 
     def fit(self, corpus: list[str]) -> "TFIDFEmbedder":
-        """Build IDF weights from a corpus of documents."""
+        """Build IDF weights from a corpus of documents.
+
+        Uses both word-level tokens and character n-grams as features
+        to capture partial word overlap between related documents.
+        """
         doc_count = len(corpus)
         if doc_count == 0:
             self._fitted = True
@@ -76,9 +110,9 @@ class TFIDFEmbedder:
 
         df: Counter[str] = Counter()
         for text in corpus:
-            tokens = set(_tokenize(text))
-            for token in tokens:
-                df[token] += 1
+            features = set(_extract_features(text))
+            for feature in features:
+                df[feature] += 1
 
         self._idf = {
             term: math.log((1 + doc_count) / (1 + freq)) + 1.0
@@ -87,28 +121,42 @@ class TFIDFEmbedder:
         self._fitted = True
         return self
 
+    def _hash_term(self, term: str, k: int) -> tuple[int, float]:
+        """Hash a term to a dimension index and sign for the k-th hash function.
+
+        Uses MD5 for deterministic, well-distributed hashing.
+        """
+        h = int(hashlib.md5(f"{term}_{k}".encode()).hexdigest(), 16) % self.dim
+        sign = 1.0 if (h % 2 == 0) else -1.0
+        return h, sign
+
     def embed(self, text: str) -> list[float]:
-        """Embed text into a fixed-dimension vector via TF-IDF + signed hashing."""
-        tokens = _tokenize(text)
-        if not tokens:
+        """Embed text into a fixed-dimension vector via TF-IDF + k-hashing.
+
+        Uses both word-level tokens and character n-grams as features.
+        Each feature is mapped to K_HASH dimensions with independent signs,
+        producing denser vectors than single-hash approaches. The resulting
+        vector is L2-normalized so cosine similarity equals dot product.
+        """
+        features = _extract_features(text)
+        if not features:
             return [0.0] * self.dim
 
-        tf = Counter(tokens)
+        tf = Counter(features)
         vector = np.zeros(self.dim, dtype=np.float32)
 
         for term, count in tf.items():
             idf = self._idf.get(term, 1.0) if self._fitted else 1.0
-            weight = count * idf
+            # Use sublinear TF scaling: log(1 + count) to reduce the
+            # impact of repeated terms and emphasize term presence
+            weight = (1.0 + math.log(count)) * idf
 
-            h1 = int(hashlib.md5(f"{term}_1".encode()).hexdigest(), 16) % self.dim
-            h2 = int(hashlib.md5(f"{term}_2".encode()).hexdigest(), 16) % self.dim
+            # K-hashing: map each feature to K_HASH dimensions
+            for k in range(self.K_HASH):
+                idx, sign = self._hash_term(term, k)
+                vector[idx] += sign * weight
 
-            sign1 = 1.0 if (h1 % 2 == 0) else -1.0
-            sign2 = 1.0 if (h2 % 2 == 0) else -1.0
-
-            vector[h1] += sign1 * weight
-            vector[h2] += sign2 * weight
-
+        # L2 normalize so cosine similarity = dot product
         norm = np.linalg.norm(vector)
         if norm > 0:
             vector = vector / norm
@@ -321,11 +369,19 @@ class EmbeddingProvider:
 _default_provider: EmbeddingProvider | None = None
 
 
-def get_embedder() -> EmbeddingProvider:
-    """Get the default embedding provider instance."""
+def get_embedder(corpus_texts: list[str] | None = None) -> EmbeddingProvider:
+    """Get the default embedding provider instance.
+
+    Args:
+        corpus_texts: Optional corpus for auto-fitting the TF-IDF backend.
+            If provided and the TF-IDF embedder hasn't been fitted yet,
+            it will be fitted on this corpus before returning.
+    """
     global _default_provider
     if _default_provider is None:
         _default_provider = EmbeddingProvider()
+    if corpus_texts and not _default_provider._tfidf._fitted:
+        _default_provider.fit(corpus_texts)
     return _default_provider
 
 

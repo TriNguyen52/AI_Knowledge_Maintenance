@@ -84,21 +84,15 @@ MCP_QUERY_CATALOG: list[dict[str, Any]] = [
             "Get aggregate metrics: success rate, avg improvement, "
             "token usage, fork count."
         ),
-        "view": "mcp_remediation_history",
-        "example_query": (
-            "SELECT count(*) AS total_workflows, "
-            "count(*) FILTER (WHERE verification_outcome = 'resolved') "
-            "AS problems_resolved, "
-            "avg(score_after - score_before) AS avg_score_improvement "
-            "FROM mcp_remediation_history"
-        ),
+        "view": "mcp_remediation_metrics",
+        "example_query": "SELECT * FROM mcp_remediation_metrics",
     },
     {
         "name": "get_assessment_history",
         "description": "Get historical assessment snapshots over time.",
-        "view": "mcp_knowledge_health",
+        "view": "mcp_assessment_history",
         "example_query": (
-            "SELECT * FROM knowledge_assessments ORDER BY created_at DESC "
+            "SELECT * FROM mcp_assessment_history ORDER BY created_at DESC "
             "LIMIT 10"
         ),
     },
@@ -138,10 +132,27 @@ MCP_QUERY_CATALOG: list[dict[str, Any]] = [
             "Get historical context for a problem type: which strategies "
             "worked, which failed, and past decision traces."
         ),
-        "view": "mcp_remediation_history",
+        "view": "mcp_remediation_context",
         "example_query": (
-            "SELECT * FROM mcp_remediation_history "
+            "SELECT * FROM mcp_remediation_context "
             "WHERE issue_type = '<issue_type>' ORDER BY created_at DESC LIMIT 5"
+        ),
+    },
+    {
+        "name": "search_artifacts_semantic",
+        "description": (
+            "Vector similarity search via HuggingFace embeddings + "
+            "CockroachDB VECTOR(384) cosine distance."
+        ),
+        "view": None,
+        "note": (
+            "Not a SQL view â€” uses CockroachDB <=> vector distance operator "
+            "on knowledge_artifacts.embedding column"
+        ),
+        "example_query": (
+            "SELECT artifact_uri, 1 - (embedding <=> '<query_vector>') "
+            "AS similarity FROM knowledge_artifacts "
+            "ORDER BY embedding <=> '<query_vector>' LIMIT 5"
         ),
     },
 ]
@@ -188,6 +199,11 @@ def handle_tool_call(tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
                 "FROM knowledge_signals ORDER BY created_at DESC LIMIT %s",
                 (limit,),
             )
+            # Increment access_count for retrieved signals (Item 4 — LTP)
+            if rows:
+                signal_ids = [r["signal_id"] for r in rows if r.get("signal_id")]
+                if signal_ids:
+                    _store.increment_signal_access_count(signal_ids)
             return {"count": len(rows), "signals": rows}
         except Exception as e:
             return {"count": 0, "signals": [], "error": str(e)}

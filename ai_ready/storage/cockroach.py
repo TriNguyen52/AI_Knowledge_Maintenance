@@ -193,6 +193,12 @@ class CockroachDBStore:
 
         self._initialized = True
 
+        # Also load MCP views (Item 6 — ensure views are created alongside schema)
+        try:
+            self.register_mcp_views()
+        except Exception as e:
+            logger.info("MCP views creation skipped: %s", e)
+
     def register_mcp_views(self) -> None:
         """Create the MCP read-only views from mcp_views.sql.
 
@@ -523,6 +529,32 @@ class CockroachDBStore:
             """,
             (signal_id,),
         )
+
+    def increment_signal_access_count(self, signal_ids: list[str]) -> int:
+        """Increment access_count for a batch of signals (LTP retrieval feedback).
+
+        Fires when signals are retrieved for remediation context or
+        assessment display — not on every DB read. This demonstrates
+        signal-level retrieval frequency as part of the memory story.
+
+        Args:
+            signal_ids: List of signal IDs to increment.
+
+        Returns:
+            Number of signal IDs processed.
+        """
+        if not signal_ids:
+            return 0
+        self._execute(
+            """
+            UPDATE knowledge_signals
+            SET access_count = access_count + 1, last_seen = now()
+            WHERE signal_id = ANY(%s)
+            """,
+            (signal_ids,),
+        )
+        logger.info("Signal access counts updated: %d signals accessed", len(signal_ids))
+        return len(signal_ids)
 
     def _row_to_signal(self, row: dict[str, Any]) -> SignalRecord:
         return SignalRecord(
