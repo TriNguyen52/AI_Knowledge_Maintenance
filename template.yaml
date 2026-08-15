@@ -2,16 +2,17 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   AI Knowledge Maintenance — Agentic knowledge assessment and remediation
-  using CockroachDB as persistent memory and Amazon Bedrock for LLM reasoning.
+  using CockroachDB as persistent agent memory and AWS Lambda for serverless
+  execution. LLM provider is configurable (Groq, Bedrock, OpenAI, etc.).
 
   Architecture:
-  - CockroachDB Cloud: Persistent agent memory (state, embeddings, signals, outcomes)
-  - Amazon Bedrock: LLM reasoning (Claude 3.5 Sonnet) + embeddings (Titan v2)
+  - CockroachDB Cloud: Persistent agent memory (state, embeddings, signals, outcomes, MCP views)
   - AWS Lambda: Serverless execution (assessment, remediation, S3-trigger)
-  - Amazon S3: Knowledge artifact storage
-  - EventBridge: Scheduled assessments
+  - Amazon S3: Versioned knowledge artifact storage with event triggers
+  - EventBridge: Scheduled assessments (default: hourly)
   - API Gateway: On-demand assessment/remediation/status
-  - SQS DLQ: Failed event handling for resilience
+  - SQS DLQ: Failed event handling (14-day retention)
+  - CloudWatch + SNS: Logs (30-day) and error alarms
 
 Parameters:
   CockroachDBUrl:
@@ -41,8 +42,7 @@ Globals:
         COCKROACH_DB_URL: !Ref CockroachDBUrl
         S3_KNOWLEDGE_BUCKET: !Ref KnowledgeBucket
         S3_KNOWLEDGE_PREFIX: !Ref KnowledgePrefix
-        LLM_PROVIDER: bedrock
-        BEDROCK_MODEL: anthropic.claude-3-5-sonnet-20241022-v2:0
+        LLM_PROVIDER: groq
 
 Resources:
   # --------------------------------------------------------
@@ -90,13 +90,6 @@ Resources:
       Policies:
         - S3ReadPolicy:
             Bucket: !Ref KnowledgeBaseBucket
-        - Statement:
-            - Effect: Allow
-              Action:
-                - bedrock:InvokeModel
-                - bedrock:Converse
-                - bedrock:ConverseStream
-              Resource: "*"
         - SQSSendMessagePolicy:
             QueueName: !GetAtt AssessmentDLQ.QueueName
       Events:
@@ -129,13 +122,6 @@ Resources:
             Bucket: !Ref KnowledgeBaseBucket
         - S3WritePolicy:
             Bucket: !Ref KnowledgeBaseBucket
-        - Statement:
-            - Effect: Allow
-              Action:
-                - bedrock:InvokeModel
-                - bedrock:Converse
-                - bedrock:ConverseStream
-              Resource: "*"
         - SQSSendMessagePolicy:
             QueueName: !GetAtt RemediationDLQ.QueueName
       Events:
@@ -165,12 +151,6 @@ Resources:
       Policies:
         - S3ReadPolicy:
             Bucket: !Ref KnowledgeBaseBucket
-        - Statement:
-            - Effect: Allow
-              Action:
-                - bedrock:InvokeModel
-                - bedrock:Converse
-              Resource: "*"
         - SQSSendMessagePolicy:
             QueueName: !GetAtt AssessmentDLQ.QueueName
       Events:

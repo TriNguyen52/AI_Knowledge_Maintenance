@@ -55,13 +55,13 @@ Problem Discovery (cluster signals → root causes)
 Assessment (scored, versioned, stored in CockroachDB)
     │
     ▼
-LLM Proposal Generation (with institutional memory)
+LLM Proposal Generation (with memory from CockroachDB)
     │
     ▼
-Human Approval → Execution → Verification → Learning
+Human Approval → Execution → Verification → Rollback on Regression → Learning
 ```
 
-Assessment is **always deterministic**, no LLM required. Ten signal collectors across six dimensions (retrieval, context, consistency, trust, connectivity, workflow) scan the knowledge base and produce reproducible results regardless of which language model is available. The LLM only participates in the improvement loop, where it proposes fixes informed by the agent's past outcomes.
+Assessment is **always deterministic**, no LLM required. Ten signal collectors across six dimensions (retrieval, context, consistency, trust, connectivity, workflow) scan the knowledge base and produce reproducible results regardless of which language model is available. The LLM only participates in the improvement loop, where it proposes fixes learnt by the agent's past outcomes. If verification detects regression, the system rolls back modifications.
 
 ## Signal Collectors
 
@@ -96,18 +96,83 @@ The agent doesn't just fix problems, it remembers which fixes worked and which d
 - **EMA strategy scoring** — tracks which remediation strategies worked (Exponential Moving Average), so successful strategies are reinforced and failed ones suppressed.
 - **CockroachDB persistence** — workflow state is snapshotted at each transition and survives restarts. Resumable via `ImprovementManager.resume_workflow()`.
 
-## Cloud Deployment
+## Cloud Architecture
 
-For persistent agent memory and serverless deployment:
+The system deploys as a serverless agent on AWS with CockroachDB Cloud as its persistent memory layer:
+
+```mermaid
+flowchart TB
+
+    subgraph INPUT["Inputs"]
+        S3["S3<br/>Artifact Storage"]
+        API["API Gateway<br/>On-Demand API"]
+        EB["EventBridge<br/>Hourly Schedule"]
+    end
+
+    subgraph ASSESS["Assessment"]
+        INC["Lambda<br/>Incremental Assessment"]
+        FULL["Lambda<br/>Full Assessment"]
+    end
+
+    subgraph REMEDIATE["Proposal"]
+        PROP["Lambda<br/>Proposal"]
+        BURR["Apache Burr<br/>Proposal Workflow"]
+    end
+
+    subgraph MEMORY["Agent Memory"]
+        STATE["Working Memory<br/>agent_state"]
+        HISTORY["Long-Term Memory<br/>proposal_history"]
+        SEMANTIC["Semantic Memory<br/>Similarity Search"]
+    end
+
+    subgraph OPERATIONS["Operations"]
+        DLQ["SQS DLQ"]
+        CW["CloudWatch"]
+    end
+
+    S3 -->|"Object Event"| INC
+    EB -->|"Scheduled Trigger"| FULL
+    API -->|"POST /assess"| FULL
+    API -->|"POST /proposal"| PROP
+
+    INC --> BURR
+    FULL --> BURR
+    PROP --> BURR
+
+    BURR -->|"Read / Write"| STATE
+    BURR -->|"Read / Write"| HISTORY
+    BURR -->|"Retrieve"| SEMANTIC
+
+    INC -.-> DLQ
+    FULL -.-> DLQ
+    PROP -.-> DLQ
+
+    INC -.-> CW
+    FULL -.-> CW
+    PROP -.-> CW
+    BURR -.-> CW
+```
+
+### Local Deployment (Free, No AWS Account)
+
+Runs entirely via Docker + Floci (local AWS emulator):
+
+```powershell
+docker compose -f deploy/compose.yaml up -d
+.\deploy\deploy.ps1
+```
+
+The same `lambda_handler.py` code runs unchanged with only the endpoint URL differs (`http://localhost:4566` vs real AWS). S3 uploads trigger incremental assessment, EventBridge runs scheduled assessments, and `aws lambda invoke` triggers on-demand assess/remediate/status.
+
+### Production Deployment
+
+The same `template.yaml` deploys to real AWS via SAM:
 
 ```bash
-# Set up CockroachDB Cloud
-python setup_cockroachdb.py
-
-# Configure environment
-cp .env.example .env  # Add connection string + LLM provider
-
+sam build && sam deploy --guided
 ```
+
+The code is identical; only the endpoint URL changes.
 
 ### LLM Providers
 
@@ -123,7 +188,7 @@ AI-Ready supports multiple LLM providers for the improvement workflow:
 
 Set `LLM_PROVIDER` in `.env` to switch providers. Assessment (signal collection) is always deterministic and never requires an LLM.
 
-## What's Novel
+## Why this product
 
 1. **Closed-loop agentic memory** — Most agent memory systems are write-only (store context, retrieve by similarity). This system creates a learning loop whcih the agent reads its own past outcomes from CockroachDB before making new decisions, so it gets progressively better at resolving recurring problem types.
 
@@ -135,12 +200,8 @@ Set `LLM_PROVIDER` in `.env` to switch providers. Assessment (signal collection)
 
 5. **MCP agent-to-agent communication** — The CockroachDB managed MCP server lets external AI agents (Claude Code, Cursor, VS Code Copilot) query the knowledge maintenance agent's memory via read-only SQL views. An AI coding assistant can ask "what are the top knowledge problems?" and "what strategies worked for broken links?", creating an ecosystem where agents share institutional knowledge.
 
-## Design Principles
+6. **Stateful agent in a serverless environment** — By persisting Burr workflow state to CockroachDB at every transition, the agent becomes stateful across Lambda invocations, a workflow can start in one invocation, pause at approval, and resume in a completely different invocation hours later.
 
-- **Deterministic before AI.** Every assessment is reproducible regardless of which language model is available. Signal collection never calls an LLM.
-- **Knowledge is infrastructure.** Documentation is treated as an engineering artifact, not application data. It deserves the same observability as code.
-- **Evidence is never discarded.** Every assessment, proposed modification, verification result, and remediation outcome becomes part of the historical record.
-- **Conservative bias throughout.** No-CI paths give cautious verdicts. Underpowered assessments produce no conclusion rather than a false one. Fail closed on reuse.
 
 ## License
 

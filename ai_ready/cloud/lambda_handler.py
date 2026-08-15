@@ -9,6 +9,8 @@ response dict.
 Supported actions:
     - "assess"    → run_cloud_assessment_cycle  (scan, persist, discover problems)
     - "remediate" → run_cloud_remediation_cycle  (assess → improve → verify → rollback)
+    - "propose"   → run_cloud_remediation_cycle(phase="propose")  (assess → propose → halt)
+    - "execute"   → run_cloud_remediation_cycle(phase="execute")  (resume → execute → verify)
     - "status"    → CockroachDBStore queries     (queue, metrics, health trend)
 
 S3 event triggers (Records with eventSource "aws:s3") are handled by
@@ -39,7 +41,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     Args:
         event: Lambda event payload. Supported keys:
-            action: "assess" | "remediate" | "status"
+            action: "assess" | "remediate" | "propose" | "execute" | "status"
             s3_bucket: Override S3_KNOWLEDGE_BUCKET env var
             s3_prefix: Override S3_KNOWLEDGE_PREFIX env var
             problem_id: Specific problem to remediate (optional)
@@ -68,6 +70,10 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             result = run_assessment(event)
         elif action == "remediate":
             result = run_remediation(event)
+        elif action == "propose":
+            result = run_proposal(event)
+        elif action == "execute":
+            result = run_execution(event)
         elif action == "status":
             result = run_status(event)
         else:
@@ -130,7 +136,7 @@ def run_assessment(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_remediation(event: dict[str, Any]) -> dict[str, Any]:
-    """Run a closed-loop remediation cycle.
+    """Run a full closed-loop remediation cycle (auto-approve).
 
     Delegates to ``run_cloud_remediation_cycle`` in
     ``ai_ready.improvement.closed_loop``, which:
@@ -170,6 +176,106 @@ def run_remediation(event: dict[str, Any]) -> dict[str, Any]:
             prefix=prefix,
             problem_id=event.get("problem_id"),
             llm_gateway=gateway,
+        )
+    finally:
+        store.close()
+
+
+def run_proposal(event: dict[str, Any]) -> dict[str, Any]:
+    """Generate a remediation proposal for human review (halt at approval).
+
+    Delegates to ``run_cloud_remediation_cycle`` with ``phase="propose"``,
+    which runs assessment + analysis + proposal generation, then halts
+    at the approval checkpoint.  The workflow state is persisted to
+    CockroachDB so :func:`run_execution` can resume it later.
+
+    Args:
+        event: Lambda event. Optional keys:
+            s3_bucket, s3_prefix, problem_id
+
+    Returns:
+        Proposal dict with app_id, proposals, root_causes, score_before, etc.
+    """
+    from ai_ready.storage.cockroach import CockroachDBStore
+    from ai_ready.llm.gateway import LLMGateway
+    from ai_ready.improvement.closed_loop import run_cloud_remediation_cycle
+
+    bucket = event.get("s3_bucket", os.environ.get("S3_KNOWLEDGE_BUCKET", ""))
+    prefix = event.get("s3_prefix", os.environ.get("S3_KNOWLEDGE_PREFIX", ""))
+    if not bucket:
+        raise ValueError(
+            "S3_KNOWLEDGE_BUCKET environment variable or s3_bucket in event required"
+        )
+
+    store = CockroachDBStore()
+    store.initialize_schema()
+
+    try:
+        provider_name = os.environ.get("LLM_PROVIDER", "groq")
+        gateway = LLMGateway(provider=provider_name)
+
+        return run_cloud_remediation_cycle(
+            store=store,
+            bucket=bucket,
+            prefix=prefix,
+            problem_id=event.get("problem_id"),
+            llm_gateway=gateway,
+            phase="propose",
+        )
+    finally:
+        store.close()
+
+
+def run_execution(event: dict[str, Any]) -> dict[str, Any]:
+    """Execute an approved proposal (resume from CockroachDB state).
+
+    Delegates to ``run_cloud_remediation_cycle`` with ``phase="execute"``,
+    which resumes the workflow from CockroachDB-persisted state, executes
+    the approved proposal, verifies the result, and uploads modified files
+    to S3.
+
+    Args:
+        event: Lambda event. Required keys:
+            app_id: The workflow ID returned by the propose phase.
+        Optional keys:
+            s3_bucket, s3_prefix, problem_id, approved (default True),
+            reason (default "approved by user")
+
+    Returns:
+        Execution result dict with verification_outcome, score_before/after, etc.
+    """
+    from ai_ready.storage.cockroach import CockroachDBStore
+    from ai_ready.llm.gateway import LLMGateway
+    from ai_ready.improvement.closed_loop import run_cloud_remediation_cycle
+
+    bucket = event.get("s3_bucket", os.environ.get("S3_KNOWLEDGE_BUCKET", ""))
+    prefix = event.get("s3_prefix", os.environ.get("S3_KNOWLEDGE_PREFIX", ""))
+    if not bucket:
+        raise ValueError(
+            "S3_KNOWLEDGE_BUCKET environment variable or s3_bucket in event required"
+        )
+
+    app_id = event.get("app_id", "")
+    if not app_id:
+        raise ValueError("app_id is required for execute action (from propose phase)")
+
+    store = CockroachDBStore()
+    store.initialize_schema()
+
+    try:
+        provider_name = os.environ.get("LLM_PROVIDER", "groq")
+        gateway = LLMGateway(provider=provider_name)
+
+        return run_cloud_remediation_cycle(
+            store=store,
+            bucket=bucket,
+            prefix=prefix,
+            problem_id=event.get("problem_id"),
+            llm_gateway=gateway,
+            phase="execute",
+            app_id=app_id,
+            approved=event.get("approved", True),
+            reason=event.get("reason", "approved by user"),
         )
     finally:
         store.close()

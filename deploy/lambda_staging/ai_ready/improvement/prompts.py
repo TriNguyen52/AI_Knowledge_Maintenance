@@ -1,0 +1,335 @@
+"""Prompt context builders for LLM actions.
+
+These functions construct the text summaries that get passed to the LLM
+inside Burr actions. They are the security boundary: the LLM sees only
+what these functions show it, never the knowledge base directly.
+
+Extracted from actions.py to keep action functions focused on
+orchestration logic rather than prompt construction.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+
+def build_signal_context(
+    signal_ids: list[str],
+    assessment_store: Any,
+) -> str:
+    """Build a text summary of signals for the LLM prompt.
+
+    The LLM receives signal descriptions, NOT access to the knowledge base.
+    This is the security boundary — the LLM sees what we show it.
+    """
+    if not assessment_store:
+        return "No assessment store available."
+
+    assessment = assessment_store.latest()
+    if not assessment:
+        return "No assessment available."
+
+    lines: list[str] = []
+    for signal in assessment.signals:
+        if signal.signal_id in signal_ids:
+            lines.append(
+                f"- Signal {signal.signal_id}: "
+                f"collector={signal.collector_id}, "
+                f"type={signal.signal_type}, "
+                f"severity={signal.severity.value}, "
+                f"artifact={signal.artifact_uri}, "
+                f"evidence={json.dumps(signal.evidence, default=str)[:200]}, "
+                f"recommendation={signal.recommendation}, "
+                f"ai_impact={signal.ai_impact}"
+            )
+    return "\n".join(lines) if lines else "No matching signals found."
+
+
+def build_systemic_cluster_summary(
+    systemic_clusters: list[dict[str, Any]],
+) -> str:
+    """Build a compact text summary of systemic clusters for LLM prompts.
+
+    This summary groups KnowledgeProblems by their root cause pattern,
+    showing the LLM systemic patterns rather than individual problems.
+    This enables the LLM to generate KB-wide systemic proposals instead
+    of per-artifact fixes.
+
+    Each cluster is summarized as:
+      - Cluster ID and pattern type
+      - Pattern description
+      - Number of problems, signals, and artifacts
+      - Shared evidence references
+      - Cluster salience
+
+    Args:
+        systemic_clusters: List of SystemicCluster dicts (from
+            cluster_problems_by_root_cause).
+
+    Returns:
+        A compact text summary suitable for LLM prompts.
+    """
+    if not systemic_clusters:
+        return "No systemic clusters identified."
+
+    lines: list[str] = []
+    lines.append(f"Systemic Pattern Analysis ({len(systemic_clusters)} cluster(s)):")
+    lines.append("")
+
+    for cluster in systemic_clusters:
+        cluster_id = cluster.get("cluster_id", "?")
+        pattern_type = cluster.get("pattern_type", "unknown")
+        description = cluster.get("pattern_description", "")
+        problem_count = len(cluster.get("problem_ids", []))
+        signal_count = len(cluster.get("signal_ids", []))
+        artifact_count = len(cluster.get("artifact_uris", []))
+        shared_evidence = cluster.get("shared_evidence", [])
+        salience = cluster.get("cluster_salience", 0.0)
+
+        # Pattern type label for readability
+        pattern_labels = {
+            "directory_cluster": "Directory Cluster",
+            "systemic_type": "Systemic Type",
+            "shared_evidence": "Shared Evidence",
+            "shared_category": "Shared Category",
+            "singleton": "Individual Problem",
+        }
+        pattern_label = pattern_labels.get(pattern_type, pattern_type)
+
+        lines.append(f"  [{pattern_label}] {cluster_id} (salience={salience:.3f}):")
+        lines.append(f"    {description}")
+        lines.append(
+            f"    Scope: {problem_count} problem(s), {signal_count} signal(s), "
+            f"{artifact_count} artifact(s)"
+        )
+        if shared_evidence:
+            evidence_str = "; ".join(shared_evidence[:3])
+            lines.append(f"    Shared evidence: {evidence_str}")
+        # Show first few artifact URIs
+        artifacts = cluster.get("artifact_uris", [])
+        if artifacts:
+            shown = artifacts[:5]
+            suffix = f" (+{len(artifacts) - 5} more)" if len(artifacts) > 5 else ""
+            lines.append(f"    Artifacts: {', '.join(shown)}{suffix}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def build_artifact_context(
+    artifact_uris: list[str],
+    assessment_store: Any,
+) -> str:
+    """Build a text summary of affected artifacts for the LLM prompt."""
+    if not assessment_store:
+        return "No assessment store available."
+
+    assessment = assessment_store.latest()
+    if not assessment:
+        return "No assessment available."
+
+    lines: list[str] = []
+    for artifact_uri in artifact_uris:
+        # Try to find artifact metadata in the assessment
+        for signal in assessment.signals:
+            if signal.artifact_uri == artifact_uri:
+                lines.append(f"- URI: {artifact_uri} (referenced by signal {signal.signal_id})")
+                break
+        else:
+            lines.append(f"- URI: {artifact_uri} (no signal reference found)")
+
+    return "\n".join(lines) if lines else "No artifacts found."
+
+
+def build_history_context(
+    prior_failures: list[dict[str, Any]],
+    history_store: Any = None,
+) -> str:
+    """Build context from prior improvement outcomes for the LLM prompt."""
+    lines: list[str] = []
+
+    # Include prior failures from forking
+    for failure in prior_failures:
+        lines.append(
+            f"- Prior attempt #{failure.get('attempt_number', '?')}: "
+            f"strategy={failure.get('strategy', 'unknown')}, "
+            f"result={failure.get('result', 'unknown')}, "
+            f"reason={failure.get('failure_reason', 'unknown')}"
+        )
+
+    # Include historical outcomes from the history store
+    if history_store:
+        try:
+            recent = history_store.get_recent_outcomes(limit=5)
+            for outcome in recent:
+                lines.append(
+                    f"- Historical: issue={outcome.get('issue_type', '?')}, "
+                    f"strategy={outcome.get('strategy', '?')}, "
+                    f"result={outcome.get('result', '?')}, "
+                    f"score_change={outcome.get('score_change', 0)}"
+                )
+        except Exception:
+            pass
+
+    return "\n".join(lines) if lines else "No prior history available."
+
+
+def cluster_signals(
+    signal_ids: list[str],
+    assessment_store: Any,
+) -> list[dict[str, Any]]:
+    """Cluster similar signals and return representative examples.
+
+    Instead of sending every signal to the LLM (which wastes tokens),
+    group signals by (collector_id, signal_type, artifact_uri) and
+    send one representative per cluster plus a count. This reduces
+    noise and token consumption while preserving diagnostic information.
+
+    Returns:
+        List of cluster dicts, each with:
+          - representative: the first signal in the cluster (full description)
+          - count: how many signals are in this cluster
+          - cluster_key: the grouping key
+          - all_signal_ids: list of all signal IDs in this cluster
+    """
+    if not assessment_store:
+        return []
+
+    assessment = assessment_store.latest()
+    if not assessment:
+        return []
+
+    # Group signals by (collector_id, signal_type, artifact_uri)
+    clusters: dict[str, dict[str, Any]] = {}
+    for signal in assessment.signals:
+        if signal.signal_id not in signal_ids:
+            continue
+        cluster_key = f"{signal.collector_id}|{signal.signal_type}|{signal.artifact_uri}"
+        if cluster_key not in clusters:
+            clusters[cluster_key] = {
+                "representative": (
+                    f"collector={signal.collector_id}, "
+                    f"type={signal.signal_type}, "
+                    f"severity={signal.severity.value}, "
+                    f"artifact={signal.artifact_uri}, "
+                    f"evidence={json.dumps(signal.evidence, default=str)[:200]}, "
+                    f"recommendation={signal.recommendation}, "
+                    f"ai_impact={signal.ai_impact}"
+                ),
+                "count": 1,
+                "cluster_key": cluster_key,
+                "all_signal_ids": [signal.signal_id],
+            }
+        else:
+            clusters[cluster_key]["count"] += 1
+            clusters[cluster_key]["all_signal_ids"].append(signal.signal_id)
+
+    return list(clusters.values())
+
+
+def build_assessment_summary(
+    signal_ids: list[str],
+    artifact_uris: list[str],
+    assessment_store: Any,
+    clusters: list[dict[str, Any]] | None = None,
+) -> str:
+    """Build a compact, reusable assessment summary for LLM prompts.
+
+    This summary is built once in analyze_issue and persisted in Burr
+    state as ``assessment_summary``. Later actions (generate_proposal)
+    reuse it instead of rebuilding context from scratch, saving both
+    compute and tokens.
+
+    The summary groups signals by (collector_id, signal_type) and shows
+    aggregate counts, affected artifacts, and a brief evidence sample.
+    This keeps the prompt small even with hundreds of signals.
+
+    Returns:
+        A compact text summary suitable for LLM prompts.
+    """
+    if not assessment_store:
+        return "No assessment store available."
+
+    assessment = assessment_store.latest()
+    if not assessment:
+        return "No assessment available."
+
+    lines: list[str] = []
+    lines.append(f"Assessment: {assessment.assessment_id}")
+    lines.append(f"Total signals: {len(signal_ids)}")
+    lines.append(f"Affected artifacts: {len(artifact_uris)}")
+    lines.append("")
+
+    # Severity distribution
+    severity_counts: dict[str, int] = {}
+    for signal in assessment.signals:
+        if signal.signal_id in signal_ids:
+            sev = signal.severity.value
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+    if severity_counts:
+        lines.append("Severity distribution: " + ", ".join(
+            f"{sev}={count}" for sev, count in sorted(severity_counts.items())
+        ))
+        lines.append("")
+
+    # Group signals by (collector_id, signal_type) for compact display
+    type_groups: dict[str, dict[str, Any]] = {}
+    for signal in assessment.signals:
+        if signal.signal_id not in signal_ids:
+            continue
+        group_key = f"{signal.collector_id}|{signal.signal_type}"
+        if group_key not in type_groups:
+            # Extract key evidence values only (skip long values)
+            ev = signal.evidence if isinstance(signal.evidence, dict) else {}
+            ev_items = []
+            for k, v in list(ev.items())[:3]:
+                v_str = str(v)
+                if len(v_str) <= 60:
+                    ev_items.append(f"{k}={v_str}")
+                else:
+                    ev_items.append(f"{k}={v_str[:57]}...")
+            ev_str = ", ".join(ev_items) if ev_items else "none"
+
+            type_groups[group_key] = {
+                "collector_id": signal.collector_id,
+                "signal_type": signal.signal_type,
+                "severity": signal.severity.value,
+                "count": 0,
+                "artifacts": [],
+                "evidence_sample": ev_str,
+            }
+        type_groups[group_key]["count"] += 1
+        if signal.artifact_uri not in type_groups[group_key]["artifacts"]:
+            type_groups[group_key]["artifacts"].append(signal.artifact_uri)
+
+    # Display type-level groups (compact)
+    lines.append(f"Signal types ({len(type_groups)}):")
+    for group in sorted(type_groups.values(), key=lambda g: -g["count"]):
+        arts = group["artifacts"]
+        shown = arts[:5]
+        suffix = f" (+{len(arts) - 5} more)" if len(arts) > 5 else ""
+        lines.append(
+            f"  [{group['count']}x] {group['collector_id']}/{group['signal_type']} "
+            f"(sev={group['severity']}, ev: {group['evidence_sample']})"
+        )
+        lines.append(f"        artifacts: {', '.join(shown)}{suffix}")
+
+    # Item 6: Signal type legend — only for types present in this assessment
+    _SIGNAL_LEGEND = {
+        "no_date_signal": "No date metadata. Fix: add 'date' to frontmatter.",
+        "stale_content": "Date is old. Fix: update 'date' after review.",
+        "missing_canonical_source": "No link to canonical source. Fix: add link to canonical domain.",
+        "broken_link": "Links to non-existent targets. Fix: remove or fix.",
+        "dangling_reference": "Ambiguous refs meaningless in isolation. Fix: rewrite self-contained.",
+        "orphan_artifact": "No inbound links. Fix: add link from index page.",
+        "duplicate_content": "Overlaps another artifact. Fix: consolidate.",
+        "terminology_variant": "Non-canonical term. Fix: standardize.",
+    }
+    present = {g["signal_type"] for g in type_groups.values()}
+    legend = [f"  {t}: {_SIGNAL_LEGEND[t]}" for t in sorted(present) if t in _SIGNAL_LEGEND]
+    if legend:
+        lines.append("\nSignal type legend:")
+        lines.extend(legend)
+
+    return "\n".join(lines)
