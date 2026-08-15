@@ -659,13 +659,17 @@ class KnowledgeExecutor:
         existing_links = set(re.findall(r"\[[^\]]+\]\(([^)]+)\)", content))
         links_added: list[str] = []
 
+        skipped_links: list[dict[str, str]] = []
+
         for uri in sorted(orphaned_uris):
             if uri == index_uri:
                 continue  # don't link to self
             # Compute relative path from index to the orphaned doc
             index_dir = index_path.parent
             orphan_path = self._resolve_path(uri)
-            if orphan_path is None:
+            if orphan_path is None or not orphan_path.exists():
+                logger.warning("Skipping link to non-existent artifact: %s", uri)
+                skipped_links.append({"uri": uri, "reason": "file_not_found"})
                 continue
             try:
                 rel_path = orphan_path.relative_to(index_dir)
@@ -684,6 +688,23 @@ class KnowledgeExecutor:
             else:
                 title = uri.rsplit("/", 1)[-1].rsplit(".", 1)[0].replace("_", " ").title()
 
+            # Topic relevance check (lightweight, deterministic):
+            # Extract keywords from index page and orphaned doc titles.
+            # If zero keyword overlap, skip to avoid mixed_topics signals.
+            index_title_match = re.search(r"^#\s+(.+)$", content, re.MULTILINE)
+            index_title = index_title_match.group(1).lower() if index_title_match else index_uri.lower()
+            orphan_title_lower = title.lower()
+            index_words = set(re.findall(r"[a-z]{3,}", index_title))
+            orphan_words = set(re.findall(r"[a-z]{3,}", orphan_title_lower))
+            # Remove common stop words
+            stop_words = {"the", "and", "for", "with", "from", "that", "this", "are", "was", "were", "have", "has", "not", "but", "you", "your", "they", "their", "will", "can", "all", "any", "how", "why", "when", "what", "who", "use", "using", "overview", "introduction", "guide", "documentation", "docs"}
+            index_words -= stop_words
+            orphan_words -= stop_words
+            if index_words and orphan_words and not (index_words & orphan_words):
+                logger.warning("Skipping link to topically unrelated artifact: %s (index: %s, orphan: %s)", uri, index_words, orphan_words)
+                skipped_links.append({"uri": uri, "reason": "no_topic_overlap"})
+                continue
+
             links_added.append(f"- [{title}]({rel_link})")
 
         if not links_added:
@@ -691,17 +712,34 @@ class KnowledgeExecutor:
                 "mode": "production",
                 "file": str(index_path),
                 "files_fixed": 0,
-                "message": "All orphaned documents already linked in index",
+                "skipped_links": skipped_links,
+                "message": "All orphaned documents already linked in index"
+                           + (f" ({len(skipped_links)} skipped)" if skipped_links else ""),
             }
 
-        # Add an "Additional Resources" section to the index
-        resources_section = (
-            "\n\n## Additional Resources\n\n"
-            + "\n".join(links_added)
-            + "\n"
-        )
+        # Add links to the index page, handling duplicate "## Additional Resources"
+        if "## Additional Resources" in content:
+            # Append to existing section — insert links before the next ## heading or EOF
+            section_start = content.index("## Additional Resources")
+            # Find the end of the section (next ## heading after section_start, or EOF)
+            after_section = content[section_start:]
+            next_heading_match = re.search(r"\n## ", after_section[len("## Additional Resources"):])
+            if next_heading_match:
+                insert_pos = section_start + len("## Additional Resources") + next_heading_match.start()
+                insert_text = "\n" + "\n".join(links_added)
+                content = content[:insert_pos] + insert_text + content[insert_pos:]
+            else:
+                # No next heading — append at end of the section
+                content = content.rstrip() + "\n" + "\n".join(links_added) + "\n"
+        else:
+            # Create new section
+            resources_section = (
+                "\n\n## Additional Resources\n\n"
+                + "\n".join(links_added)
+                + "\n"
+            )
+            content = content.rstrip() + resources_section
 
-        content = content.rstrip() + resources_section
         index_path.write_text(content, encoding="utf-8")
 
         return {
@@ -709,7 +747,9 @@ class KnowledgeExecutor:
             "file": str(index_path),
             "orphaned_docs_linked": len(links_added),
             "links_added": links_added[:5],
-            "message": f"Added {len(links_added)} cross-reference links to index page",
+            "skipped_links": skipped_links,
+            "message": f"Added {len(links_added)} cross-reference links to index page"
+                       + (f" ({len(skipped_links)} skipped)" if skipped_links else ""),
         }
 
     def _handle_create_document(self, step: dict[str, Any]) -> dict[str, Any]:

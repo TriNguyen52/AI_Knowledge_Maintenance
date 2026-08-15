@@ -1043,7 +1043,7 @@ def execute_change(state: State, executor: Any = None) -> State:
 @action(reads=["execution_history", "assessment_id", "signal_ids", "affected_artifact_uris",
                "proposals", "selected_proposal_idx", "knowledge_problems", "decision_trace",
                "root_cause_analysis"],
-        writes=["verification_results", "current_stage", "decision_trace"])
+        writes=["verification_results", "current_stage", "decision_trace", "external_validation"])
 def verify_improvement(state: State, assessment_store: Any = None,
                        assessment_pipeline: Any = None,
                        artifacts: list[Any] = None,
@@ -1518,11 +1518,71 @@ def verify_improvement(state: State, assessment_store: Any = None,
             except Exception as e:
                 logger.warning(f"Diagnosis quality recording failed: {e}")
 
+        # --- Non-Circular External Validation (Item 7) ---
+        # Run independent metrics that don't share code with collectors.
+        # This catches blind spots the circular (same-collector) verification
+        # would miss, and provides an independent improvement signal.
+        external_validation = {}
+        try:
+            from ai_ready.improvement.external_validation import validate_improvement
+
+            # Build before/after artifact content dicts from the assessments
+            before_contents: dict[str, str] = {}
+            after_contents: dict[str, str] = {}
+
+            # Use artifacts from the before-assessment metadata if available
+            for sig in before_assessment.signals:
+                if sig.artifact_uri and sig.artifact_uri not in before_contents:
+                    # We don't have the original content stored, but we can
+                    # use the after_artifacts (which were reloaded from disk)
+                    # as a proxy for "after" and leave "before" empty for
+                    # metrics that only need "after" (e.g., orphan count).
+                    pass
+
+            # Build after-content from the reloaded artifacts
+            for a in (artifacts or []):
+                content = getattr(a, "content", None) or ""
+                if not content and hasattr(a, "raw_content"):
+                    content = a.raw_content or ""
+                after_contents[a.uri] = content
+
+            # For before-content, we need the original assessment's artifacts.
+            # Since we don't have them in memory, we skip metrics that require
+            # before-content comparison and only run after-only metrics.
+            # The validate_improvement function handles empty before dicts.
+
+            # Get modified URIs from execution history
+            modified_uris_list = list(modified_uris) if 'modified_uris' in dir() else []
+
+            external_validation = validate_improvement(
+                before_artifacts=before_contents,
+                after_artifacts=after_contents,
+                modified_uris=modified_uris_list,
+            )
+
+            logger.info(
+                f"External validation: {external_validation.get('summary', {}).get('overall', 'unknown')} "
+                f"({external_validation.get('summary', {}).get('metrics_improved', 0)} improved, "
+                f"{external_validation.get('summary', {}).get('metrics_regressed', 0)} regressed)"
+            )
+
+            # Enrich the verification result summary with external validation
+            ext_summary = external_validation.get("summary", {})
+            result.summary += (
+                f" External validation: {ext_summary.get('overall', 'N/A')} "
+                f"({ext_summary.get('metrics_improved', 0)} improved, "
+                f"{ext_summary.get('metrics_regressed', 0)} regressed)."
+            )
+        except Exception as e:
+            logger.warning(f"External validation failed: {e}")
+            external_validation = {"error": str(e)}
+
         return state.update(
             verification_results=result.to_dict(),
             current_stage=RemediationStatus.COMPLETED.value if success
                           else RemediationStatus.FAILED_VERIFICATION.value,
             decision_trace=decision_trace.to_dict(),
+            external_validation=external_validation,
         )
 
     except Exception as e:

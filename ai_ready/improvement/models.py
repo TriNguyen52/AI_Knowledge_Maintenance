@@ -525,4 +525,5 @@ def initial_state(
         "systemic_clusters": [],
         "assessment_signals": assessment_signals or [],
         "cross_check_diagnostics": [],
+        "external_validation": {},
     }

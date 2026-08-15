@@ -142,8 +142,8 @@ class AssessmentPipeline:
         """Populate severity, score, ai_impact, and recommendation from policy. Delegates to AssessOperation."""
         self._assess_op.apply_policy(signals)
 
-    def compute_overall_score(self, dimensions: dict[str, DimensionScore]) -> int:
-        """Compute weighted average of dimension scores. Delegates to AssessOperation."""
+    def compute_overall_score(self, dimensions: dict[str, DimensionScore]) -> tuple[int, int, dict[str, Any]]:
+        """Compute weighted average of dimension scores with coefficients and caps. Delegates to AssessOperation."""
         return self._assess_op.compute_overall_score(dimensions)
 
     def get_exit_code(self, assessment: KnowledgeAssessment) -> int:

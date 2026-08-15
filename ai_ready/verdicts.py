@@ -126,10 +126,11 @@ def compute_verdict(
     critical_signals = sum(
         1 for s in assessment.signals if s.severity == Severity.CRITICAL
     )
-    if assessment.score < CRITICAL_SCORE_THRESHOLD or critical_signals >= CRITICAL_SIGNAL_COUNT:
+    score = assessment.effective_score
+    if score < CRITICAL_SCORE_THRESHOLD or critical_signals >= CRITICAL_SIGNAL_COUNT:
         reasons = []
-        if assessment.score < CRITICAL_SCORE_THRESHOLD:
-            reasons.append(f"score {assessment.score} < {CRITICAL_SCORE_THRESHOLD}")
+        if score < CRITICAL_SCORE_THRESHOLD:
+            reasons.append(f"score {score} < {CRITICAL_SCORE_THRESHOLD}")
         if critical_signals >= CRITICAL_SIGNAL_COUNT:
             reasons.append(
                 f"{critical_signals} CRITICAL signals (threshold: {CRITICAL_SIGNAL_COUNT})"
@@ -141,23 +142,24 @@ def compute_verdict(
 
     # 4. DEGRADING
     if prior_assessment is not None:
-        score_drop = prior_assessment.score - assessment.score
+        prior_score = prior_assessment.effective_score
+        score_drop = prior_score - score
         if score_drop > DEGRADING_DROP_POINTS:
             return Verdict(
                 label=HealthVerdict.DEGRADING,
                 reason=(
                     f"Score dropped {score_drop} points "
-                    f"({prior_assessment.score} -> {assessment.score}), "
+                    f"({prior_score} -> {score}), "
                     f"exceeding degradation threshold of {DEGRADING_DROP_POINTS}."
                 ),
             )
 
     # 5. HEALTHY
-    if assessment.score >= HEALTHY_SCORE_THRESHOLD and critical_signals == 0:
+    if score >= HEALTHY_SCORE_THRESHOLD and critical_signals == 0:
         return Verdict(
             label=HealthVerdict.HEALTHY,
             reason=(
-                f"Score {assessment.score}/{HEALTHY_SCORE_THRESHOLD}+ "
+                f"Score {score}/{HEALTHY_SCORE_THRESHOLD}+ "
                 f"with no critical signals."
             ),
         )
@@ -167,11 +169,11 @@ def compute_verdict(
         return Verdict(
             label=HealthVerdict.MODERATE,
             reason=(
-                f"Score {assessment.score} with {critical_signals} "
+                f"Score {score} with {critical_signals} "
                 f"critical signal(s) present."
             ),
         )
     return Verdict(
         label=HealthVerdict.MODERATE,
-        reason=f"Score {assessment.score} — below healthy threshold of {HEALTHY_SCORE_THRESHOLD}.",
+        reason=f"Score {score} — below healthy threshold of {HEALTHY_SCORE_THRESHOLD}.",
     )

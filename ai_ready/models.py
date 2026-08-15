@@ -514,11 +514,17 @@ class KnowledgeAssessment:
 
     assessment_id: str
     score: int
+    adjusted_score: int | None = None  # Coefficient-adjusted + cap-limited score; None = old assessment (use score)
     dimensions: dict[str, DimensionScore] = field(default_factory=dict)
     signals: list[KnowledgeSignal] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     fingerprint: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def effective_score(self) -> int:
+        """The score used for verdicts and display — adjusted_score if computed, else score."""
+        return self.adjusted_score if self.adjusted_score is not None else self.score
 
     def explain_score(self, max_contributors: int = 5) -> ScoreExplanation:
         """Explain the assessment score using existing dimensions and signals.
@@ -551,9 +557,18 @@ class KnowledgeAssessment:
                 f" Critical dimensions (below 50): {', '.join(self.critical_dimensions)}."
             )
 
+        # Append coefficient explanation if adjusted_score was computed
+        coeff_info = self.metadata.get("coefficient_explanation")
+        if coeff_info and self.adjusted_score is not None:
+            summary += f" Base score: {self.score}, adjusted: {self.adjusted_score}."
+            for c in coeff_info.get("coefficients", []):
+                summary += f" {c['name']}: {c['value']:.2f}."
+            for cap in coeff_info.get("caps_applied", []):
+                summary += f" Cap: {cap['reason']} → {cap['cap_value']}."
+
         return ScoreExplanation(
-            score=self.score,
-            lost_score_points=max(0, 100 - self.score),
+            score=self.effective_score,
+            lost_score_points=max(0, 100 - self.effective_score),
             summary=summary,
             dominant_dimensions=dominant_dimensions,
             dominant_contributors=contributors,
@@ -563,6 +578,7 @@ class KnowledgeAssessment:
         return {
             "assessment_id": self.assessment_id,
             "score": self.score,
+            "adjusted_score": self.adjusted_score if self.adjusted_score is not None else self.score,
             "dimensions": {
                 name: {
                     "name": d.name,

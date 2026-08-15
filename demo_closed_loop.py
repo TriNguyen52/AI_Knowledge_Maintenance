@@ -385,7 +385,7 @@ def run_improvement(
 # Show CockroachDB institutional memory (after both runs)
 # ---------------------------------------------------------------------------
 
-def show_cockroach_memory(store):
+def show_cockroach_memory(store, llm_gateway=None):
     from ai_ready.cloud.mcp_server import handle_tool_call, MCP_TOOLS, set_store
     set_store(store)
 
@@ -481,7 +481,7 @@ def show_cockroach_memory(store):
 
             ab_result = run_memory_ab_test(
                 ab_state,
-                llm_gateway=None,
+                llm_gateway=llm_gateway,
                 history_store=ab_store,
                 assessment_store=None,
             )
@@ -762,7 +762,20 @@ def main() -> None:
       verify_cockroachdb(cockroach_store, results)
 
       # --- Show final CockroachDB state (MCP tools) ---
-      show_cockroach_memory(cockroach_store)
+      show_cockroach_memory(cockroach_store, llm_gateway=llm_gateway)
+
+      # --- Pause/Resume demo (proves workflow state survives restart) ---
+      try:
+          from ai_ready.improvement.closed_loop import demonstrate_pause_resume
+          pr_result = demonstrate_pause_resume(
+              store=cockroach_store,
+              source=source_path,
+              limit=limit,
+              llm_gateway=llm_gateway,
+          )
+          display.print_pause_resume_demo(pr_result)
+      except Exception as e:
+          display.print_info("Pause/Resume Demo", f"Skipped: {e}")
 
       # --- Restore original files ---
       if backup_dir and source_path:

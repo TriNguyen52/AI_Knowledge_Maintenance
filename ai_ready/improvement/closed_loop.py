@@ -171,6 +171,7 @@ def run_closed_loop_cycle(
     run_idx: int = 1,
     llm_gateway: Any = None,
     offset: int = 0,
+    halt_at_approval: bool = False,
 ) -> dict[str, Any]:
     """Run a single closed-loop improvement cycle.
 
@@ -182,6 +183,11 @@ def run_closed_loop_cycle(
     4. Runs the improvement workflow (analyze -> propose -> execute -> verify)
     5. Records modified artifact URIs to CockroachDB for later runs
 
+    When ``halt_at_approval=True``, the function stops after step 4's
+    proposal stage (``start_improvement``) and returns the proposals for
+    human review.  The workflow state is persisted to CockroachDB so
+    :func:`resume_closed_loop_cycle` can complete it later.
+
     Args:
         store: Connected CockroachDBStore instance.
         source: Path to the knowledge base on disk.
@@ -191,21 +197,20 @@ def run_closed_loop_cycle(
         run_idx: 1-based run index (for tracking in modified_artifacts).
         llm_gateway: Optional LLM gateway for proposal generation.
         offset: Deprecated, ignored.  Kept for backward compatibility.
+        halt_at_approval: If True, stop after proposal generation and
+            return proposals for human review.  Use
+            :func:`resume_closed_loop_cycle` to complete the workflow.
 
     Returns:
-        Dict with keys:
-        - run: run_idx
-        - score_before: assessment score before improvement
-        - score_after: assessment score after improvement
-        - score_delta: score_after - score_before
-        - signals_resolved: count of resolved signals
-        - new_signals: count of new signals
-        - outcome: verification outcome string (or "rolled_back")
-        - strategy: selected proposal strategy
-        - modified_uris: list of URIs modified by the executor
-        - memory_influence: dict showing how prior outcomes influenced this run
-        - final_state: full final workflow state
-        - rolled_back: True if regression detected and files restored
+        When ``halt_at_approval=False`` (default):
+        - run, score_before, score_after, score_delta, signals_resolved,
+          new_signals, outcome, strategy, modified_uris, memory_influence,
+          final_state, rolled_back
+
+        When ``halt_at_approval=True``:
+        - run, score_before, app_id, halted_at_approval,
+          proposals, root_causes, knowledge_problems, memory_influence,
+          signals_count, dimensions
     """
     source_str = str(source.resolve())
 
@@ -290,11 +295,68 @@ def run_closed_loop_cycle(
     )
 
     app_id = manager.start_improvement(assessment)
+
+    # -- Halt at approval for human-in-the-loop workflow --
+    if halt_at_approval:
+        state = manager.get_state(app_id) or {}
+        proposals = state.get("proposals", [])
+        root_causes = state.get("root_cause_analysis", [])
+        knowledge_problems = state.get("knowledge_problems", [])
+        memory_influence = state.get("memory_influence", {})
+        selected_idx = state.get("selected_proposal_idx", 0)
+
+        logger.info(
+            "Run %d: halted at approval — %d proposals, app_id=%s",
+            run_idx, len(proposals), app_id,
+        )
+        return {
+            "run": run_idx,
+            "score_before": score_before,
+            "app_id": app_id,
+            "halted_at_approval": True,
+            "proposals": proposals,
+            "selected_proposal_idx": selected_idx,
+            "root_causes": root_causes,
+            "knowledge_problems": knowledge_problems,
+            "memory_influence": memory_influence,
+            "signals_count": len(assessment.signals),
+            "dimensions": {
+                d.name: d.score for d in assessment.dimensions.values()
+            },
+        }
+
     final_state = manager.approve_and_complete(
         app_id, approved=True, reason="auto-approved for closed-loop cycle"
     )
 
-    # 5. Check for regression and rollback if needed
+    return _finalize_cycle(
+        final_state=final_state,
+        store=store,
+        source=source,
+        source_str=source_str,
+        run_idx=run_idx,
+        score_before=score_before,
+        backed_up=backed_up,
+        backup_dir=backup_dir,
+    )
+
+
+def _finalize_cycle(
+    final_state: dict[str, Any],
+    store: CockroachDBStore,
+    source: Path,
+    source_str: str,
+    run_idx: int,
+    score_before: int,
+    backed_up: dict[str, str],
+    backup_dir: Path,
+) -> dict[str, Any]:
+    """Post-approval finalisation: regression check, rollback, record, cleanup.
+
+    Shared by :func:`run_closed_loop_cycle` (auto-approve path) and
+    :func:`resume_closed_loop_cycle` (human-approve path) so the
+    rollback / record / cleanup logic is not duplicated.
+    """
     verification = final_state.get("verification_results", {})
     score_after = verification.get("after_score", score_before)
     score_delta = verification.get("score_difference", 0)
@@ -304,21 +366,17 @@ def run_closed_loop_cycle(
     new_modified_uris = _extract_modified_uris(final_state, source_str)
 
     if score_after < score_before and backed_up:
-        # Regression detected — restore files from backup
         logger.warning(
             "Run %d: score regressed (%d -> %d), rolling back %d files",
             run_idx, score_before, score_after, len(backed_up),
         )
-        restored = _restore_artifacts(source, backed_up)
+        _restore_artifacts(source, backed_up)
         rolled_back = True
         outcome = "rolled_back"
-        # Don't record modified URIs — the changes were undone
         new_modified_uris = []
-        # Update the score to reflect the restored state
         score_after = score_before
         score_delta = 0
     elif new_modified_uris:
-        # Changes were beneficial (or neutral) — record them for future runs
         record_modified_artifacts(
             store, source_str, new_modified_uris,
             run_idx=run_idx, step_type="mixed",
@@ -326,10 +384,8 @@ def run_closed_loop_cycle(
         logger.info("Run %d: recorded %d modified URIs to CockroachDB",
                      run_idx, len(new_modified_uris))
 
-    # Clean up the backup regardless
     _cleanup_backup(backup_dir)
 
-    # 6. Extract results
     proposals = final_state.get("proposals", [])
     selected_idx = final_state.get("selected_proposal_idx", 0)
     strategy = (
@@ -353,6 +409,116 @@ def run_closed_loop_cycle(
         "final_state": final_state,
         "rolled_back": rolled_back,
     }
+
+
+def resume_closed_loop_cycle(
+    store: CockroachDBStore,
+    source: Path,
+    app_id: str,
+    run_idx: int = 1,
+    llm_gateway: Any = None,
+    approved: bool = True,
+    reason: str = "approved by user",
+) -> dict[str, Any]:
+    """Resume a halted workflow from CockroachDB and complete the cycle.
+
+    Counterpart to :func:`run_closed_loop_cycle` with
+    ``halt_at_approval=True``.  The workflow state is loaded from
+    CockroachDB via :meth:`ImprovementManager.resume_workflow`, then
+    :meth:`ImprovementManager.approve_and_complete` executes the
+    approved proposal, verifies, and the shared
+    :func:`_finalize_cycle` helper handles rollback / record / cleanup.
+
+    Args:
+        store: Connected CockroachDBStore instance.
+        source: Path to the knowledge base on disk.
+        app_id: The workflow app_id returned by the halted proposal cycle.
+        run_idx: 1-based run index (must match the proposal cycle).
+        llm_gateway: Optional LLM gateway (needed for forking on failure).
+        approved: True to approve the proposal, False to reject.
+        reason: Human-readable reason for the decision.
+
+    Returns:
+        Same shape as :func:`run_closed_loop_cycle` (non-halt path).
+    """
+    source_str = str(source.resolve())
+
+    # Re-load artifacts (executor needs files on disk)
+    modified_uris = []
+    if run_idx > 1:
+        modified_uris = get_modified_artifact_uris(store, source_str)
+
+    knowledge = load_knowledge_source_with_modifications(
+        source=str(source),
+        exclude_patterns=_EXCLUDE_PATTERNS,
+        modified_uris=modified_uris if run_idx > 1 else None,
+    )
+    artifacts = knowledge.artifacts
+    relationships = knowledge.relationships
+    git_commit = _get_git_commit(source_str)
+
+    pipeline = AssessmentPipeline()
+    assessment = pipeline.run(
+        artifacts=artifacts,
+        source=source_str,
+        git_commit=git_commit,
+        relationships=relationships,
+    )
+    score_before = assessment.score
+
+    # Backup before executor modifies anything
+    import tempfile
+    backup_dir = Path(tempfile.gettempdir()) / "ai-ready-rollback" / f"run_{run_idx}"
+    backed_up = _backup_artifacts(source, artifacts, backup_dir)
+
+    # Create fresh manager (simulates new Lambda container)
+    assessment_store = CockroachAssessmentStore(store)
+    history_store = CockroachHistoryStore(store)
+    config = Config.default()
+
+    known_uris = {a.uri for a in artifacts}
+    executor = KnowledgeExecutor(
+        artifact_store=assessment_store,
+        source_path=source_str,
+        assessment_signals=assessment.signals,
+        known_artifact_uris=known_uris,
+    )
+
+    manager = ImprovementManager(
+        llm_gateway=llm_gateway,
+        assessment_store=assessment_store,
+        assessment_pipeline=pipeline,
+        history_store=history_store,
+        executor=executor,
+        artifacts=artifacts,
+        relationships=relationships,
+        source=source_str,
+        git_commit=git_commit,
+        enable_tracking=False,
+        enable_otel=False,
+        max_fork_attempts=2,
+        cockroach_store=store,
+        config=config,
+    )
+
+    # Resume from CockroachDB state
+    manager.resume_workflow(app_id, assessment)
+
+    # Complete the workflow (execute + verify)
+    final_state = manager.approve_and_complete(
+        app_id, approved=approved, reason=reason,
+    )
+
+    return _finalize_cycle(
+        final_state=final_state,
+        store=store,
+        source=source,
+        source_str=source_str,
+        run_idx=run_idx,
+        score_before=score_before,
+        backed_up=backed_up,
+        backup_dir=backup_dir,
+    )
 
 
 def demonstrate_pause_resume(
@@ -593,42 +759,40 @@ def run_cloud_remediation_cycle(
     prefix: str = "",
     problem_id: str | None = None,
     llm_gateway: Any = None,
+    phase: str = "full",
+    app_id: str | None = None,
+    approved: bool = True,
+    reason: str = "approved by user",
 ) -> dict[str, Any]:
-    """Run a single closed-loop remediation cycle with S3-backed artifacts.
+    """Run a cloud remediation cycle with S3-backed artifacts.
 
-    This is the cloud equivalent of ``run_closed_loop_cycle`` — the only
-    difference is that artifacts live in S3 instead of local disk. The
-    function:
+    Supports three phases for human-in-the-loop approval:
 
-    1. Downloads S3 artifacts to /tmp/knowledge_base
-    2. Calls ``run_closed_loop_cycle`` (assess → improve → verify → rollback)
-    3. Uploads only the modified files back to S3
-    4. Stores the remediation outcome in CockroachDB (institutional memory)
-    5. Updates problem status and decision traces
-    6. Returns a formatted result dict
-
-    CockroachDB tracks all modifications, institutional memory, and agent
-    state — same as the local demo. Each subsequent call picks up
-    modifications from prior calls via the ``modified_artifacts`` table.
+    - ``phase="full"`` (default): assess → propose → execute → verify → upload.
+      The original auto-approve behaviour.
+    - ``phase="propose"``: assess → propose → halt at approval checkpoint.
+      Returns proposals for human review.  State persisted to CockroachDB.
+    - ``phase="execute"``: resume from CockroachDB state → execute → verify →
+      upload.  Requires ``app_id`` from the propose phase.
 
     Args:
         store: Connected CockroachDBStore instance.
         bucket: S3 bucket containing knowledge artifacts.
         prefix: S3 prefix (optional, defaults to "").
-        problem_id: Specific problem to remediate (optional). If not
-            provided, the top open problem is used.
+        problem_id: Specific problem to remediate (optional).
         llm_gateway: Optional LLM gateway for proposal generation.
+        phase: "full", "propose", or "execute".
+        app_id: Required for phase="execute" — the workflow ID returned
+            by the propose phase.
+        approved: For phase="execute" — True to approve, False to reject.
+        reason: Human-readable reason for the approval decision.
 
     Returns:
-        Dict with keys:
-        - action: "remediate"
-        - problem_id, problem_category, outcome_id
-        - verification_outcome, score_before, score_after, score_delta
-        - strategy, tokens_used, forked
-        - context_used: past_attempts, successful/failed strategies, similar problems
-        - modified_uris: list of URIs modified by the executor
-        - rolled_back: True if regression detected and files restored
-        - elapsed_seconds
+        For phase="full": same as before (action, problem_id, outcome_id, …).
+        For phase="propose": action="propose", app_id, proposals, root_causes,
+            score_before, signals_count, dimensions, memory_influence.
+        For phase="execute": action="execute", app_id, verification_outcome,
+            score_before, score_after, score_delta, modified_uris, ….
     """
     from ai_ready.storage.models import RemediationRecord
 
@@ -663,14 +827,60 @@ def run_cloud_remediation_cycle(
         target_problem.category, artifact_uris
     )
 
-    # 4. Run the closed-loop cycle (all assessment/improvement/verification logic)
-    result = run_closed_loop_cycle(
-        store=store,
-        source=local_source,
-        limit=0,
-        run_idx=run_idx,
-        llm_gateway=llm_gateway,
-    )
+    # 4. Run the appropriate phase
+    if phase == "propose":
+        result = run_closed_loop_cycle(
+            store=store,
+            source=local_source,
+            limit=0,
+            run_idx=run_idx,
+            llm_gateway=llm_gateway,
+            halt_at_approval=True,
+        )
+        # Return proposals for human review
+        return {
+            "action": "propose",
+            "problem_id": target_problem.problem_id,
+            "problem_category": target_problem.category,
+            "app_id": result.get("app_id", ""),
+            "score_before": result.get("score_before", 0),
+            "proposals": result.get("proposals", []),
+            "selected_proposal_idx": result.get("selected_proposal_idx", 0),
+            "root_causes": result.get("root_causes", []),
+            "knowledge_problems": result.get("knowledge_problems", []),
+            "memory_influence": result.get("memory_influence", {}),
+            "signals_count": result.get("signals_count", 0),
+            "dimensions": result.get("dimensions", {}),
+            "context_used": {
+                "past_attempts": remediation_context.get("total_attempts", 0),
+                "successful_strategies": len(remediation_context.get("successful_strategies", [])),
+                "failed_strategies": len(remediation_context.get("failed_strategies", [])),
+                "similar_problems": len(similar_problems),
+            },
+            "elapsed_seconds": round(time.monotonic() - start_time, 2),
+        }
+
+    if phase == "execute":
+        if not app_id:
+            return {"error": "phase='execute' requires app_id from propose phase"}
+        result = resume_closed_loop_cycle(
+            store=store,
+            source=local_source,
+            app_id=app_id,
+            run_idx=run_idx,
+            llm_gateway=llm_gateway,
+            approved=approved,
+            reason=reason,
+        )
+    else:
+        # phase == "full" (default) — original auto-approve behaviour
+        result = run_closed_loop_cycle(
+            store=store,
+            source=local_source,
+            limit=0,
+            run_idx=run_idx,
+            llm_gateway=llm_gateway,
+        )
 
     # 5. Upload only the modified files back to S3
     modified_uris = result.get("modified_uris", [])
@@ -728,7 +938,7 @@ def run_cloud_remediation_cycle(
     elapsed = time.monotonic() - start_time
 
     return {
-        "action": "remediate",
+        "action": "execute" if phase == "execute" else "remediate",
         "problem_id": target_problem.problem_id,
         "problem_category": target_problem.category,
         "outcome_id": record.outcome_id,

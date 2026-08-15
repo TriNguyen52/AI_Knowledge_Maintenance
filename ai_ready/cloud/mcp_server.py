@@ -266,6 +266,35 @@ def handle_tool_call(tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
         except Exception as e:
             return {"error": str(e)}
 
+    elif tool_name == "get_problem_queue":
+        try:
+            return _store.get_problems(limit=limit)
+        except Exception as e:
+            return {"error": str(e)}
+
+    elif tool_name == "get_assessment_history":
+        try:
+            rows = _store.get_assessment_history(limit=limit)
+            return [
+                {
+                    "assessment_id": getattr(r, "assessment_id", ""),
+                    "score": getattr(r, "score", 0),
+                    "signals_count": getattr(r, "signals_count", 0),
+                    "source": getattr(r, "source", ""),
+                    "created_at": str(getattr(r, "created_at", "")),
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            return {"error": str(e)}
+
+    elif tool_name == "get_health_trend":
+        try:
+            days = int(params.get("days", 30))
+            return _store.get_knowledge_health_trend(days=days)
+        except Exception as e:
+            return {"error": str(e)}
+
     return {"message": f"Unknown tool: {tool_name}"}
 
 

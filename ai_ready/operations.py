@@ -108,15 +108,39 @@ class AssessOperation:
     Applies InterpretationPolicy to enrich KnowledgeSignals with severity,
     score, recommendation, and ai_impact, then aggregates dimensions and
     computes the overall score to produce a KnowledgeAssessment.
+
+    Scoring has three stages:
+    1. Base score: weighted average of dimension scores (additive, original behavior)
+    2. Coefficient adjustment: multiplicative coefficients for connectivity, trust, freshness
+    3. Score caps: hard floors that prevent dimension masking (e.g. connectivity=0 caps at 30)
     """
+
+    # Default coefficient thresholds (configurable via Config)
+    DEFAULT_COEFFICIENT_THRESHOLDS = {
+        "connectivity": 30,   # Below this, connectivity coefficient < 1.0
+        "trust": 20,           # Below this, trust coefficient < 1.0
+        "freshness": 40,       # Below this, freshness coefficient < 1.0
+    }
+
+    # Default cap thresholds (configurable via Config)
+    DEFAULT_CAP_THRESHOLDS = {
+        "connectivity_critical": 30,  # If connectivity < this, cap overall at 50
+        "trust_critical": 20,          # If trust < this, cap overall at 40
+        "retrieval_critical": 30,     # If retrieval < this, cap overall at 45
+        "zero_dimension_cap": 30,     # If ANY dimension = 0, cap overall at this
+    }
 
     def __init__(
         self,
         weights: dict[str, float] | None = None,
         policy: InterpretationPolicy | None = None,
+        coefficient_thresholds: dict[str, int] | None = None,
+        cap_thresholds: dict[str, int] | None = None,
     ) -> None:
         self.weights = weights if weights is not None else DEFAULT_WEIGHTS
         self.policy = policy if policy is not None else InterpretationPolicy()
+        self.coefficient_thresholds = coefficient_thresholds or dict(self.DEFAULT_COEFFICIENT_THRESHOLDS)
+        self.cap_thresholds = cap_thresholds or dict(self.DEFAULT_CAP_THRESHOLDS)
 
     def run(
         self,
@@ -146,8 +170,8 @@ class AssessOperation:
         # Aggregate into dimensions
         dimensions = self.aggregate_dimensions(results, signals)
 
-        # Compute overall score
-        overall_score = self.compute_overall_score(dimensions)
+        # Compute overall score (base + coefficients + caps)
+        base_score, adjusted_score, coeff_info = self.compute_overall_score(dimensions)
 
         # Collect metrics
         metrics: dict[str, Any] = {}
@@ -177,6 +201,8 @@ class AssessOperation:
             "artifact_count": len(artifacts),
             "relationship_count": len(bundle.relationships),
             "link_fingerprints": link_fingerprints,
+            "base_score": base_score,
+            "coefficient_explanation": coeff_info,
         }
         if git_commit:
             metadata["git_commit"] = git_commit
@@ -191,7 +217,8 @@ class AssessOperation:
 
         return KnowledgeAssessment(
             assessment_id=assessment_id,
-            score=overall_score,
+            score=base_score,
+            adjusted_score=adjusted_score,
             dimensions=dimensions,
             signals=signals,
             metrics=metrics,
@@ -265,8 +292,16 @@ class AssessOperation:
                 signal.ai_impact = "No AI impact description available."
                 signal.recommendation = f"Issue: {signal.signal_type}"
 
-    def compute_overall_score(self, dimensions: dict[str, DimensionScore]) -> int:
-        """Compute weighted average of dimension scores."""
+    def compute_overall_score(self, dimensions: dict[str, DimensionScore]) -> tuple[int, int, dict[str, Any]]:
+        """Compute weighted average of dimension scores with coefficient adjustment and caps.
+
+        Returns:
+            Tuple of (base_score, adjusted_score, coefficient_info).
+            - base_score: pure weighted average (additive, for comparability)
+            - adjusted_score: base_score × coefficients, then capped
+            - coefficient_info: dict with coefficient values and applied caps
+        """
+        # Stage 1: Base score (additive weighted average — original behavior)
         total_weight = 0.0
         weighted_sum = 0.0
         for dim_name, dim_score in dimensions.items():
@@ -275,8 +310,108 @@ class AssessOperation:
             total_weight += weight
 
         if total_weight == 0:
-            return 100
-        return int(weighted_sum / total_weight)
+            return 100, 100, {"coefficients": [], "caps_applied": []}
+
+        base_score = int(weighted_sum / total_weight)
+
+        # Stage 2: Multiplicative coefficients (can only reduce score)
+        coefficients: list[dict[str, Any]] = []
+
+        # Connectivity coefficient (α_conn): unreachable knowledge scores lower
+        conn_score = dimensions.get("connectivity")
+        conn_threshold = self.coefficient_thresholds.get("connectivity", 30)
+        if conn_score and conn_score.score < conn_threshold:
+            alpha_conn = conn_score.score / conn_threshold if conn_threshold > 0 else 0.0
+        else:
+            alpha_conn = 1.0
+        coefficients.append({
+            "name": "connectivity",
+            "value": alpha_conn,
+            "threshold": conn_threshold,
+            "dimension_score": conn_score.score if conn_score else None,
+        })
+
+        # Trust coefficient (α_trust): untrusted knowledge scores lower
+        trust_score = dimensions.get("trust")
+        trust_threshold = self.coefficient_thresholds.get("trust", 20)
+        if trust_score and trust_score.score < trust_threshold:
+            alpha_trust = trust_score.score / trust_threshold if trust_threshold > 0 else 0.0
+        else:
+            alpha_trust = 1.0
+        coefficients.append({
+            "name": "trust",
+            "value": alpha_trust,
+            "threshold": trust_threshold,
+            "dimension_score": trust_score.score if trust_score else None,
+        })
+
+        # Freshness coefficient (α_fresh): uses trust dimension (freshness is part of trust)
+        fresh_threshold = self.coefficient_thresholds.get("freshness", 40)
+        if trust_score and trust_score.score < fresh_threshold:
+            alpha_fresh = 0.5 + (trust_score.score / (fresh_threshold * 2.0))
+        else:
+            alpha_fresh = 1.0
+        alpha_fresh = max(0.5, min(1.0, alpha_fresh))  # Clamp to [0.5, 1.0]
+        coefficients.append({
+            "name": "freshness",
+            "value": alpha_fresh,
+            "threshold": fresh_threshold,
+            "dimension_score": trust_score.score if trust_score else None,
+        })
+
+        adjusted = int(base_score * alpha_conn * alpha_trust * alpha_fresh)
+
+        # Stage 3: Hard score caps (prevent dimension masking)
+        caps_applied: list[dict[str, Any]] = []
+
+        conn_cap_threshold = self.cap_thresholds.get("connectivity_critical", 30)
+        conn_cap_value = self.cap_thresholds.get("connectivity_cap", 50)
+        if conn_score and conn_score.score < conn_cap_threshold:
+            caps_applied.append({
+                "reason": "connectivity_critical",
+                "cap_value": conn_cap_value,
+                "dimension_score": conn_score.score,
+            })
+
+        trust_cap_threshold = self.cap_thresholds.get("trust_critical", 20)
+        trust_cap_value = self.cap_thresholds.get("trust_cap", 40)
+        if trust_score and trust_score.score < trust_cap_threshold:
+            caps_applied.append({
+                "reason": "trust_critical",
+                "cap_value": trust_cap_value,
+                "dimension_score": trust_score.score,
+            })
+
+        retrieval_score = dimensions.get("retrieval")
+        retrieval_cap_threshold = self.cap_thresholds.get("retrieval_critical", 30)
+        retrieval_cap_value = self.cap_thresholds.get("retrieval_cap", 45)
+        if retrieval_score and retrieval_score.score < retrieval_cap_threshold:
+            caps_applied.append({
+                "reason": "retrieval_critical",
+                "cap_value": retrieval_cap_value,
+                "dimension_score": retrieval_score.score,
+            })
+
+        zero_cap_value = self.cap_thresholds.get("zero_dimension_cap", 30)
+        if any(d.score == 0 for d in dimensions.values()):
+            caps_applied.append({
+                "reason": "zero_dimension",
+                "cap_value": zero_cap_value,
+                "dimension_score": 0,
+            })
+
+        if caps_applied:
+            cap_value = min(cap["cap_value"] for cap in caps_applied)
+            adjusted = min(adjusted, cap_value)
+
+        coeff_info = {
+            "coefficients": coefficients,
+            "caps_applied": caps_applied,
+            "base_score": base_score,
+            "adjusted_score": adjusted,
+        }
+
+        return base_score, adjusted, coeff_info
 
 
 class DiffOperation:
@@ -389,7 +524,7 @@ class DiffOperation:
 
         score_change_explanation = {
             "summary": explanation,
-            "score_delta": curr.score - prev.score,
+            "score_delta": curr.effective_score - prev.effective_score,
             "dimension_changes": dimension_change_explanations,
             "top_regressions": [
                 c for c in contributor_changes
@@ -402,8 +537,8 @@ class DiffOperation:
         }
 
         recommendation = ""
-        if curr.score < prev.score:
-            recommendation = f"Score dropped {prev.score} -> {curr.score}. Review {len(new_signals)} new signals before deployment."
+        if curr.effective_score < prev.effective_score:
+            recommendation = f"Score dropped {prev.effective_score} -> {curr.effective_score}. Review {len(new_signals)} new signals before deployment."
         elif new_high > 0:
             recommendation = f"{new_high} new high-severity signals. Review before deployment."
         elif len(resolved_signals) > 0 and not new_signals:
@@ -414,9 +549,9 @@ class DiffOperation:
         return AssessmentDiff(
             prev_assessment_id=prev.assessment_id,
             curr_assessment_id=curr.assessment_id,
-            prev_score=prev.score,
-            curr_score=curr.score,
-            score_delta=curr.score - prev.score,
+            prev_score=prev.effective_score,
+            curr_score=curr.effective_score,
+            score_delta=curr.effective_score - prev.effective_score,
             new_signals=new_signals,
             resolved_signals=resolved_signals,
             persistent_signals=persistent_signals,

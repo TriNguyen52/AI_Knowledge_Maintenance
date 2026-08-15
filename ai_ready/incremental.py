@@ -225,8 +225,8 @@ class IncrementalExecutor:
         all_results = self._build_all_results(results, all_signals, prev_assessment)
         dimensions = self.pipeline.aggregate_dimensions(all_results, all_signals)
 
-        # --- Recompute overall score ---
-        overall_score = self.pipeline.compute_overall_score(dimensions)
+        # --- Recompute overall score (base + coefficients + caps) ---
+        base_score, adjusted_score, coeff_info = self.pipeline.compute_overall_score(dimensions)
 
         # --- Collect metrics from new results ---
         metrics: dict[str, Any] = {}
@@ -243,13 +243,16 @@ class IncrementalExecutor:
             "incremental": True,
             "changed_artifacts": len(changed_uris),
             "link_fingerprints": link_fingerprints,
+            "base_score": base_score,
+            "coefficient_explanation": coeff_info,
         }
         if git_commit:
             metadata["git_commit"] = git_commit
 
         return KnowledgeAssessment(
             assessment_id=assessment_id,
-            score=overall_score,
+            score=base_score,
+            adjusted_score=adjusted_score,
             dimensions=dimensions,
             signals=all_signals,
             metrics=metrics,

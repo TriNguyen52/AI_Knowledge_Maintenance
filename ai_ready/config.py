@@ -19,6 +19,8 @@ class Config:
         fail_on: list[str] | None = None,
         enabled_collectors: dict[str, bool] | None = None,
         salience_threshold: float = 0.01,
+        coefficient_thresholds: dict[str, int] | None = None,
+        cap_thresholds: dict[str, int] | None = None,
     ) -> None:
         self.weights = weights or dict(DEFAULT_WEIGHTS)
         self.thresholds = thresholds or {"overall_score": 0}
@@ -29,6 +31,24 @@ class Config:
         # matches the demo's hardcoded value.  Configurable via YAML:
         #   salience_threshold: 0.05
         self.salience_threshold = salience_threshold
+        # Coefficient scoring thresholds — dimensions below these values
+        # trigger multiplicative score reduction.  Configurable via YAML:
+        #   coefficient_thresholds:
+        #     connectivity: 30
+        #     trust: 20
+        #     freshness: 40
+        self.coefficient_thresholds = coefficient_thresholds or None
+        # Score cap thresholds — hard floors that prevent dimension masking.
+        # Configurable via YAML:
+        #   cap_thresholds:
+        #     connectivity_critical: 30
+        #     connectivity_cap: 50
+        #     trust_critical: 20
+        #     trust_cap: 40
+        #     retrieval_critical: 30
+        #     retrieval_cap: 45
+        #     zero_dimension_cap: 30
+        self.cap_thresholds = cap_thresholds or None
 
     @property
     def enabled_collector_ids(self) -> list[str]:
@@ -66,6 +86,8 @@ class Config:
             fail_on=data.get("fail_on", ["CRITICAL"]),
             enabled_collectors=enabled_collectors,
             salience_threshold=data.get("salience_threshold", 0.01),
+            coefficient_thresholds=data.get("coefficient_thresholds"),
+            cap_thresholds=data.get("cap_thresholds"),
         )
 
     @classmethod

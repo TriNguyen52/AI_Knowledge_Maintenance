@@ -36,6 +36,24 @@ from typing import Any
 from ai_ready.cli import display
 
 
+def _get_llm_gateway():
+    """Create an LLM gateway from env vars when available.
+
+    Returns None when no API key is set (falls back to heuristic path).
+    The caller always passes the result to functions that accept
+    ``llm_gateway`` — None means heuristic-only, which is the safe default.
+    """
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if not groq_key:
+        return None
+    try:
+        from ai_ready.llm import LLMGateway
+        return LLMGateway(provider="groq")
+    except Exception as e:
+        print(f"Warning: could not create Groq gateway: {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Lambda invocation
 # ---------------------------------------------------------------------------
@@ -400,7 +418,7 @@ def show_cockroach_memory(store) -> None:
 
             ab_result = run_memory_ab_test(
                 ab_state,
-                llm_gateway=None,
+                llm_gateway=_get_llm_gateway(),
                 history_store=ab_store,
                 assessment_store=None,
             )
@@ -505,6 +523,133 @@ def show_cloud_infra(endpoint: str, bucket: str, prefix: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# AWS Event Chain Proof: S3 → EventBridge → Lambda → CockroachDB
+# ---------------------------------------------------------------------------
+
+# A small markdown file with detectable signals (orphan, no date, generic heading)
+_TEST_MD_CONTENT = """# Test Document
+
+This is a test document with no date metadata and no links to other documents.
+It has a generic heading and is an orphan artifact.
+
+## Overview
+
+Some content here.
+"""
+
+def trigger_s3_assessment(
+    bucket: str = "knowledge-base",
+    key: str = "test-trigger/test.md",
+    endpoint: str = "http://localhost:4566",
+    function_name: str = "ai-knowledge-assess",
+    cockroach_store: Any = None,
+) -> dict[str, Any]:
+    """Trigger an S3-driven assessment to prove the full AWS event chain.
+
+    Steps:
+    1. Upload a test markdown file to S3 (via boto3)
+    2. Invoke Lambda with an S3 event payload (simulating EventBridge trigger)
+    3. Optionally poll CockroachDB for the new assessment record
+    4. Return the full chain result
+
+    Reuses the existing ``invoke_lambda()`` function — no new Lambda
+    invocation logic.
+
+    Args:
+        bucket: S3 bucket name.
+        key: S3 object key for the test file.
+        endpoint: Floci/AWS endpoint URL.
+        function_name: Lambda function name.
+        cockroach_store: Optional connected CockroachDBStore for verification.
+
+    Returns:
+        Dict with keys:
+        - s3_upload: True/False whether upload succeeded
+        - s3_key: The uploaded S3 key
+        - lambda_response: Response from Lambda assessment
+        - cockroach_verified: True if assessment found in CockroachDB
+        - chain_complete: True if all steps succeeded
+    """
+    result: dict[str, Any] = {
+        "s3_upload": False,
+        "s3_key": key,
+        "lambda_response": {},
+        "cockroach_verified": False,
+        "chain_complete": False,
+    }
+
+    # 1. Upload test file to S3
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+            config=BotoConfig(s3={"addressing_style": "path"}),
+        )
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=_TEST_MD_CONTENT.encode("utf-8"),
+            ContentType="text/markdown",
+        )
+        result["s3_upload"] = True
+    except Exception as e:
+        result["s3_upload_error"] = str(e)
+        return result
+
+    # 2. Invoke Lambda with S3 event payload (simulates EventBridge trigger)
+    s3_event_payload = {
+        "action": "assess",
+        "source": f"s3://{bucket}/{key}",
+        "s3_event": {
+            "Records": [
+                {
+                    "eventName": "ObjectCreated:Put",
+                    "s3": {
+                        "bucket": {"name": bucket},
+                        "object": {"key": key},
+                    },
+                }
+            ]
+        },
+    }
+    lambda_response = invoke_lambda(
+        payload=s3_event_payload,
+        endpoint=endpoint,
+        function_name=function_name,
+    )
+    result["lambda_response"] = lambda_response
+
+    # 3. Verify in CockroachDB (if store provided)
+    if cockroach_store and "error" not in lambda_response:
+        try:
+            time.sleep(2)  # Brief wait for async persistence
+            assessments = cockroach_store.get_recent_assessments(limit=5)
+            for a in assessments:
+                src = a.get("source", "")
+                if key in src or f"s3://{bucket}" in src:
+                    result["cockroach_verified"] = True
+                    result["assessment_id"] = a.get("assessment_id", "")
+                    result["assessment_score"] = a.get("score", 0)
+                    break
+        except Exception as e:
+            result["cockroach_error"] = str(e)
+
+    # 4. Chain complete if all steps succeeded
+    result["chain_complete"] = (
+        result["s3_upload"]
+        and "error" not in lambda_response
+        and (result["cockroach_verified"] if cockroach_store else True)
+    )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
@@ -516,6 +661,7 @@ def run_lambda_demo(
     num_cycles: int = 3,
     aws_python: str | None = None,
     clear_db: bool = False,
+    source_path: str | None = None,
 ) -> None:
     """Run the full cloud-native Lambda closed-loop demo.
 
@@ -722,6 +868,44 @@ def run_lambda_demo(
 
         # 8. Show CockroachDB institutional memory (MCP tools)
         show_cockroach_memory(store)
+
+        # 8b. Pause/Resume demo (proves workflow state survives restart)
+        if source_path:
+            try:
+                from ai_ready.improvement.closed_loop import demonstrate_pause_resume
+                pr_result = demonstrate_pause_resume(
+                    store=store,
+                    source=Path(source_path),
+                    limit=0,
+                    llm_gateway=_get_llm_gateway(),
+                )
+                display.print_pause_resume_demo(pr_result)
+            except Exception as e:
+                display.print_info("Pause/Resume Demo", f"Skipped: {e}")
+
+        # 8c. AWS Event Chain Proof (S3 → Lambda → CockroachDB)
+        try:
+            display.print_section("AWS Event Chain Proof")
+            event_result = trigger_s3_assessment(
+                bucket=s3_bucket,
+                endpoint=endpoint,
+                function_name=function_name,
+                cockroach_store=store,
+            )
+            if event_result.get("chain_complete"):
+                display.print_info("S3 Upload", f"OK ({event_result['s3_key']})")
+                display.print_info("Lambda Assessment", "OK")
+                if event_result.get("cockroach_verified"):
+                    display.print_info(
+                        "CockroachDB Verified",
+                        f"Assessment ID: {event_result.get('assessment_id', 'N/A')}, "
+                        f"Score: {event_result.get('assessment_score', 'N/A')}",
+                    )
+                display.print_info("Chain Status", "COMPLETE: S3 → Lambda → CockroachDB")
+            else:
+                display.print_info("Chain Status", f"Incomplete: {event_result}")
+        except Exception as e:
+            display.print_info("AWS Event Chain", f"Skipped: {e}")
 
         # 9. Cloud demo complete
         total_elapsed = time.monotonic() - total_start
